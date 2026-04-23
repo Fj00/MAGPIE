@@ -563,7 +563,7 @@ void fj_data_add_move(Recorder *recorder, const RecorderArgs *args) {
   FJMove *fj_move = &fj_data->moves[fj_data->move_count];
   const Rack *leave = args->leave;
   rack_copy(&fj_move->leave, leave);
-  fj_move->move_score = move_get_score(args->move);
+  fj_move->move_score = equity_to_int(move_get_score(args->move));
   fj_move->player_index = game_get_player_on_turn_index(game);
   const Player *player = game_get_player(game, fj_move->player_index);
   const Player *opponent = game_get_player(game, 1 - fj_move->player_index);
