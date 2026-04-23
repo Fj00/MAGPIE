@@ -603,7 +603,10 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
     return NULL;
   }
   Game *game = game_runner->game;
-  const int bag_count = bag_get_letters(game_get_bag(game));
+  // force_targets.csv uses the "unseen" bag count convention:
+  // physical bag + opponent's rack = bag_get_letters + RACK_SIZE.
+  // So bag=93 = opening turn (86 physical + 7 opp rack).
+  const int bag_count = bag_get_letters(game_get_bag(game)) + (RACK_SIZE);
   int target_count = 0;
   ForceTarget **targets = force_table_lookup(ft, bag_count, &target_count);
   if (target_count == 0) {
