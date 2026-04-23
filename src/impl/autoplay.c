@@ -506,7 +506,11 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
 
   game_runner->turn_number = 0;
   game_runner->force_draw = false;
-  game_runner->force_triggered = false;
+  // If every target is satisfied, treat the game as already-forced so all
+  // its turns get recorded normally (unbiased hasty self-play).
+  game_runner->force_triggered =
+      game_runner->shared_data->force_table != NULL &&
+      force_table_is_exhausted(game_runner->shared_data->force_table);
   if (game_runner->shared_data->leavegen_shared_data &&
       // We only force draws if we've played enough games for this
       // generation.
@@ -675,7 +679,7 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
           }
         }
         game_runner->force_triggered = true;
-        force_target_decrement(target);
+        force_table_decrement_target(ft, target);
         return move;
       }
     }

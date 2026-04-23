@@ -52,8 +52,14 @@ ForceTarget **force_table_lookup(ForceTable *table, int bag, int *count);
 bool force_target_matches(const ForceTarget *target, const Rack *leave,
                           int score);
 
-// Decrement a target's deficit. Returns true if the target is now satisfied.
-bool force_target_decrement(ForceTarget *target);
+// Decrement a target's deficit. If the deficit transitions from 1 to 0,
+// the table's active-target counter is decremented. Returns true if the
+// target is now satisfied.
+bool force_table_decrement_target(ForceTable *table, ForceTarget *target);
+
+// True once every target has been satisfied (all deficits are zero). Safe
+// to call from multiple threads; the underlying counter is atomic.
+bool force_table_is_exhausted(const ForceTable *table);
 
 // Total remaining deficit across all targets (for progress reporting).
 int64_t force_table_total_remaining(const ForceTable *table);

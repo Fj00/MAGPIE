@@ -1,6 +1,7 @@
 #include "force_table.h"
 
 #include <ctype.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,9 @@ struct ForceTable {
   ForceTarget *targets; // heap-allocated array
   int num_targets;
   int capacity;
+  // Count of targets whose deficit is still > 0. Decrements when a target's
+  // deficit reaches zero; reaches zero when every target is satisfied.
+  atomic_int active_targets;
   // Index: per bag count, an array of pointers into targets[]. A satisfied
   // target stays in the array (its deficit==0) — lookup callers must filter.
   ForceTarget **by_bag_ptrs[FORCE_BAG_MAX];
@@ -142,11 +146,21 @@ bool force_target_matches(const ForceTarget *target, const Rack *leave,
   return true;
 }
 
-bool force_target_decrement(ForceTarget *target) {
+bool force_table_decrement_target(ForceTable *table, ForceTarget *target) {
   if (target->deficit > 0) {
     target->deficit--;
+    if (target->deficit == 0) {
+      atomic_fetch_sub_explicit(&table->active_targets, 1,
+                                memory_order_relaxed);
+      return true;
+    }
   }
   return target->deficit == 0;
+}
+
+bool force_table_is_exhausted(const ForceTable *table) {
+  return atomic_load_explicit(&table->active_targets, memory_order_relaxed) ==
+         0;
 }
 
 ForceTarget **force_table_lookup(ForceTable *table, int bag, int *count) {
@@ -322,6 +336,9 @@ ForceTable *force_table_create(const char *csv_path,
       table->by_bag_ptrs[b][j + 1] = key;
     }
   }
+
+  atomic_store_explicit(&table->active_targets, table->num_targets,
+                        memory_order_relaxed);
 
   fprintf(stderr, "force_table: loaded %d targets from %s (total deficit=%lld)\n",
           table->num_targets, csv_path,
