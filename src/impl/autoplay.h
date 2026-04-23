@@ -19,6 +19,7 @@ typedef struct AutoplayArgs {
   bool print_boards;
   autoplay_t type;
   const char *data_paths;
+  const char *force_table_path;
   GameArgs *game_args;
   int num_threads;
   int print_interval;

@@ -15,6 +15,7 @@
 #include "../ent/checkpoint.h"
 #include "../ent/data_filepaths.h"
 #include "../ent/equity.h"
+#include "../ent/force_table.h"
 #include "../ent/game.h"
 #include "../ent/inference_args.h"
 #include "../ent/inference_results.h"
@@ -35,6 +36,7 @@
 #include "../util/io_util.h"
 #include "../util/string_util.h"
 #include "gameplay.h"
+#include "move_gen.h"
 #include "rack_list.h"
 #include "simmer.h"
 #include <stdbool.h>
@@ -70,6 +72,7 @@ typedef struct AutoplaySharedData {
   cpthread_mutex_t iter_completed_mutex;
   ThreadControl *thread_control;
   LeavegenSharedData *leavegen_shared_data;
+  ForceTable *force_table;
 } AutoplaySharedData;
 
 typedef struct AutoplayIterOutput {
@@ -265,6 +268,9 @@ typedef struct AutoplayWorker {
   Rack nontarget_known_rack;
   Rack target_known_rack;
   MoveList *move_lists[2];
+  // Used only when a force table is active. Holds the full move list with
+  // MOVE_RECORD_ALL so we can filter by leave profile.
+  MoveList *force_move_list;
 } AutoplayWorker;
 
 AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
@@ -298,6 +304,10 @@ AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
       move_list_create(ap_args->p1_sim_args.num_plays);
   autoplay_worker->move_lists[1] =
       move_list_create(ap_args->p2_sim_args.num_plays);
+  autoplay_worker->force_move_list = NULL;
+  if (shared_data->force_table) {
+    autoplay_worker->force_move_list = move_list_create(2000);
+  }
 
   autoplay_worker->sim_results = NULL;
   autoplay_worker->inference_results = NULL;
@@ -332,6 +342,7 @@ void autoplay_worker_destroy(AutoplayWorker *autoplay_worker) {
   error_stack_destroy(autoplay_worker->error_stack);
   move_list_destroy(autoplay_worker->move_lists[0]);
   move_list_destroy(autoplay_worker->move_lists[1]);
+  move_list_destroy(autoplay_worker->force_move_list);
   free(autoplay_worker);
 }
 
@@ -385,6 +396,16 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
         args->data_paths, klv, num_autoplay_threads, num_gens,
         min_rack_targets);
   }
+  shared_data->force_table = NULL;
+  const char *ft_path = args->force_table_path;
+  if (!ft_path || ft_path[0] == '\0') {
+    // Fallback for testing before CLI flag is wired: env var.
+    ft_path = getenv("MAGPIE_FORCE_TABLE");
+  }
+  if (ft_path && ft_path[0] != '\0') {
+    shared_data->force_table =
+        force_table_create(ft_path, args->game_args->ld);
+  }
   return shared_data;
 }
 
@@ -404,11 +425,16 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   }
   prng_destroy(shared_data->prng);
   leavegen_shared_data_destroy(shared_data->leavegen_shared_data);
+  force_table_destroy(shared_data->force_table);
   free(shared_data);
 }
 
 typedef struct GameRunner {
   bool force_draw;
+  // True once any forced move has been picked in this game. While false and
+  // force_table is active, wordstats recording for this game's turns is
+  // suppressed (pre-force turns are "tainted" per the gen 2 spec).
+  bool force_triggered;
   int turn_number;
   int pair_game_number; // 0 for non-paired games, 1 or 2 for game pairs
   uint64_t game_number;
@@ -467,6 +493,7 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
 
   game_runner->turn_number = 0;
   game_runner->force_draw = false;
+  game_runner->force_triggered = false;
   if (game_runner->shared_data->leavegen_shared_data &&
       // We only force draws if we've played enough games for this
       // generation.
@@ -561,6 +588,85 @@ const Move *game_runner_get_top_simming_move(AutoplayWorker *autoplay_worker,
   return move;
 }
 
+// If a force target at the current bag count matches any candidate move,
+// pick the highest-equity match and return it. Marks the runner's
+// force_triggered flag on success. Returns NULL if no forcing applied.
+static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
+                                   GameRunner *game_runner) {
+  ForceTable *ft = game_runner->shared_data->force_table;
+  if (!ft || game_runner->force_triggered || !autoplay_worker->force_move_list) {
+    return NULL;
+  }
+  Game *game = game_runner->game;
+  const int bag_count = bag_get_letters(game_get_bag(game));
+  int target_count = 0;
+  ForceTarget **targets = force_table_lookup(ft, bag_count, &target_count);
+  if (target_count == 0) {
+    return NULL;
+  }
+  bool any_active = false;
+  for (int i = 0; i < target_count; i++) {
+    if (targets[i]->deficit > 0) {
+      any_active = true;
+      break;
+    }
+  }
+  if (!any_active) {
+    return NULL;
+  }
+
+  MoveList *ml = autoplay_worker->force_move_list;
+  const MoveGenArgs mg_args = {
+      .game = game,
+      .move_list = ml,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_EQUITY,
+      .override_kwg = NULL,
+      .thread_index = autoplay_worker->worker_index,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+      .tiles_played_bv = NULL,
+      .initial_tiles_bv = 0};
+  generate_moves(&mg_args);
+  const int n_moves = move_list_get_count(ml);
+  if (n_moves == 0) {
+    return NULL;
+  }
+
+  const LetterDistribution *ld = game_get_ld(game);
+  Rack leave;
+  rack_set_dist_size(&leave, ld_get_size(ld));
+  for (int priority = FORCE_TARGET_PAIR; priority >= FORCE_TARGET_STRATUM;
+       priority--) {
+    for (int t = 0; t < target_count; t++) {
+      ForceTarget *target = targets[t];
+      if (target->deficit <= 0 || (int)target->kind != priority) {
+        continue;
+      }
+      for (int m = 0; m < n_moves; m++) {
+        Move *move = move_list_get_move(ml, m);
+        get_leave_for_move(move, game, &leave);
+        const int score = equity_to_int(move_get_score(move));
+        if (!force_target_matches(target, &leave, score)) {
+          continue;
+        }
+        // force_target_matches does not check the cons/mixed/vowel type
+        // because it does not carry the LetterDistribution. Do it here.
+        if (target->exchange == 0 && target->leave_length >= 3) {
+          if (force_classify_leave(&leave, ld) != target->leave_type) {
+            continue;
+          }
+        }
+        game_runner->force_triggered = true;
+        force_target_decrement(target);
+        return move;
+      }
+    }
+  }
+  return NULL;
+}
+
 const Move *game_runner_get_best_move(AutoplayWorker *autoplay_worker,
                                       GameRunner *game_runner) {
   const int player_on_turn_index =
@@ -614,15 +720,27 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     rack_copy(player_rack, &original_rack);
   }
 
-  const Move *move = game_runner_get_best_move(autoplay_worker, game_runner);
+  const Move *move = try_forced_move(autoplay_worker, game_runner);
+  if (!move) {
+    move = game_runner_get_best_move(autoplay_worker, game_runner);
+  }
 
   if (lg_shared_data) {
     rack_list_add_rack(lg_shared_data->rack_list, player_rack,
                        equity_to_double(move_get_equity(move)));
   }
   get_leave_for_move(move, game, &rare_rack_or_move_leave);
-  autoplay_results_add_move(autoplay_worker->autoplay_results,
-                            game_runner->game, move, &rare_rack_or_move_leave);
+  // Skip recording pre-force turns when a force table is active: those turns
+  // are "tainted" (the game was always going to include a force), and the
+  // gen 2 spec excludes them from training data.
+  const bool skip_recording =
+      game_runner->shared_data->force_table != NULL &&
+      !game_runner->force_triggered;
+  if (!skip_recording) {
+    autoplay_results_add_move(autoplay_worker->autoplay_results,
+                              game_runner->game, move,
+                              &rare_rack_or_move_leave);
+  }
 
   // Print board with move about to be played if requested
   if (autoplay_worker->args.print_boards) {
