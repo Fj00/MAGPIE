@@ -425,6 +425,11 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   }
   prng_destroy(shared_data->prng);
   leavegen_shared_data_destroy(shared_data->leavegen_shared_data);
+  if (shared_data->force_table) {
+    fprintf(stderr, "force_table: remaining deficit = %lld across %d targets\n",
+            (long long)force_table_total_remaining(shared_data->force_table),
+            force_table_num_targets(shared_data->force_table));
+  }
   force_table_destroy(shared_data->force_table);
   free(shared_data);
 }

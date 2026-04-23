@@ -2618,6 +2618,7 @@ void config_fill_autoplay_args(const Config *config,
   autoplay_args->seed = config->seed;
   autoplay_args->thread_control = config_get_thread_control(config);
   autoplay_args->data_paths = config_get_data_paths(config);
+  autoplay_args->force_table_path = NULL;
   autoplay_args->game_string_options = config->game_string_options;
   config_fill_game_args(config, autoplay_args->game_args);
   autoplay_args->multi_threading_mode = config->multi_threading_mode;

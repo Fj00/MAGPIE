@@ -307,8 +307,9 @@ ForceTable *force_table_create(const char *csv_path,
     }
   }
 
-  log_info("force_table: loaded %d targets from %s", table->num_targets,
-           csv_path);
+  fprintf(stderr, "force_table: loaded %d targets from %s (total deficit=%lld)\n",
+          table->num_targets, csv_path,
+          (long long)force_table_total_remaining(table));
   return table;
 }
 
