@@ -73,6 +73,7 @@ typedef struct AutoplaySharedData {
   ThreadControl *thread_control;
   LeavegenSharedData *leavegen_shared_data;
   ForceTable *force_table;
+  const LetterDistribution *ld;
 } AutoplaySharedData;
 
 typedef struct AutoplayIterOutput {
@@ -397,6 +398,7 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
         min_rack_targets);
   }
   shared_data->force_table = NULL;
+  shared_data->ld = args->game_args->ld;
   const char *ft_path = args->force_table_path;
   if (!ft_path || ft_path[0] == '\0') {
     // Fallback for testing before CLI flag is wired: env var.
@@ -429,6 +431,12 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
     fprintf(stderr, "force_table: remaining deficit = %lld across %d targets\n",
             (long long)force_table_total_remaining(shared_data->force_table),
             force_table_num_targets(shared_data->force_table));
+    // Dump updated deficits (can be passed back as the next run's input).
+    const char *dump_path = getenv("MAGPIE_FORCE_TABLE_DUMP");
+    if (dump_path && dump_path[0] != '\0') {
+      force_table_dump_remaining(shared_data->force_table, dump_path,
+                                 shared_data->ld);
+    }
   }
   force_table_destroy(shared_data->force_table);
   free(shared_data);

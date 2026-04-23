@@ -313,6 +313,45 @@ ForceTable *force_table_create(const char *csv_path,
   return table;
 }
 
+void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
+                                const LetterDistribution *ld) {
+  FILE *f = fopen(csv_path, "w");
+  if (!f) {
+    fprintf(stderr, "force_table_dump: cannot open %s for write\n", csv_path);
+    return;
+  }
+  fprintf(f, "kind,bag,length,type,exchange,subleave,current,target,deficit,"
+             "forced_games_estimate\n");
+  const char *kind_names[] = {"stratum", "tile", "pair"};
+  const char *type_names[] = {"all", "cons", "mixed", "vowel"};
+  int rows_written = 0;
+  for (int i = 0; i < table->num_targets; i++) {
+    const ForceTarget *t = &table->targets[i];
+    if (t->deficit <= 0) {
+      continue;
+    }
+    char subleave[3] = {0};
+    if (t->subleave_count >= 1) {
+      subleave[0] = (t->subleave_mls[0] == 0) ? '?' :
+                    ld->ld_ml_to_hl[t->subleave_mls[0]][0];
+    }
+    if (t->subleave_count >= 2) {
+      subleave[1] = (t->subleave_mls[1] == 0) ? '?' :
+                    ld->ld_ml_to_hl[t->subleave_mls[1]][0];
+    }
+    // current/target/forced_games_estimate aren't tracked precisely after
+    // runtime; emit 0 placeholders except deficit (the reliable field).
+    fprintf(f, "%s,%d,%d,%s,%d,%s,0,0,%lld,0\n",
+            kind_names[t->kind], t->bag, t->leave_length,
+            type_names[t->leave_type], t->exchange, subleave,
+            (long long)t->deficit);
+    rows_written++;
+  }
+  fclose(f);
+  fprintf(stderr, "force_table_dump: wrote %d remaining targets to %s\n",
+          rows_written, csv_path);
+}
+
 void force_table_destroy(ForceTable *table) {
   if (!table) {
     return;

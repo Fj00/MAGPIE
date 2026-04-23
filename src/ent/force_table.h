@@ -58,6 +58,12 @@ bool force_target_decrement(ForceTarget *target);
 // Total remaining deficit across all targets (for progress reporting).
 int64_t force_table_total_remaining(const ForceTable *table);
 
+// Dump the remaining deficits to a CSV with the same schema as the input,
+// skipping targets whose deficit is 0. Used for progress reporting and to
+// produce an updated force_targets.csv for subsequent runs.
+void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
+                                const LetterDistribution *ld);
+
 // Number of targets currently loaded (including satisfied ones).
 int force_table_num_targets(const ForceTable *table);
 
