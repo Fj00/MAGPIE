@@ -73,6 +73,7 @@ typedef struct AutoplaySharedData {
   ThreadControl *thread_control;
   LeavegenSharedData *leavegen_shared_data;
   ForceTable *force_table;
+  bool stop_on_force_exhaust;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -96,6 +97,9 @@ bool autoplay_get_next_iter_output(AutoplaySharedData *shared_data,
   bool at_stop_count = false;
   cpthread_mutex_lock(&shared_data->iter_mutex);
   if (shared_data->iter_count >= shared_data->max_iter_count) {
+    at_stop_count = true;
+  } else if (shared_data->stop_on_force_exhaust &&
+             force_table_is_exhausted(shared_data->force_table)) {
     at_stop_count = true;
   } else {
     iter_output->seed = prng_next(shared_data->prng);
@@ -408,6 +412,9 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
     shared_data->force_table =
         force_table_create(ft_path, args->game_args->ld);
   }
+  shared_data->stop_on_force_exhaust =
+      shared_data->force_table != NULL &&
+      getenv("MAGPIE_FORCE_STOP_ON_EXHAUST") != NULL;
   return shared_data;
 }
 
