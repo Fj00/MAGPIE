@@ -485,14 +485,26 @@ typedef struct FJSharedData {
   FILE *fhs[MAX_NUMBER_OF_TILES];
 } FJSharedData;
 
+// Bucket index = bag_letters + RACK_SIZE. The recorder skips writes at
+// bag_letters==0, and opener plays ≥2 tiles, so only the opener value
+// (MAX_NUMBER_OF_TILES - RACK_SIZE) and [RACK_SIZE+1, opener-2] are ever
+// populated. Other indices would just leave empty files behind.
+static bool fj_bag_is_valid(int i) {
+  const int opener = MAX_NUMBER_OF_TILES - RACK_SIZE;
+  return i == opener || (i >= RACK_SIZE + 1 && i <= opener - 2);
+}
+
 void fj_data_reset_fh(FJSharedData *shared_data) {
   for (int i = 0; i < MAX_NUMBER_OF_TILES; i++) {
-    char *filename_num_remaining =
-        get_formatted_string("autoplay_record_fj_%d", i);
     if (shared_data->fhs[i]) {
       fclose_or_die(shared_data->fhs[i]);
       shared_data->fhs[i] = NULL;
     }
+    if (!fj_bag_is_valid(i)) {
+      continue;
+    }
+    char *filename_num_remaining =
+        get_formatted_string("autoplay_record_fj_%d", i);
     shared_data->fhs[i] = fopen_or_die(filename_num_remaining, "w");
     if (!shared_data->fhs[i]) {
       log_fatal("error opening fj file for writing: %s",
@@ -546,7 +558,9 @@ void fj_data_destroy(Recorder *recorder) {
   if (recorder->owns_thread_shared_data) {
     FJSharedData *shared_data = (FJSharedData *)recorder->thread_shared_data;
     for (int i = 0; i < MAX_NUMBER_OF_TILES; i++) {
-      fclose_or_die(shared_data->fhs[i]);
+      if (shared_data->fhs[i]) {
+        fclose_or_die(shared_data->fhs[i]);
+      }
     }
     free(shared_data);
   }
