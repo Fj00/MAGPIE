@@ -465,6 +465,12 @@ typedef struct GameRunner {
   Game *game_one_move_behind;
   Move previous_move;
   AutoplaySharedData *shared_data;
+  // Set by try_forced_move when a force fires. The deficit decrement is
+  // deferred to game-end (autoplay_add_game) so that stratum-kind targets
+  // can be credited only when the game's outcome bumps min(wins, losses).
+  ForceTarget *pending_force_target;
+  int pending_force_diff; // forcing player's score - opponent's at force turn
+  int pending_force_player_index; // 0 or 1
 } GameRunner;
 
 GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
@@ -513,6 +519,9 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
 
   game_runner->turn_number = 0;
   game_runner->force_draw = false;
+  game_runner->pending_force_target = NULL;
+  game_runner->pending_force_diff = 0;
+  game_runner->pending_force_player_index = 0;
   // If every target is satisfied, treat the game as already-forced so all
   // its turns get recorded normally (unbiased hasty self-play).
   game_runner->force_triggered =
@@ -686,7 +695,17 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
           }
         }
         game_runner->force_triggered = true;
-        force_table_decrement_target(ft, target);
+        // Capture the force-turn state. The deficit is credited at game-end
+        // (autoplay_add_game) once the diff/outcome are final, so stratum
+        // targets only debit when min(wins, losses) actually moves.
+        game_runner->pending_force_target = target;
+        const int p_idx = game_get_player_on_turn_index(game);
+        game_runner->pending_force_player_index = p_idx;
+        const int my_score =
+            equity_to_int(player_get_score(game_get_player(game, p_idx)));
+        const int opp_score =
+            equity_to_int(player_get_score(game_get_player(game, 1 - p_idx)));
+        game_runner->pending_force_diff = my_score - opp_score;
         return move;
       }
     }
@@ -850,6 +869,22 @@ void autoplay_add_game(AutoplayWorker *autoplay_worker,
   autoplay_results_add_game(autoplay_worker->autoplay_results,
                             game_runner->game, game_runner->turn_number,
                             divergent, game_runner->seed);
+  // Credit the force table for this game's final outcome. For stratum-kind
+  // targets this is the moment the deficit actually decrements (and only
+  // when the outcome bumps min(wins, losses) at the force-turn diff).
+  ForceTable *ft = autoplay_worker->shared_data->force_table;
+  if (ft != NULL && game_runner->pending_force_target != NULL) {
+    const Game *game = game_runner->game;
+    const int p_idx = game_runner->pending_force_player_index;
+    const int my_final =
+        equity_to_int(player_get_score(game_get_player(game, p_idx)));
+    const int opp_final =
+        equity_to_int(player_get_score(game_get_player(game, 1 - p_idx)));
+    const bool is_tie = (my_final == opp_final);
+    const bool is_win = (my_final > opp_final);
+    force_table_credit_game(ft, game_runner->pending_force_target,
+                            game_runner->pending_force_diff, is_win, is_tie);
+  }
   AutoplayIterCompletedOutput iter_completed_output;
   autoplay_complete_iter(autoplay_worker->shared_data, &iter_completed_output);
   if (iter_completed_output.print_info) {

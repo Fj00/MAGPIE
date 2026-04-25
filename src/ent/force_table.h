@@ -57,6 +57,24 @@ bool force_target_matches(const ForceTarget *target, const Rack *leave,
 // target is now satisfied.
 bool force_table_decrement_target(ForceTable *table, ForceTarget *target);
 
+// Credit a finished game's outcome against a target hit during the game.
+// For stratum-kind targets: looks up the per-(target, diff) tally and
+// decrements the target's deficit only when the outcome would increase
+// min(wins, losses) for that diff bucket. The tally is always updated.
+// Race-free across threads via atomic fetch-add of a packed (wins:32,
+// losses:32) bucket — each game's pre-increment value uniquely determines
+// whether IT was the one that bumped min_wl.
+//
+// For tile/pair-kind targets: decrements deficit by 1 (their semantics
+// are count-based, not min(w,l)-based — original behavior preserved).
+//
+// `diff` is the score difference at the force turn from the forcing
+// player's perspective (same convention as the FJ recorder's score_diff).
+// `is_win`/`is_tie` describe the game's final outcome for that player;
+// `is_tie` takes precedence over `is_win`.
+void force_table_credit_game(ForceTable *table, ForceTarget *target,
+                             int diff, bool is_win, bool is_tie);
+
 // True once every target has been satisfied (all deficits are zero). Safe
 // to call from multiple threads; the underlying counter is atomic.
 bool force_table_is_exhausted(const ForceTable *table);

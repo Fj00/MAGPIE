@@ -12,6 +12,19 @@
 // Maximum bag count indexed directly. Bag sizes we care about are 0..93.
 #define FORCE_BAG_MAX 94
 
+// Per-stratum diff-tally bounds: ±FORCE_DIFF_MAX. Diffs outside this range
+// are clamped to the boundary (matches the spreadsheet WINDOW behavior).
+// 1001 buckets per stratum target × 8 bytes = 8 KB.
+#define FORCE_DIFF_MAX 500
+#define FORCE_DIFF_BUCKETS (FORCE_DIFF_MAX * 2 + 1)
+
+// Atomic packed (wins:32, losses:32). Updated with atomic_fetch_add so that
+// each game's pre-increment value uniquely tells it whether IT was the one
+// that bumped min(w,l).
+typedef struct StratumTally {
+  _Atomic uint64_t buckets[FORCE_DIFF_BUCKETS];
+} StratumTally;
+
 struct ForceTable {
   ForceTarget *targets; // heap-allocated array
   int num_targets;
@@ -23,6 +36,10 @@ struct ForceTable {
   // target stays in the array (its deficit==0) — lookup callers must filter.
   ForceTarget **by_bag_ptrs[FORCE_BAG_MAX];
   int by_bag_count[FORCE_BAG_MAX];
+  // Per-target diff tally for stratum-kind targets only (NULL otherwise).
+  // Indexed by target's offset within targets[]. Used by
+  // force_table_credit_game to decrement deficit only on min(w,l) bumps.
+  StratumTally **stratum_tallies;
 };
 
 static ForceTargetKind parse_kind(const char *s) {
@@ -156,6 +173,47 @@ bool force_table_decrement_target(ForceTable *table, ForceTarget *target) {
     }
   }
   return target->deficit == 0;
+}
+
+void force_table_credit_game(ForceTable *table, ForceTarget *target,
+                             int diff, bool is_win, bool is_tie) {
+  // Tile/pair: count-based semantics (one matched game = one credit).
+  if (target->kind != FORCE_TARGET_STRATUM) {
+    force_table_decrement_target(table, target);
+    return;
+  }
+  // Ties don't change min(wins, losses). Treat them as a non-credit, but
+  // still try to drain progress so a stratum with many ties doesn't stall.
+  // A tie at the boundary (w == l) would have left min unchanged anyway, so
+  // skipping the decrement is correct for the EPV metric. We still update
+  // the tally so future games see accurate state.
+  const int idx = (int)(target - table->targets);
+  StratumTally *st = (table->stratum_tallies != NULL)
+                         ? table->stratum_tallies[idx]
+                         : NULL;
+  int clamped = diff;
+  if (clamped < -FORCE_DIFF_MAX) {
+    clamped = -FORCE_DIFF_MAX;
+  } else if (clamped > FORCE_DIFF_MAX) {
+    clamped = FORCE_DIFF_MAX;
+  }
+  const int bucket = clamped + FORCE_DIFF_MAX;
+  if (is_tie || st == NULL) {
+    return;
+  }
+  // Pack wins in the high 32 bits, losses in the low 32 bits.
+  const uint64_t increment = is_win ? ((uint64_t)1 << 32) : (uint64_t)1;
+  const uint64_t old = atomic_fetch_add_explicit(
+      &st->buckets[bucket], increment, memory_order_relaxed);
+  const uint32_t old_w = (uint32_t)(old >> 32);
+  const uint32_t old_l = (uint32_t)(old & 0xFFFFFFFFu);
+  const uint32_t new_w = old_w + (is_win ? 1u : 0u);
+  const uint32_t new_l = old_l + (is_win ? 0u : 1u);
+  const uint32_t old_min = (old_w < old_l) ? old_w : old_l;
+  const uint32_t new_min = (new_w < new_l) ? new_w : new_l;
+  if (new_min > old_min) {
+    force_table_decrement_target(table, target);
+  }
 }
 
 bool force_table_is_exhausted(const ForceTable *table) {
@@ -340,6 +398,22 @@ ForceTable *force_table_create(const char *csv_path,
   atomic_store_explicit(&table->active_targets, table->num_targets,
                         memory_order_relaxed);
 
+  // Allocate per-target diff tallies for stratum-kind targets. Tile/pair
+  // targets keep tally=NULL since they use count-based decrement.
+  table->stratum_tallies = (StratumTally **)malloc_or_die(
+      sizeof(StratumTally *) * table->num_targets);
+  for (int i = 0; i < table->num_targets; i++) {
+    if (table->targets[i].kind == FORCE_TARGET_STRATUM) {
+      StratumTally *st = (StratumTally *)malloc_or_die(sizeof(StratumTally));
+      for (int b = 0; b < FORCE_DIFF_BUCKETS; b++) {
+        atomic_store_explicit(&st->buckets[b], 0, memory_order_relaxed);
+      }
+      table->stratum_tallies[i] = st;
+    } else {
+      table->stratum_tallies[i] = NULL;
+    }
+  }
+
   fprintf(stderr, "force_table: loaded %d targets from %s (total deficit=%lld)\n",
           table->num_targets, csv_path,
           (long long)force_table_total_remaining(table));
@@ -391,6 +465,12 @@ void force_table_destroy(ForceTable *table) {
   }
   for (int b = 0; b < FORCE_BAG_MAX; b++) {
     free(table->by_bag_ptrs[b]);
+  }
+  if (table->stratum_tallies) {
+    for (int i = 0; i < table->num_targets; i++) {
+      free(table->stratum_tallies[i]);
+    }
+    free(table->stratum_tallies);
   }
   free(table->targets);
   free(table);
