@@ -1088,6 +1088,24 @@ void autoplay_add_game(AutoplayWorker *autoplay_worker,
   }
 }
 
+// Encode a player's current rack as ASCII chars (e.g. "AEINRST", "?ABDIJ").
+// out must have room for RACK_SIZE+1 bytes; the LD's first ld_ml_to_hl byte
+// is used per machine letter (English Scrabble = single ASCII char per tile).
+static void pass_cycle_stringify_rack(const Game *game, int player_index,
+                                      char *out) {
+  const LetterDistribution *ld = game_get_ld(game);
+  const Rack *rack = player_get_rack(game_get_player(game, player_index));
+  const uint16_t dist_size = rack_get_dist_size(rack);
+  int n = 0;
+  for (uint16_t i = 0; i < dist_size && n < RACK_SIZE; i++) {
+    const int c = rack_get_letter(rack, i);
+    for (int k = 0; k < c && n < RACK_SIZE; k++) {
+      out[n++] = ld->ld_ml_to_hl[i][0];
+    }
+  }
+  out[n] = '\0';
+}
+
 void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
                                      GameRunner *game_runner1,
                                      GameRunner *game_runner2,
@@ -1239,9 +1257,13 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
                          i == 0 ? "%s" : "|%s",
                          game_runner1->pass_cycle_history[i]);
       }
+      char p1_final[16] = {0}, p2_final[16] = {0};
+      pass_cycle_stringify_rack(game_runner1->game, bp1, p1_final);
+      pass_cycle_stringify_rack(game_runner1->game, 1 - bp1, p2_final);
       pass_cycle_record(pct, game_runner1->game_number,
                         game_runner1->pass_cycle_bot_rack_str,
                         game_runner1->pass_cycle_opp_rack_str,
+                        p1_final, p2_final,
                         game_runner1->pass_cycle_branch, outcome1,
                         game_runner1->turn_number, hist1);
     }
@@ -1264,9 +1286,13 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
                            i == 0 ? "%s" : "|%s",
                            game_runner2->pass_cycle_history[i]);
         }
+        char p1_final2[16] = {0}, p2_final2[16] = {0};
+        pass_cycle_stringify_rack(game_runner2->game, bp2, p1_final2);
+        pass_cycle_stringify_rack(game_runner2->game, 1 - bp2, p2_final2);
         pass_cycle_record(pct, game_runner2->game_number,
                           game_runner2->pass_cycle_bot_rack_str,
                           game_runner2->pass_cycle_opp_rack_str,
+                          p1_final2, p2_final2,
                           game_runner2->pass_cycle_branch, outcome2,
                           game_runner2->turn_number, hist2);
       }

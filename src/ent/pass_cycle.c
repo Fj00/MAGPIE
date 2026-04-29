@@ -125,7 +125,9 @@ PassCycleTable *pass_cycle_table_create(const char *pool_path,
     free(weights);
     return NULL;
   }
-  fprintf(out, "pair_id,p1_rack,p2_rack,branch,outcome,num_turns,history\n");
+  fprintf(out,
+          "pair_id,p1_rack,p2_rack,p1_final_rack,p2_final_rack,"
+          "branch,outcome,num_turns,history\n");
   fflush(out);
 
   PassCycleTable *table = malloc_or_die(sizeof(PassCycleTable));
@@ -209,11 +211,14 @@ bool pass_cycle_sample_racks(const PassCycleTable *table, uint64_t pair_id,
 
 void pass_cycle_record(PassCycleTable *table, uint64_t pair_id,
                        const char *p1_rack, const char *p2_rack,
+                       const char *p1_final_rack, const char *p2_final_rack,
                        int branch, int outcome, int num_turns,
                        const char *history) {
   pthread_mutex_lock(&table->out_mutex);
-  fprintf(table->out_file, "%llu,%s,%s,%d,%d,%d,%s\n",
+  fprintf(table->out_file, "%llu,%s,%s,%s,%s,%d,%d,%d,%s\n",
           (unsigned long long)pair_id, p1_rack, p2_rack,
+          p1_final_rack ? p1_final_rack : "",
+          p2_final_rack ? p2_final_rack : "",
           branch, outcome, num_turns, history ? history : "");
   pthread_mutex_unlock(&table->out_mutex);
 }

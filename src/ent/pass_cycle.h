@@ -32,9 +32,12 @@ bool pass_cycle_sample_racks(const PassCycleTable *table, uint64_t pair_id,
 // Write one game result row. Thread-safe.
 // branch:     0 = P1 passes turn 0 (while board empty), 1 = P1 plays normally.
 // outcome:    0 = loss, 1 = tie, 2 = win (from P1's perspective).
+// p{1,2}_final_rack: rack composition at game-end (after final draw),
+//                    used for end-game rack-value scoring.
 // history:    pipe-joined per-turn "<rack>:<move>" trace, or NULL.
 void pass_cycle_record(PassCycleTable *table, uint64_t pair_id,
                        const char *p1_rack, const char *p2_rack,
+                       const char *p1_final_rack, const char *p2_final_rack,
                        int branch, int outcome, int num_turns,
                        const char *history);
 
