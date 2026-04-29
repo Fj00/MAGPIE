@@ -13,6 +13,7 @@
 #include "../def/thread_control_defs.h"
 #include "../ent/autoplay_results.h"
 #include "../ent/bag.h"
+#include "../ent/board.h"
 #include "../ent/checkpoint.h"
 #include "../ent/data_filepaths.h"
 #include "../ent/equity.h"
@@ -532,6 +533,10 @@ typedef struct GameRunner {
   int pass_cycle_bot_player;
   const char *pass_cycle_bot_rack_str;
   const char *pass_cycle_opp_rack_str;
+  // Per-turn (rack, move) trace for downstream counterfactual reconstruction.
+  // Each entry encodes "<rack>:<move>" where move is "P" or "X<tiles>".
+  char pass_cycle_history[6][24];
+  int pass_cycle_n_moves;
 } GameRunner;
 
 GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
@@ -603,6 +608,7 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   game_runner->pass_cycle_bot_player = starting_player_index;
   game_runner->pass_cycle_bot_rack_str = NULL;
   game_runner->pass_cycle_opp_rack_str = NULL;
+  game_runner->pass_cycle_n_moves = 0;
   if (!used_forced_rack && game_runner->shared_data->pass_cycle_table) {
     PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
     const char *p1_rack = NULL;
@@ -906,10 +912,14 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     move_set_as_pass(spare);
     move = spare;
   }
-  // Pass-cycle mode: bot passes every turn (not just turn 0) in branch 0.
+  // Pass-cycle mode: P1 force-passes while the board is still empty (the
+  // empty-board rack classification only applies until tiles are placed).
+  // The board can stay empty across multiple turns if the opponent keeps
+  // exchanging. Once any tile is placed, P1 reverts to normal play.
   if (!move && game_runner->pass_cycle_active &&
       game_runner->pass_cycle_branch == 0 &&
-      player_on_turn_index == game_runner->pass_cycle_bot_player) {
+      player_on_turn_index == game_runner->pass_cycle_bot_player &&
+      board_get_tiles_played(game_get_board(game)) == 0) {
     Move *spare = move_list_get_spare_move(
         autoplay_worker->move_lists[player_on_turn_index]);
     move_set_as_pass(spare);
@@ -977,6 +987,41 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     thread_control_print(autoplay_worker->args.thread_control,
                          string_builder_peek(output));
     string_builder_destroy(output);
+  }
+
+  // Pass-cycle history: capture (rack, move) for the first 6 turns. Only
+  // 6-pass-end games get recorded, so anything past turn 5 is irrelevant.
+  if (game_runner->pass_cycle_active && game_runner->pass_cycle_n_moves < 6) {
+    char *slot =
+        game_runner->pass_cycle_history[game_runner->pass_cycle_n_moves];
+    char rack_buf[RACK_SIZE + 2] = {0};
+    int rb = 0;
+    const LetterDistribution *ld = game_get_ld(game);
+    const uint16_t dist_size = rack_get_dist_size(player_rack);
+    for (uint16_t i = 0; i < dist_size && rb < RACK_SIZE; i++) {
+      const int n = rack_get_letter(player_rack, i);
+      for (int k = 0; k < n && rb < RACK_SIZE; k++) {
+        rack_buf[rb++] = ld->ld_ml_to_hl[i][0];
+      }
+    }
+    rack_buf[rb] = '\0';
+    const game_event_t mt = move_get_type(move);
+    if (mt == GAME_EVENT_EXCHANGE) {
+      char tiles[RACK_SIZE + 2] = {0};
+      const int nt = move_get_tiles_played(move);
+      for (int i = 0; i < nt && i < RACK_SIZE; i++) {
+        const MachineLetter ml = move_get_tile(move, i);
+        tiles[i] = ld->ld_ml_to_hl[ml][0];
+      }
+      snprintf(slot, 24, "%s:X%s", rack_buf, tiles);
+    } else if (mt == GAME_EVENT_PASS) {
+      snprintf(slot, 24, "%s:P", rack_buf);
+    } else {
+      // Tile placement on what should still be an empty board: shouldn't
+      // happen in 6-pass paths, but encode defensively.
+      snprintf(slot, 24, "%s:T", rack_buf);
+    }
+    game_runner->pass_cycle_n_moves++;
   }
 
   play_move(move, game, NULL);
@@ -1170,39 +1215,61 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
     }
   }
 
-  // Pass-cycle mode: write per-game result rows.
+  // Pass-cycle mode: only record games where the 6-pass cycle fired from
+  // the OPENING (turns 1-6, board still empty). Late-game lockups where
+  // the cycle fires after tiles were placed don't belong to the
+  // pass-strategy dataset (those are different positions).
   PassCycleTable *pct = autoplay_worker->shared_data->pass_cycle_table;
   if (pct && game_runner1->pass_cycle_active) {
-    const int bp1 = game_runner1->pass_cycle_bot_player;
-    const int ms1 = equity_to_int(
-        player_get_score(game_get_player(game_runner1->game, bp1)));
-    const int os1 = equity_to_int(
-        player_get_score(game_get_player(game_runner1->game, 1 - bp1)));
-    const int outcome1 = ms1 > os1 ? 2 : (ms1 == os1 ? 1 : 0);
-    const int end1 =
-        (game_get_game_end_reason(game_runner1->game) ==
-         GAME_END_REASON_CONSECUTIVE_ZEROS) ? 1 : 0;
-    pass_cycle_record(pct, game_runner1->game_number,
-                      game_runner1->pass_cycle_bot_rack_str,
-                      game_runner1->pass_cycle_opp_rack_str,
-                      game_runner1->pass_cycle_branch, outcome1, end1,
-                      game_runner1->turn_number);
-
+    const bool g1_six_pass =
+        game_get_game_end_reason(game_runner1->game) ==
+            GAME_END_REASON_CONSECUTIVE_ZEROS &&
+        board_get_tiles_played(game_get_board(game_runner1->game)) == 0;
+    if (g1_six_pass) {
+      const int bp1 = game_runner1->pass_cycle_bot_player;
+      const int ms1 = equity_to_int(
+          player_get_score(game_get_player(game_runner1->game, bp1)));
+      const int os1 = equity_to_int(
+          player_get_score(game_get_player(game_runner1->game, 1 - bp1)));
+      const int outcome1 = ms1 > os1 ? 2 : (ms1 == os1 ? 1 : 0);
+      char hist1[160] = {0};
+      int off1 = 0;
+      for (int i = 0; i < game_runner1->pass_cycle_n_moves; i++) {
+        off1 += snprintf(hist1 + off1, sizeof(hist1) - (size_t)off1,
+                         i == 0 ? "%s" : "|%s",
+                         game_runner1->pass_cycle_history[i]);
+      }
+      pass_cycle_record(pct, game_runner1->game_number,
+                        game_runner1->pass_cycle_bot_rack_str,
+                        game_runner1->pass_cycle_opp_rack_str,
+                        game_runner1->pass_cycle_branch, outcome1,
+                        game_runner1->turn_number, hist1);
+    }
     if (game_runner2 && game_runner2->pass_cycle_active) {
-      const int bp2 = game_runner2->pass_cycle_bot_player;
-      const int ms2 = equity_to_int(
-          player_get_score(game_get_player(game_runner2->game, bp2)));
-      const int os2 = equity_to_int(
-          player_get_score(game_get_player(game_runner2->game, 1 - bp2)));
-      const int outcome2 = ms2 > os2 ? 2 : (ms2 == os2 ? 1 : 0);
-      const int end2 =
-          (game_get_game_end_reason(game_runner2->game) ==
-           GAME_END_REASON_CONSECUTIVE_ZEROS) ? 1 : 0;
-      pass_cycle_record(pct, game_runner2->game_number,
-                        game_runner2->pass_cycle_bot_rack_str,
-                        game_runner2->pass_cycle_opp_rack_str,
-                        game_runner2->pass_cycle_branch, outcome2, end2,
-                        game_runner2->turn_number);
+      const bool g2_six_pass =
+          game_get_game_end_reason(game_runner2->game) ==
+              GAME_END_REASON_CONSECUTIVE_ZEROS &&
+          board_get_tiles_played(game_get_board(game_runner2->game)) == 0;
+      if (g2_six_pass) {
+        const int bp2 = game_runner2->pass_cycle_bot_player;
+        const int ms2 = equity_to_int(
+            player_get_score(game_get_player(game_runner2->game, bp2)));
+        const int os2 = equity_to_int(
+            player_get_score(game_get_player(game_runner2->game, 1 - bp2)));
+        const int outcome2 = ms2 > os2 ? 2 : (ms2 == os2 ? 1 : 0);
+        char hist2[160] = {0};
+        int off2 = 0;
+        for (int i = 0; i < game_runner2->pass_cycle_n_moves; i++) {
+          off2 += snprintf(hist2 + off2, sizeof(hist2) - (size_t)off2,
+                           i == 0 ? "%s" : "|%s",
+                           game_runner2->pass_cycle_history[i]);
+        }
+        pass_cycle_record(pct, game_runner2->game_number,
+                          game_runner2->pass_cycle_bot_rack_str,
+                          game_runner2->pass_cycle_opp_rack_str,
+                          game_runner2->pass_cycle_branch, outcome2,
+                          game_runner2->turn_number, hist2);
+      }
     }
   }
 }
