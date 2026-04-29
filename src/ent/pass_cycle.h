@@ -23,11 +23,14 @@ void pass_cycle_table_destroy(PassCycleTable *table);
 
 // Sample P1 and P2 racks for pair_id. P1 is drawn from the full pool;
 // P2 is drawn from the subset still drawable after P1's tiles are removed.
+// *p1_is_pass_out is set to 1 if P1's rack is a pass-favorable candidate
+// (force-pass eligible), 0 if exchange-only.
 // Returns false only if no drawable P2 rack exists (should not happen in
 // practice with a standard Scrabble bag).
 bool pass_cycle_sample_racks(const PassCycleTable *table, uint64_t pair_id,
                              const char **p1_rack_out,
-                             const char **p2_rack_out);
+                             const char **p2_rack_out,
+                             int *p1_is_pass_out);
 
 // Write one game result row. Thread-safe.
 // branch:     0 = P1 passes turn 0 (while board empty), 1 = P1 plays normally.

@@ -23,6 +23,7 @@ struct PassCycleTable {
   char **racks;
   RackTiles *tile_counts;  // parsed tile composition per rack
   double *cum_weights;     // cumulative normalized weights for binary search
+  uint8_t *is_pass;        // 1 = pass-favorable, 0 = exchange-only
   int num_racks;
 
   FILE *out_file;
@@ -87,6 +88,7 @@ PassCycleTable *pass_cycle_table_create(const char *pool_path,
   char **racks = malloc_or_die(sizeof(char *) * (size_t)count);
   RackTiles *tiles = malloc_or_die(sizeof(RackTiles) * (size_t)count);
   double *weights = malloc_or_die(sizeof(double) * (size_t)count);
+  uint8_t *is_pass_arr = malloc_or_die(sizeof(uint8_t) * (size_t)count);
   int idx = 0;
   while (fgets(line, sizeof(line), f) && idx < count) {
     size_t len = strlen(line);
@@ -95,12 +97,14 @@ PassCycleTable *pass_cycle_table_create(const char *pool_path,
     if (len == 0) continue;
     char rack_buf[PASS_CYCLE_MAX_RACK_LEN + 1] = {0};
     double w = 0.0;
-    if (sscanf(line, "%15[^,],%lf", rack_buf, &w) != 2) continue;
+    int isp = 0;
+    if (sscanf(line, "%15[^,],%lf,%d", rack_buf, &w, &isp) < 2) continue;
     char *copy = malloc_or_die(strlen(rack_buf) + 1);
     strcpy(copy, rack_buf);
     racks[idx] = copy;
     parse_rack_tiles(rack_buf, &tiles[idx]);
     weights[idx] = w;
+    is_pass_arr[idx] = (uint8_t)(isp ? 1 : 0);
     idx++;
   }
   fclose(f);
@@ -123,6 +127,7 @@ PassCycleTable *pass_cycle_table_create(const char *pool_path,
     free(racks);
     free(tiles);
     free(weights);
+    free(is_pass_arr);
     return NULL;
   }
   fprintf(out,
@@ -130,16 +135,22 @@ PassCycleTable *pass_cycle_table_create(const char *pool_path,
           "branch,outcome,num_turns,history\n");
   fflush(out);
 
+  int n_pass = 0;
+  for (int i = 0; i < count; i++) n_pass += is_pass_arr[i];
+
   PassCycleTable *table = malloc_or_die(sizeof(PassCycleTable));
   table->racks = racks;
   table->tile_counts = tiles;
   table->cum_weights = weights;
+  table->is_pass = is_pass_arr;
   table->num_racks = count;
   table->out_file = out;
   pthread_mutex_init(&table->out_mutex, NULL);
 
-  fprintf(stderr, "pass_cycle: %d racks in combined pool; output -> %s\n",
-          count, out_path);
+  fprintf(stderr,
+          "pass_cycle: %d racks in combined pool (%d pass-favorable); "
+          "output -> %s\n",
+          count, n_pass, out_path);
   return table;
 }
 
@@ -149,6 +160,7 @@ void pass_cycle_table_destroy(PassCycleTable *table) {
   free(table->racks);
   free(table->tile_counts);
   free(table->cum_weights);
+  free(table->is_pass);
   if (table->out_file) {
     fflush(table->out_file);
     fclose(table->out_file);
@@ -170,11 +182,13 @@ static int sample_by_weight(const PassCycleTable *table, double u) {
 
 bool pass_cycle_sample_racks(const PassCycleTable *table, uint64_t pair_id,
                              const char **p1_rack_out,
-                             const char **p2_rack_out) {
+                             const char **p2_rack_out,
+                             int *p1_is_pass_out) {
   // P1: hash(pair_id) -> weighted sample from full pool.
   const uint64_t h1 = mix64(pair_id * 2ULL + 1ULL);
   const int p1_idx = sample_by_weight(table, uniform01(h1));
   *p1_rack_out = table->racks[p1_idx];
+  if (p1_is_pass_out) *p1_is_pass_out = (int)table->is_pass[p1_idx];
 
   // Remaining bag after P1's draw.
   uint8_t bag[PASS_CYCLE_TILE_TYPES];

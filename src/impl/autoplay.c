@@ -529,6 +529,7 @@ typedef struct GameRunner {
   // Pass-cycle mode: both players' racks are forced; branch 0 = bot always
   // passes every turn, branch 1 = bot plays normally.
   bool pass_cycle_active;
+  bool pass_cycle_p1_is_pass;  // P1 rack came from pass-favorable subset
   int pass_cycle_branch;
   int pass_cycle_bot_player;
   const char *pass_cycle_bot_rack_str;
@@ -604,6 +605,7 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   // (round-robin by iter_count); opp gets a weighted exchange-prone rack.
   // Both games in a pair use the same racks but different branches.
   game_runner->pass_cycle_active = false;
+  game_runner->pass_cycle_p1_is_pass = false;
   game_runner->pass_cycle_branch = 0;
   game_runner->pass_cycle_bot_player = starting_player_index;
   game_runner->pass_cycle_bot_rack_str = NULL;
@@ -613,8 +615,9 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
     PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
     const char *p1_rack = NULL;
     const char *p2_rack = NULL;
+    int p1_is_pass = 0;
     if (pass_cycle_sample_racks(pct, iter_output->iter_count, &p1_rack,
-                                &p2_rack)) {
+                                &p2_rack, &p1_is_pass)) {
       // P1 is the starting player (the one who passes in branch 0).
       const int p1 = starting_player_index;
       const int p2 = 1 - starting_player_index;
@@ -627,6 +630,7 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
           draw_to_full_rack(game, p2);
         }
         game_runner->pass_cycle_active = true;
+        game_runner->pass_cycle_p1_is_pass = p1_is_pass != 0;
         game_runner->pass_cycle_branch = (pair_game_number == 2) ? 1 : 0;
         game_runner->pass_cycle_bot_player = p1;
         game_runner->pass_cycle_bot_rack_str = p1_rack;
@@ -912,11 +916,12 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     move_set_as_pass(spare);
     move = spare;
   }
-  // Pass-cycle mode: P1 force-passes while the board is still empty (the
-  // empty-board rack classification only applies until tiles are placed).
-  // The board can stay empty across multiple turns if the opponent keeps
-  // exchanging. Once any tile is placed, P1 reverts to normal play.
+  // Pass-cycle mode: P1 force-passes only if their rack came from the
+  // pass-favorable subset and the board is still empty. P1 racks drawn
+  // from the exchange-only subset play naturally — the 6-pass cycle then
+  // arises organically when both players' natural decisions keep zeroing.
   if (!move && game_runner->pass_cycle_active &&
+      game_runner->pass_cycle_p1_is_pass &&
       game_runner->pass_cycle_branch == 0 &&
       player_on_turn_index == game_runner->pass_cycle_bot_player &&
       board_get_tiles_played(game_get_board(game)) == 0) {
