@@ -233,23 +233,29 @@ bool pass_cycle_sample_racks(const PassCycleTable *table, uint64_t pair_id,
     bag[i] -= p1_tiles->counts[i];
   }
 
-  // P2: hash(pair_id, attempt) -> weighted sample, retry if not drawable.
-  // Expected retry rate is very low since the bag has 93 tiles remaining
-  // and most 7-tile racks are easily drawable.
+  // If P1 drew a pass-favorable rack, exclude pass-favorable racks from
+  // P2's draw — the (pass, pass) pairing is uninteresting (deterministic
+  // 6-pass cycle, no exchanges). P2 may still later exchange INTO a
+  // pass-favorable rack, which is fine and handled by the per-turn lookup.
+  const bool exclude_pass_for_p2 = (table->is_pass[p1_idx] == 1);
+
+  // P2: hash(pair_id, attempt) -> weighted sample with rejection.
   for (int attempt = 0; attempt < 32; attempt++) {
     const uint64_t h2 = mix64(pair_id * 2ULL + (uint64_t)attempt * 7919ULL);
     const int p2_idx = sample_by_weight(table, uniform01(h2));
+    if (exclude_pass_for_p2 && table->is_pass[p2_idx] == 1) continue;
     if (rack_drawable(&table->tile_counts[p2_idx], bag)) {
       *p2_rack_out = table->racks[p2_idx];
       return true;
     }
   }
   // Fallback: linear scan from a random starting point for the first
-  // drawable rack. Should almost never be reached.
+  // drawable rack that satisfies the exclusion. Should almost never be reached.
   const uint64_t hf = mix64(pair_id ^ 0xdeadbeefULL);
   const int start = (int)(hf % (uint64_t)table->num_racks);
   for (int i = 0; i < table->num_racks; i++) {
     const int idx = (start + i) % table->num_racks;
+    if (exclude_pass_for_p2 && table->is_pass[idx] == 1) continue;
     if (rack_drawable(&table->tile_counts[idx], bag)) {
       *p2_rack_out = table->racks[idx];
       return true;
