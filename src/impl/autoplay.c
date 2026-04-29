@@ -5,6 +5,7 @@
 #include "../compat/ctime.h"
 #include "../def/autoplay_defs.h"
 #include "../def/cpthread_defs.h"
+#include "../def/game_defs.h"
 #include "../def/game_history_defs.h"
 #include "../def/letter_distribution_defs.h"
 #include "../def/players_data_defs.h"
@@ -18,6 +19,7 @@
 #include "../ent/force_table.h"
 #include "../ent/game.h"
 #include "../ent/opening_pass.h"
+#include "../ent/pass_cycle.h"
 #include "../ent/inference_args.h"
 #include "../ent/inference_results.h"
 #include "../ent/klv.h"
@@ -77,6 +79,7 @@ typedef struct AutoplaySharedData {
   bool stop_on_force_exhaust;
   OpeningPassTable *opening_pass_table;
   bool stop_on_opening_pass_complete;
+  PassCycleTable *pass_cycle_table;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -436,6 +439,14 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   shared_data->stop_on_opening_pass_complete =
       shared_data->opening_pass_table != NULL &&
       getenv("MAGPIE_OPENING_PASS_STOP_ON_COMPLETE") != NULL;
+
+  shared_data->pass_cycle_table = NULL;
+  const char *pc_racks = getenv("MAGPIE_PASS_CYCLE_RACKS");
+  const char *pc_out = getenv("MAGPIE_PASS_CYCLE_OUT");
+  if (pc_racks && pc_racks[0] != '\0' && pc_out && pc_out[0] != '\0') {
+    shared_data->pass_cycle_table =
+        pass_cycle_table_create(pc_racks, pc_out);
+  }
   return shared_data;
 }
 
@@ -479,6 +490,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
     }
   }
   opening_pass_table_destroy(shared_data->opening_pass_table);
+  pass_cycle_table_destroy(shared_data->pass_cycle_table);
   free(shared_data);
 }
 
@@ -513,6 +525,13 @@ typedef struct GameRunner {
   int opening_pass_rack_idx;
   int opening_pass_branch;
   int opening_pass_player_index;
+  // Pass-cycle mode: both players' racks are forced; branch 0 = bot always
+  // passes every turn, branch 1 = bot plays normally.
+  bool pass_cycle_active;
+  int pass_cycle_branch;
+  int pass_cycle_bot_player;
+  const char *pass_cycle_bot_rack_str;
+  const char *pass_cycle_opp_rack_str;
 } GameRunner;
 
 GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
@@ -572,6 +591,40 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
         game_runner->opening_pass_rack_idx = rack_idx;
         game_runner->opening_pass_branch =
             (pair_game_number == 2) ? 1 : 0;
+        used_forced_rack = true;
+      }
+    }
+  }
+  // Pass-cycle mode: force both racks. Bot gets a pass-favorable rack
+  // (round-robin by iter_count); opp gets a weighted exchange-prone rack.
+  // Both games in a pair use the same racks but different branches.
+  game_runner->pass_cycle_active = false;
+  game_runner->pass_cycle_branch = 0;
+  game_runner->pass_cycle_bot_player = starting_player_index;
+  game_runner->pass_cycle_bot_rack_str = NULL;
+  game_runner->pass_cycle_opp_rack_str = NULL;
+  if (!used_forced_rack && game_runner->shared_data->pass_cycle_table) {
+    PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
+    const char *p1_rack = NULL;
+    const char *p2_rack = NULL;
+    if (pass_cycle_sample_racks(pct, iter_output->iter_count, &p1_rack,
+                                &p2_rack)) {
+      // P1 is the starting player (the one who passes in branch 0).
+      const int p1 = starting_player_index;
+      const int p2 = 1 - starting_player_index;
+      const int n1 = draw_rack_string_from_bag(game, p1, p1_rack);
+      if (n1 > 0) {
+        const int n2 = draw_rack_string_from_bag(game, p2, p2_rack);
+        if (n2 <= 0) {
+          // Should not happen given pass_cycle_sample_racks filtering,
+          // but fall back to random draw just in case.
+          draw_to_full_rack(game, p2);
+        }
+        game_runner->pass_cycle_active = true;
+        game_runner->pass_cycle_branch = (pair_game_number == 2) ? 1 : 0;
+        game_runner->pass_cycle_bot_player = p1;
+        game_runner->pass_cycle_bot_rack_str = p1_rack;
+        game_runner->pass_cycle_opp_rack_str = p2_rack;
         used_forced_rack = true;
       }
     }
@@ -853,6 +906,15 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     move_set_as_pass(spare);
     move = spare;
   }
+  // Pass-cycle mode: bot passes every turn (not just turn 0) in branch 0.
+  if (!move && game_runner->pass_cycle_active &&
+      game_runner->pass_cycle_branch == 0 &&
+      player_on_turn_index == game_runner->pass_cycle_bot_player) {
+    Move *spare = move_list_get_spare_move(
+        autoplay_worker->move_lists[player_on_turn_index]);
+    move_set_as_pass(spare);
+    move = spare;
+  }
   if (!move) {
     move = try_forced_move(autoplay_worker, game_runner);
   }
@@ -993,7 +1055,10 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
   const bool opening_pass_paired =
       autoplay_worker->shared_data->opening_pass_table != NULL &&
       game_runner2 != NULL;
-  const int runner2_starter = opening_pass_paired
+  const bool pass_cycle_paired =
+      autoplay_worker->shared_data->pass_cycle_table != NULL &&
+      game_runner2 != NULL;
+  const int runner2_starter = (opening_pass_paired || pass_cycle_paired)
                                   ? starting_player_index
                                   : 1 - starting_player_index;
   game_runner_start(autoplay_worker, game_runner1, iter_output,
@@ -1102,6 +1167,42 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
                                    : outcome1;
       opening_pass_record_pair(op_table, rack_idx, pass_outcome,
                                play_outcome);
+    }
+  }
+
+  // Pass-cycle mode: write per-game result rows.
+  PassCycleTable *pct = autoplay_worker->shared_data->pass_cycle_table;
+  if (pct && game_runner1->pass_cycle_active) {
+    const int bp1 = game_runner1->pass_cycle_bot_player;
+    const int ms1 = equity_to_int(
+        player_get_score(game_get_player(game_runner1->game, bp1)));
+    const int os1 = equity_to_int(
+        player_get_score(game_get_player(game_runner1->game, 1 - bp1)));
+    const int outcome1 = ms1 > os1 ? 2 : (ms1 == os1 ? 1 : 0);
+    const int end1 =
+        (game_get_game_end_reason(game_runner1->game) ==
+         GAME_END_REASON_CONSECUTIVE_ZEROS) ? 1 : 0;
+    pass_cycle_record(pct, game_runner1->game_number,
+                      game_runner1->pass_cycle_bot_rack_str,
+                      game_runner1->pass_cycle_opp_rack_str,
+                      game_runner1->pass_cycle_branch, outcome1, end1,
+                      game_runner1->turn_number);
+
+    if (game_runner2 && game_runner2->pass_cycle_active) {
+      const int bp2 = game_runner2->pass_cycle_bot_player;
+      const int ms2 = equity_to_int(
+          player_get_score(game_get_player(game_runner2->game, bp2)));
+      const int os2 = equity_to_int(
+          player_get_score(game_get_player(game_runner2->game, 1 - bp2)));
+      const int outcome2 = ms2 > os2 ? 2 : (ms2 == os2 ? 1 : 0);
+      const int end2 =
+          (game_get_game_end_reason(game_runner2->game) ==
+           GAME_END_REASON_CONSECUTIVE_ZEROS) ? 1 : 0;
+      pass_cycle_record(pct, game_runner2->game_number,
+                        game_runner2->pass_cycle_bot_rack_str,
+                        game_runner2->pass_cycle_opp_rack_str,
+                        game_runner2->pass_cycle_branch, outcome2, end2,
+                        game_runner2->turn_number);
     }
   }
 }
