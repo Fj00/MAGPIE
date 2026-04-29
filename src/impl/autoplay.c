@@ -17,6 +17,7 @@
 #include "../ent/equity.h"
 #include "../ent/force_table.h"
 #include "../ent/game.h"
+#include "../ent/opening_pass.h"
 #include "../ent/inference_args.h"
 #include "../ent/inference_results.h"
 #include "../ent/klv.h"
@@ -74,6 +75,8 @@ typedef struct AutoplaySharedData {
   LeavegenSharedData *leavegen_shared_data;
   ForceTable *force_table;
   bool stop_on_force_exhaust;
+  OpeningPassTable *opening_pass_table;
+  bool stop_on_opening_pass_complete;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -100,6 +103,9 @@ bool autoplay_get_next_iter_output(AutoplaySharedData *shared_data,
     at_stop_count = true;
   } else if (shared_data->stop_on_force_exhaust &&
              force_table_is_exhausted(shared_data->force_table)) {
+    at_stop_count = true;
+  } else if (shared_data->stop_on_opening_pass_complete &&
+             opening_pass_table_is_complete(shared_data->opening_pass_table)) {
     at_stop_count = true;
   } else {
     iter_output->seed = prng_next(shared_data->prng);
@@ -415,6 +421,21 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   shared_data->stop_on_force_exhaust =
       shared_data->force_table != NULL &&
       getenv("MAGPIE_FORCE_STOP_ON_EXHAUST") != NULL;
+
+  shared_data->opening_pass_table = NULL;
+  const char *op_path = getenv("MAGPIE_OPENING_PASS_TABLE");
+  if (op_path && op_path[0] != '\0') {
+    shared_data->opening_pass_table =
+        opening_pass_table_create(op_path, args->game_args->ld);
+    const char *resume_path = getenv("MAGPIE_OPENING_PASS_RESUME");
+    if (shared_data->opening_pass_table && resume_path &&
+        resume_path[0] != '\0') {
+      opening_pass_table_resume(shared_data->opening_pass_table, resume_path);
+    }
+  }
+  shared_data->stop_on_opening_pass_complete =
+      shared_data->opening_pass_table != NULL &&
+      getenv("MAGPIE_OPENING_PASS_STOP_ON_COMPLETE") != NULL;
   return shared_data;
 }
 
@@ -446,6 +467,18 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
     }
   }
   force_table_destroy(shared_data->force_table);
+  if (shared_data->opening_pass_table) {
+    fprintf(stderr,
+            "opening_pass: %d racks; remaining target games = %lld\n",
+            opening_pass_table_num_racks(shared_data->opening_pass_table),
+            (long long)opening_pass_table_remaining(
+                shared_data->opening_pass_table));
+    const char *out_path = getenv("MAGPIE_OPENING_PASS_OUT");
+    if (out_path && out_path[0] != '\0') {
+      opening_pass_table_dump(shared_data->opening_pass_table, out_path);
+    }
+  }
+  opening_pass_table_destroy(shared_data->opening_pass_table);
   free(shared_data);
 }
 
@@ -471,6 +504,15 @@ typedef struct GameRunner {
   ForceTarget *pending_force_target;
   int pending_force_diff; // forcing player's score - opponent's at force turn
   int pending_force_player_index; // 0 or 1
+  // Opening-pass mode state. opening_pass_rack_idx >= 0 indicates this
+  // game has a forced opening rack from the opening_pass_table.
+  // opening_pass_branch: 0 = pass branch (force pass on opening turn),
+  //                     1 = play branch (normal play, used as counterfactual).
+  // opening_pass_player_index: which player has the forced rack (always
+  // the starter, so the first move belongs to them).
+  int opening_pass_rack_idx;
+  int opening_pass_branch;
+  int opening_pass_player_index;
 } GameRunner;
 
 GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
@@ -508,7 +550,36 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   autoplay_worker->args.p1_sim_args.seed = iter_output->seed;
   autoplay_worker->args.p2_sim_args.seed = iter_output->seed;
   game_set_starting_player_index(game, starting_player_index);
-  draw_starting_racks(game);
+
+  // Opening-pass mode: force the starter's rack to a candidate from the
+  // table; opponent draws normally from the remaining bag. Branch derived
+  // from pair_game_number (1=pass, 2=play; 0 falls back to pass for
+  // unpaired runs, though paired runs are the supported configuration).
+  game_runner->opening_pass_rack_idx = -1;
+  game_runner->opening_pass_branch = 0;
+  game_runner->opening_pass_player_index = starting_player_index;
+  bool used_forced_rack = false;
+  if (game_runner->shared_data->opening_pass_table) {
+    int rack_idx = -1;
+    const char *rack_str = opening_pass_table_get_rack(
+        game_runner->shared_data->opening_pass_table,
+        iter_output->iter_count, &rack_idx);
+    if (rack_str) {
+      const int n = draw_rack_string_from_bag(game, starting_player_index,
+                                              rack_str);
+      if (n > 0) {
+        draw_to_full_rack(game, 1 - starting_player_index);
+        game_runner->opening_pass_rack_idx = rack_idx;
+        game_runner->opening_pass_branch =
+            (pair_game_number == 2) ? 1 : 0;
+        used_forced_rack = true;
+      }
+    }
+  }
+  if (!used_forced_rack) {
+    draw_starting_racks(game);
+  }
+
   if (game_runner->game_one_move_behind) {
     Game *game_one_move_behind = game_runner->game_one_move_behind;
     game_reset(game_one_move_behind);
@@ -680,11 +751,20 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
       if (target->deficit <= 0 || (int)target->kind != priority) {
         continue;
       }
+      // Compute current score-diff once per (target × move-list pass) so the
+      // force_target_matches diff-range check has it available. Diff is the
+      // player_on_turn's score minus opp's at the moment of decision.
+      const int p_idx = game_get_player_on_turn_index(game);
+      const int my_score =
+          equity_to_int(player_get_score(game_get_player(game, p_idx)));
+      const int opp_score =
+          equity_to_int(player_get_score(game_get_player(game, 1 - p_idx)));
+      const int cur_diff = my_score - opp_score;
       for (int m = 0; m < n_moves; m++) {
         Move *move = move_list_get_move(ml, m);
         get_leave_for_move(move, game, &leave);
         const int score = equity_to_int(move_get_score(move));
-        if (!force_target_matches(target, &leave, score)) {
+        if (!force_target_matches(target, &leave, score, cur_diff)) {
           continue;
         }
         // force_target_matches does not check the cons/mixed/vowel type
@@ -699,13 +779,8 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
         // (autoplay_add_game) once the diff/outcome are final, so stratum
         // targets only debit when min(wins, losses) actually moves.
         game_runner->pending_force_target = target;
-        const int p_idx = game_get_player_on_turn_index(game);
         game_runner->pending_force_player_index = p_idx;
-        const int my_score =
-            equity_to_int(player_get_score(game_get_player(game, p_idx)));
-        const int opp_score =
-            equity_to_int(player_get_score(game_get_player(game, 1 - p_idx)));
-        game_runner->pending_force_diff = my_score - opp_score;
+        game_runner->pending_force_diff = cur_diff;
         return move;
       }
     }
@@ -766,7 +841,21 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     rack_copy(player_rack, &original_rack);
   }
 
-  const Move *move = try_forced_move(autoplay_worker, game_runner);
+  const Move *move = NULL;
+  // Opening-pass mode: on the opening turn of the starter (the player with
+  // the forced rack) in the pass branch, override the move with a pass.
+  if (game_runner->opening_pass_rack_idx >= 0 &&
+      game_runner->opening_pass_branch == 0 &&
+      game_runner->turn_number == 0 &&
+      player_on_turn_index == game_runner->opening_pass_player_index) {
+    Move *spare = move_list_get_spare_move(
+        autoplay_worker->move_lists[player_on_turn_index]);
+    move_set_as_pass(spare);
+    move = spare;
+  }
+  if (!move) {
+    move = try_forced_move(autoplay_worker, game_runner);
+  }
   if (!move) {
     move = game_runner_get_best_move(autoplay_worker, game_runner);
   }
@@ -897,11 +986,21 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
                                      GameRunner *game_runner2,
                                      const AutoplayIterOutput *iter_output) {
   const int starting_player_index = (int)(iter_output->iter_count % 2);
+  // Opening-pass paired mode: both runners use the SAME starting player so
+  // the forced rack and force-pass logic apply to the same player slot in
+  // both games. The branch (pass vs play) differentiates them via
+  // pair_game_number.
+  const bool opening_pass_paired =
+      autoplay_worker->shared_data->opening_pass_table != NULL &&
+      game_runner2 != NULL;
+  const int runner2_starter = opening_pass_paired
+                                  ? starting_player_index
+                                  : 1 - starting_player_index;
   game_runner_start(autoplay_worker, game_runner1, iter_output,
                     starting_player_index, game_runner2 ? 1 : 0);
   if (game_runner2) {
     game_runner_start(autoplay_worker, game_runner2, iter_output,
-                      1 - starting_player_index, 2);
+                      runner2_starter, 2);
   }
   bool games_are_divergent = false;
   while (true) {
@@ -966,6 +1065,44 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
     // does not use game pairs and therefore does not have a second
     // game runner.
     autoplay_add_game(autoplay_worker, game_runner2, games_are_divergent);
+  }
+
+  // Opening-pass mode: record per-game outcomes and (if paired) the
+  // paired-difference statistics for the forced-rack player's perspective.
+  OpeningPassTable *op_table =
+      autoplay_worker->shared_data->opening_pass_table;
+  if (op_table && game_runner1->opening_pass_rack_idx >= 0) {
+    const int rack_idx = game_runner1->opening_pass_rack_idx;
+    const int p1 = game_runner1->opening_pass_player_index;
+    const int s1_my = equity_to_int(
+        player_get_score(game_get_player(game_runner1->game, p1)));
+    const int s1_opp = equity_to_int(
+        player_get_score(game_get_player(game_runner1->game, 1 - p1)));
+    const int outcome1 =
+        s1_my > s1_opp ? 2 : (s1_my == s1_opp ? 1 : 0);
+    opening_pass_record(op_table, rack_idx,
+                        game_runner1->opening_pass_branch, outcome1);
+
+    if (game_runner2 && game_runner2->opening_pass_rack_idx == rack_idx) {
+      const int p2 = game_runner2->opening_pass_player_index;
+      const int s2_my = equity_to_int(
+          player_get_score(game_get_player(game_runner2->game, p2)));
+      const int s2_opp = equity_to_int(
+          player_get_score(game_get_player(game_runner2->game, 1 - p2)));
+      const int outcome2 =
+          s2_my > s2_opp ? 2 : (s2_my == s2_opp ? 1 : 0);
+      opening_pass_record(op_table, rack_idx,
+                          game_runner2->opening_pass_branch, outcome2);
+      // Pair outcome (pass=branch 0, play=branch 1)
+      const int pass_outcome = (game_runner1->opening_pass_branch == 0)
+                                   ? outcome1
+                                   : outcome2;
+      const int play_outcome = (game_runner1->opening_pass_branch == 0)
+                                   ? outcome2
+                                   : outcome1;
+      opening_pass_record_pair(op_table, rack_idx, pass_outcome,
+                               play_outcome);
+    }
   }
 }
 

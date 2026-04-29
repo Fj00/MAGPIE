@@ -514,13 +514,16 @@ void fj_data_reset_fh(FJSharedData *shared_data) {
   }
 }
 
+// Clears only in-memory state. Does NOT touch the per-bag FJ files.
+// Critically, this is called before consolidate at end of autoplay (via
+// autoplay_results_consolidate -> autoplay_results_reset). If we
+// reopened the files in "w" mode here, we would TRUNCATE all the
+// per-bag data accumulated to disk during the run. File open/truncate
+// is now done exactly once, in fj_data_create at recorder construction.
 void fj_data_reset(Recorder *recorder) {
   FJData *fj_data = (FJData *)recorder->data;
   for (int i = 0; i < MAX_NUMBER_OF_TILES; i++) {
     string_builder_clear(fj_data->sbs[i]);
-  }
-  if (recorder->owns_thread_shared_data) {
-    fj_data_reset_fh(recorder->thread_shared_data);
   }
   for (int i = 0; i < MAX_NUMBER_OF_MOVES; i++) {
     for (int j = 0; j < MAX_ALPHABET_SIZE; j++) {
@@ -548,6 +551,13 @@ void fj_data_create(Recorder *recorder) {
   recorder->data = data;
   recorder->thread_shared_data = shared_data;
   fj_data_reset(recorder);
+  // Open the per-bag files (truncating any prior contents) exactly once,
+  // here at recorder construction. fj_data_reset is also called before
+  // consolidate at autoplay end, where re-opening with "w" would
+  // destroy the per-bag data accumulated during the run.
+  if (recorder->owns_thread_shared_data) {
+    fj_data_reset_fh(recorder->thread_shared_data);
+  }
 }
 
 void fj_data_destroy(Recorder *recorder) {

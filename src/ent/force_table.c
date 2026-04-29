@@ -1,6 +1,7 @@
 #include "force_table.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -127,7 +128,7 @@ LeaveType force_classify_leave(const Rack *leave,
 }
 
 bool force_target_matches(const ForceTarget *target, const Rack *leave,
-                          int score) {
+                          int score, int diff) {
   if (target->deficit <= 0) {
     return false;
   }
@@ -136,6 +137,9 @@ bool force_target_matches(const ForceTarget *target, const Rack *leave,
   }
   int is_exchange = (score == 0) ? 1 : 0;
   if (is_exchange != target->exchange) {
+    return false;
+  }
+  if (diff < target->diff_min || diff > target->diff_max) {
     return false;
   }
   // For exchanges or <=2 tile leaves, type is "all". For 3+ tile plays, match
@@ -307,6 +311,14 @@ ForceTable *force_table_create(const char *csv_path,
     if (deficit <= 0) {
       continue;
     }
+    // Optional diff range (columns 11-12, 1-indexed). Backward-compat:
+    // 10-column CSVs default to no constraint.
+    int diff_min = INT_MIN;
+    int diff_max = INT_MAX;
+    if (n >= 12) {
+      diff_min = atoi(fields[10]);
+      diff_max = atoi(fields[11]);
+    }
 
     if (table->num_targets == table->capacity) {
       table->capacity *= 2;
@@ -323,6 +335,8 @@ ForceTable *force_table_create(const char *csv_path,
     t->subleave_mls[0] = 0;
     t->subleave_mls[1] = 0;
     t->deficit = deficit;
+    t->diff_min = diff_min;
+    t->diff_max = diff_max;
 
     if (kind == FORCE_TARGET_TILE) {
       if (strlen(subleave) != 1) {
@@ -428,7 +442,7 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
     return;
   }
   fprintf(f, "kind,bag,length,type,exchange,subleave,current,target,deficit,"
-             "forced_games_estimate\n");
+             "forced_games_estimate,diff_min,diff_max\n");
   const char *kind_names[] = {"stratum", "tile", "pair"};
   const char *type_names[] = {"all", "cons", "mixed", "vowel"};
   int rows_written = 0;
@@ -448,10 +462,11 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
     }
     // current/target/forced_games_estimate aren't tracked precisely after
     // runtime; emit 0 placeholders except deficit (the reliable field).
-    fprintf(f, "%s,%d,%d,%s,%d,%s,0,0,%lld,0\n",
+    // Diff range echoed back as-loaded.
+    fprintf(f, "%s,%d,%d,%s,%d,%s,0,0,%lld,0,%d,%d\n",
             kind_names[t->kind], t->bag, t->leave_length,
             type_names[t->leave_type], t->exchange, subleave,
-            (long long)t->deficit);
+            (long long)t->deficit, t->diff_min, t->diff_max);
     rows_written++;
   }
   fclose(f);

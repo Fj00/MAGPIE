@@ -31,6 +31,13 @@ typedef struct ForceTarget {
   MachineLetter subleave_mls[2];
   int subleave_count;
   int64_t deficit;
+  // Diff range for this target. Used to constrain a target to a specific
+  // adaptive diff-bucket within a stratum (per the 10×10×10 spec — each
+  // bucket fits one of the 10 averaged models, and each model needs ≥EPV
+  // observations of each feature). Inclusive bounds.
+  // INT_MIN/INT_MAX = no constraint (backward-compatible with 10-column CSVs).
+  int diff_min;
+  int diff_max;
 } ForceTarget;
 
 typedef struct ForceTable ForceTable;
@@ -45,12 +52,15 @@ void force_table_destroy(ForceTable *table);
 // NULL is returned and *count set to 0 if no targets exist for the bag.
 ForceTarget **force_table_lookup(ForceTable *table, int bag, int *count);
 
-// Check whether a candidate move's leave + score matches the given target.
-// `leave` is the post-move kept-tile rack. `score` is the move's score.
-// Blanks are treated per the aggregation spec (ignored for type
-// classification, but counted as a distinct tile '?' for subleave matching).
+// Check whether a candidate move's leave + score + current score-diff matches
+// the given target. `leave` is the post-move kept-tile rack. `score` is the
+// move's score. `diff` is the current score difference (player_on_turn minus
+// opp) at the time of the candidate move; checked against target's
+// [diff_min, diff_max]. Blanks are treated per the aggregation spec (ignored
+// for type classification, but counted as a distinct tile '?' for subleave
+// matching).
 bool force_target_matches(const ForceTarget *target, const Rack *leave,
-                          int score);
+                          int score, int diff);
 
 // Decrement a target's deficit. If the deficit transitions from 1 to 0,
 // the table's active-target counter is decremented. Returns true if the
