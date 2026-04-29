@@ -529,9 +529,8 @@ typedef struct GameRunner {
   // Pass-cycle mode: both players' racks are forced; branch 0 = bot always
   // passes every turn, branch 1 = bot plays normally.
   bool pass_cycle_active;
-  bool pass_cycle_p1_is_pass;  // P1 rack came from pass-favorable subset
   int pass_cycle_branch;
-  int pass_cycle_bot_player;
+  int pass_cycle_bot_player;  // = starting_player_index (P1's seat for outcome)
   const char *pass_cycle_bot_rack_str;
   const char *pass_cycle_opp_rack_str;
   // Per-turn (rack, move) trace for downstream counterfactual reconstruction.
@@ -605,7 +604,6 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   // (round-robin by iter_count); opp gets a weighted exchange-prone rack.
   // Both games in a pair use the same racks but different branches.
   game_runner->pass_cycle_active = false;
-  game_runner->pass_cycle_p1_is_pass = false;
   game_runner->pass_cycle_branch = 0;
   game_runner->pass_cycle_bot_player = starting_player_index;
   game_runner->pass_cycle_bot_rack_str = NULL;
@@ -615,9 +613,8 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
     PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
     const char *p1_rack = NULL;
     const char *p2_rack = NULL;
-    int p1_is_pass = 0;
     if (pass_cycle_sample_racks(pct, iter_output->iter_count, &p1_rack,
-                                &p2_rack, &p1_is_pass)) {
+                                &p2_rack)) {
       // P1 is the starting player (the one who passes in branch 0).
       const int p1 = starting_player_index;
       const int p2 = 1 - starting_player_index;
@@ -630,7 +627,6 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
           draw_to_full_rack(game, p2);
         }
         game_runner->pass_cycle_active = true;
-        game_runner->pass_cycle_p1_is_pass = p1_is_pass != 0;
         game_runner->pass_cycle_branch = (pair_game_number == 2) ? 1 : 0;
         game_runner->pass_cycle_bot_player = p1;
         game_runner->pass_cycle_bot_rack_str = p1_rack;
@@ -916,19 +912,42 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     move_set_as_pass(spare);
     move = spare;
   }
-  // Pass-cycle mode: P1 force-passes only if their rack came from the
-  // pass-favorable subset and the board is still empty. P1 racks drawn
-  // from the exchange-only subset play naturally — the 6-pass cycle then
-  // arises organically when both players' natural decisions keep zeroing.
+  // Pass-cycle mode (branch 0, empty board): each turn, check the player
+  // on turn's CURRENT rack against the pool. is_pass=1 → force pass.
+  // Otherwise leave the move to natural HastyBot play (which will exchange
+  // for is_pass=0 racks — those were classified as exchange — and play
+  // tiles for racks not in the pool). Applied symmetrically to both
+  // players: after an exchange, the new rack is re-checked, so a player
+  // who exchanges into a pass-favorable rack starts passing.
   if (!move && game_runner->pass_cycle_active &&
-      game_runner->pass_cycle_p1_is_pass &&
       game_runner->pass_cycle_branch == 0 &&
-      player_on_turn_index == game_runner->pass_cycle_bot_player &&
       board_get_tiles_played(game_get_board(game)) == 0) {
-    Move *spare = move_list_get_spare_move(
-        autoplay_worker->move_lists[player_on_turn_index]);
-    move_set_as_pass(spare);
-    move = spare;
+    char canonical[RACK_SIZE + 2] = {0};
+    {
+      const LetterDistribution *ld = game_get_ld(game);
+      const uint16_t dist_size = rack_get_dist_size(player_rack);
+      int n = 0;
+      // Letters first (skip ML 0 = blank).
+      for (uint16_t i = 1; i < dist_size && n < RACK_SIZE; i++) {
+        const int c = rack_get_letter(player_rack, i);
+        for (int k = 0; k < c && n < RACK_SIZE; k++) {
+          canonical[n++] = ld->ld_ml_to_hl[i][0];
+        }
+      }
+      // Blanks last.
+      const int nblanks = rack_get_letter(player_rack, 0);
+      for (int k = 0; k < nblanks && n < RACK_SIZE; k++) {
+        canonical[n++] = '?';
+      }
+      canonical[n] = '\0';
+    }
+    PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
+    if (pass_cycle_lookup_is_pass(pct, canonical) == 1) {
+      Move *spare = move_list_get_spare_move(
+          autoplay_worker->move_lists[player_on_turn_index]);
+      move_set_as_pass(spare);
+      move = spare;
+    }
   }
   if (!move) {
     move = try_forced_move(autoplay_worker, game_runner);

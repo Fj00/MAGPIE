@@ -19,12 +19,20 @@ typedef struct {
   uint8_t counts[PASS_CYCLE_TILE_TYPES];
 } RackTiles;
 
+typedef struct {
+  const char *rack;  // points into PassCycleTable.racks (do not free)
+  uint8_t is_pass;
+} RackLookup;
+
 struct PassCycleTable {
   char **racks;
   RackTiles *tile_counts;  // parsed tile composition per rack
   double *cum_weights;     // cumulative normalized weights for binary search
   uint8_t *is_pass;        // 1 = pass-favorable, 0 = exchange-only
   int num_racks;
+
+  // Sorted-by-rack-string index for runtime is_pass lookup.
+  RackLookup *lookup;
 
   FILE *out_file;
   pthread_mutex_t out_mutex;
@@ -45,6 +53,25 @@ static bool rack_drawable(const RackTiles *rack, const uint8_t bag[PASS_CYCLE_TI
     if (rack->counts[i] > bag[i]) return false;
   }
   return true;
+}
+
+static int compare_lookup_by_rack(const void *a, const void *b) {
+  const RackLookup *la = (const RackLookup *)a;
+  const RackLookup *lb = (const RackLookup *)b;
+  return strcmp(la->rack, lb->rack);
+}
+
+int pass_cycle_lookup_is_pass(const PassCycleTable *table,
+                              const char *canonical_rack) {
+  if (!table || !canonical_rack) return -1;
+  RackLookup key;
+  key.rack = canonical_rack;
+  key.is_pass = 0;
+  RackLookup *found =
+      bsearch(&key, table->lookup, (size_t)table->num_racks,
+              sizeof(RackLookup), compare_lookup_by_rack);
+  if (!found) return -1;
+  return (int)found->is_pass;
 }
 
 static uint64_t mix64(uint64_t x) {
@@ -138,12 +165,21 @@ PassCycleTable *pass_cycle_table_create(const char *pool_path,
   int n_pass = 0;
   for (int i = 0; i < count; i++) n_pass += is_pass_arr[i];
 
+  // Build sorted lookup index for runtime canonical-rack -> is_pass queries.
+  RackLookup *lookup = malloc_or_die(sizeof(RackLookup) * (size_t)count);
+  for (int i = 0; i < count; i++) {
+    lookup[i].rack = racks[i];
+    lookup[i].is_pass = is_pass_arr[i];
+  }
+  qsort(lookup, (size_t)count, sizeof(RackLookup), compare_lookup_by_rack);
+
   PassCycleTable *table = malloc_or_die(sizeof(PassCycleTable));
   table->racks = racks;
   table->tile_counts = tiles;
   table->cum_weights = weights;
   table->is_pass = is_pass_arr;
   table->num_racks = count;
+  table->lookup = lookup;
   table->out_file = out;
   pthread_mutex_init(&table->out_mutex, NULL);
 
@@ -161,6 +197,7 @@ void pass_cycle_table_destroy(PassCycleTable *table) {
   free(table->tile_counts);
   free(table->cum_weights);
   free(table->is_pass);
+  free(table->lookup);
   if (table->out_file) {
     fflush(table->out_file);
     fclose(table->out_file);
@@ -182,13 +219,11 @@ static int sample_by_weight(const PassCycleTable *table, double u) {
 
 bool pass_cycle_sample_racks(const PassCycleTable *table, uint64_t pair_id,
                              const char **p1_rack_out,
-                             const char **p2_rack_out,
-                             int *p1_is_pass_out) {
+                             const char **p2_rack_out) {
   // P1: hash(pair_id) -> weighted sample from full pool.
   const uint64_t h1 = mix64(pair_id * 2ULL + 1ULL);
   const int p1_idx = sample_by_weight(table, uniform01(h1));
   *p1_rack_out = table->racks[p1_idx];
-  if (p1_is_pass_out) *p1_is_pass_out = (int)table->is_pass[p1_idx];
 
   // Remaining bag after P1's draw.
   uint8_t bag[PASS_CYCLE_TILE_TYPES];
