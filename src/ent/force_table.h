@@ -23,21 +23,22 @@ typedef enum {
 } LeaveType;
 
 typedef struct ForceTarget {
-  ForceTargetKind kind;
-  int bag;
-  int leave_length;
-  LeaveType leave_type;
-  int exchange;
-  MachineLetter subleave_mls[2];
-  int subleave_count;
+  // Hot fields — placed first so a single cache-line load (64 bytes) on the
+  // target struct brings all the per-iteration check fields. The matching
+  // loop reads deficit, kind, length, exchange, type, diff range, subleave
+  // before deciding whether to do a deeper check.
   int64_t deficit;
-  // Diff range for this target. Used to constrain a target to a specific
-  // adaptive diff-bucket within a stratum (per the 10×10×10 spec — each
-  // bucket fits one of the 10 averaged models, and each model needs ≥EPV
-  // observations of each feature). Inclusive bounds.
-  // INT_MIN/INT_MAX = no constraint (backward-compatible with 10-column CSVs).
+  ForceTargetKind kind;
+  int leave_length;
+  int exchange;
+  LeaveType leave_type;
   int diff_min;
   int diff_max;
+  int subleave_count;
+  MachineLetter subleave_mls[2];
+  // Cold fields — only touched on a candidate match or during table
+  // maintenance.
+  int bag;
   // B5: per-bucket index pointers — used to swap-to-back when deficit hits 0.
   // Lookups return only the active prefix of each bucket (entries with
   // deficit > 0 are kept at indices 0..active-1; satisfied entries get pushed
@@ -45,6 +46,25 @@ typedef struct ForceTarget {
   int by_bag_idx;
   int by_shape_idx;
 } ForceTarget;
+
+// Compact per-target hot data co-located with bucket pointer for cache-
+// friendly per-iteration matching. Stored inline in shape buckets so the
+// inner match loop reads contiguous memory instead of pointer-chasing into
+// scattered ForceTarget structs. Same fields the matching loop checks; on a
+// candidate match the worker dereferences the cold ForceTarget* for the rest.
+typedef struct {
+  int32_t deficit;             // sufficient — per-cell deficits fit in int32
+  uint8_t kind;                // ForceTargetKind cast to uint8
+  uint8_t leave_length;
+  uint8_t exchange;
+  uint8_t leave_type;
+  int32_t diff_min;
+  int32_t diff_max;
+  MachineLetter subleave_mls[2];
+  uint8_t subleave_count;
+  uint8_t _pad;
+  struct ForceTarget *cold;    // pointer to the full struct (for match)
+} ForceTargetSlot;             // 32 bytes, fits 2 per cache line
 
 typedef struct ForceTable ForceTable;
 
@@ -64,6 +84,14 @@ ForceTarget **force_table_lookup(ForceTable *table, int bag, int *count);
 ForceTarget **force_table_lookup_by_shape(ForceTable *table, int bag,
                                           int leave_length, int exchange,
                                           int *count);
+
+// Hot-loop friendly lookup: returns a slot array (inline hot fields + cold
+// pointer) for the specified shape bucket. Same active prefix size as the
+// pointer version. Slots provide cache-friendly iteration during matching;
+// dereference slot->cold only on candidate match.
+ForceTargetSlot *force_table_lookup_slots_by_shape(ForceTable *table, int bag,
+                                                    int leave_length,
+                                                    int exchange, int *count);
 
 // Check whether a candidate move's leave + score + current score-diff matches
 // the given target. `leave` is the post-move kept-tile rack. `score` is the

@@ -53,6 +53,10 @@ struct ForceTable {
   int by_shape_count[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX][FORCE_EXCHANGE_MAX];
   _Atomic(int) by_shape_active[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX]
                               [FORCE_EXCHANGE_MAX];
+  // Hot-loop slots: parallel to by_shape_ptrs, contains inline hot fields +
+  // cold pointer per slot. Workers iterate slots for cache-friendly matching.
+  ForceTargetSlot *by_shape_slots[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX]
+                                 [FORCE_EXCHANGE_MAX];
   // B5: serializes the swap-to-back operation when a target hits deficit==0.
   // Only acquired on the rare deficit-hits-zero transition; readers iterate
   // active prefix without locking (they may briefly see torn order on
@@ -188,6 +192,23 @@ bool force_target_matches(const ForceTarget *target, const Rack *leave,
   return true;
 }
 
+// Populate a ForceTargetSlot from its full target. Used at load time and
+// to refresh slot.deficit when the cold deficit decrements.
+static inline void slot_init_from_target(ForceTargetSlot *slot,
+                                          ForceTarget *target) {
+  slot->deficit = (int32_t)target->deficit;
+  slot->kind = (uint8_t)target->kind;
+  slot->leave_length = (uint8_t)target->leave_length;
+  slot->exchange = (uint8_t)(target->exchange ? 1 : 0);
+  slot->leave_type = (uint8_t)target->leave_type;
+  slot->diff_min = target->diff_min;
+  slot->diff_max = target->diff_max;
+  slot->subleave_mls[0] = target->subleave_mls[0];
+  slot->subleave_mls[1] = target->subleave_mls[1];
+  slot->subleave_count = (uint8_t)target->subleave_count;
+  slot->cold = target;
+}
+
 // B5: when a target hits deficit==0, swap it to the back of each of its
 // buckets (by_bag and by_shape) and decrement that bucket's active count.
 // Caller must hold table->bucket_mutex. Workers iterate only the active
@@ -219,6 +240,7 @@ static void swap_to_back_shape(ForceTable *table, ForceTarget *target) {
   if (bag < 0 || bag >= FORCE_BAG_MAX) return;
   if (L < 0 || L >= FORCE_LEAVE_LEN_MAX) return;
   ForceTarget **ptrs = table->by_shape_ptrs[bag][L][ex];
+  ForceTargetSlot *slots = table->by_shape_slots[bag][L][ex];
   if (!ptrs) return;
   int last = atomic_load_explicit(&table->by_shape_active[bag][L][ex],
                                    memory_order_relaxed) - 1;
@@ -230,6 +252,11 @@ static void swap_to_back_shape(ForceTable *table, ForceTarget *target) {
     ptrs[last] = target;
     swapped->by_shape_idx = idx;
     target->by_shape_idx = last;
+    if (slots) {
+      ForceTargetSlot tmp = slots[idx];
+      slots[idx] = slots[last];
+      slots[last] = tmp;
+    }
   }
   atomic_store_explicit(&table->by_shape_active[bag][L][ex], last,
                         memory_order_release);
@@ -238,6 +265,21 @@ static void swap_to_back_shape(ForceTable *table, ForceTarget *target) {
 bool force_table_decrement_target(ForceTable *table, ForceTarget *target) {
   if (target->deficit > 0) {
     target->deficit--;
+    // Update the parallel slot's deficit so the hot loop sees the new value
+    // without needing to dereference the cold target. (Slot's deficit is
+    // int32, but per-cell deficit always fits.)
+    {
+      const int bag = target->bag;
+      const int L = target->leave_length;
+      const int ex = target->exchange ? 1 : 0;
+      if (bag >= 0 && bag < FORCE_BAG_MAX && L >= 0 &&
+          L < FORCE_LEAVE_LEN_MAX) {
+        ForceTargetSlot *slots = table->by_shape_slots[bag][L][ex];
+        if (slots && target->by_shape_idx >= 0) {
+          slots[target->by_shape_idx].deficit = (int32_t)target->deficit;
+        }
+      }
+    }
     if (target->deficit == 0) {
       atomic_fetch_sub_explicit(&table->active_targets, 1,
                                 memory_order_relaxed);
@@ -324,6 +366,20 @@ ForceTarget **force_table_lookup_by_shape(ForceTable *table, int bag,
   *count = atomic_load_explicit(&table->by_shape_active[bag][leave_length][ex],
                                 memory_order_acquire);
   return table->by_shape_ptrs[bag][leave_length][ex];
+}
+
+ForceTargetSlot *force_table_lookup_slots_by_shape(ForceTable *table, int bag,
+                                                    int leave_length,
+                                                    int exchange, int *count) {
+  if (bag < 0 || bag >= FORCE_BAG_MAX || leave_length < 0 ||
+      leave_length >= FORCE_LEAVE_LEN_MAX) {
+    *count = 0;
+    return NULL;
+  }
+  const int ex = exchange ? 1 : 0;
+  *count = atomic_load_explicit(&table->by_shape_active[bag][leave_length][ex],
+                                memory_order_acquire);
+  return table->by_shape_slots[bag][leave_length][ex];
 }
 
 int64_t force_table_total_remaining(const ForceTable *table) {
@@ -532,6 +588,9 @@ ForceTable *force_table_create(const char *csv_path,
         if (n > 0) {
           table->by_shape_ptrs[b][L][ex] =
               (ForceTarget **)malloc_or_die(sizeof(ForceTarget *) * n);
+          // Parallel slot array — populated below alongside the pointer array.
+          table->by_shape_slots[b][L][ex] =
+              (ForceTargetSlot *)malloc_or_die(sizeof(ForceTargetSlot) * n);
         }
       }
     }
@@ -547,6 +606,8 @@ ForceTable *force_table_create(const char *csv_path,
       const int ex = t->exchange ? 1 : 0;
       const int idx = by_shape_fill[b][t->leave_length][ex]++;
       table->by_shape_ptrs[b][t->leave_length][ex][idx] = t;
+      slot_init_from_target(
+          &table->by_shape_slots[b][t->leave_length][ex][idx], t);
       t->by_shape_idx = idx;
     }
   }
@@ -635,6 +696,7 @@ void force_table_destroy(ForceTable *table) {
     for (int L = 0; L < FORCE_LEAVE_LEN_MAX; L++) {
       for (int ex = 0; ex < FORCE_EXCHANGE_MAX; ex++) {
         free(table->by_shape_ptrs[b][L][ex]);
+        free(table->by_shape_slots[b][L][ex]);
       }
     }
   }

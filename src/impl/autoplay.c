@@ -836,13 +836,13 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
       const int best_score = equity_to_int(move_get_score(best_move));
       const int best_leave_len = (int)best_leave.number_of_letters;
       const bool best_is_exch = (best_score == 0);
-      // Use the shape bucket for natural-best instead of the full bag bucket
-      // — natural-best can only match targets with matching (leave_length,
-      // exchange). Cuts iteration from ~23K targets-at-bag to ~few hundred.
+      // Use the shape bucket for natural-best instead of the full bag bucket.
+      // Hot-loop slots: contains inline hot fields + cold pointer per slot,
+      // cache-friendly sequential read.
       int best_bucket_count = 0;
-      ForceTarget **best_bucket = NULL;
+      ForceTargetSlot *best_slots = NULL;
       if (best_leave_len >= 0 && best_leave_len < 8) {
-        best_bucket = force_table_lookup_by_shape(
+        best_slots = force_table_lookup_slots_by_shape(
             ft, bag_count, best_leave_len, best_is_exch ? 1 : 0,
             &best_bucket_count);
       }
@@ -852,23 +852,35 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
         for (int priority = FORCE_TARGET_PAIR;
              priority >= FORCE_TARGET_STRATUM; priority--) {
           for (int t = 0; t < best_bucket_count; t++) {
-            ForceTarget *target = best_bucket[t];
-            if (target->deficit <= 0 || (int)target->kind != priority) {
+            ForceTargetSlot *slot = &best_slots[t];
+            if (slot->deficit <= 0 || (int)slot->kind != priority) {
               continue;
             }
-            if (!force_target_matches(target, &best_leave, best_score,
-                                      cur_diff)) {
+            // Inline check (avoid function call) — same logic as
+            // force_target_matches but reads slot's hot fields. Length matches
+            // by definition (we looked up the matching shape). Exchange too.
+            if (cur_diff < slot->diff_min || cur_diff > slot->diff_max) {
               continue;
             }
-            if (target->exchange == 0 && target->leave_length >= 3) {
+            // Subleave tile check.
+            int ok = 1;
+            for (int i = 0; i < slot->subleave_count; i++) {
+              const MachineLetter need = slot->subleave_mls[i];
+              if (best_leave.array[need] <= 0) { ok = 0; break; }
+              if (i == 1 && slot->subleave_mls[0] == slot->subleave_mls[1] &&
+                  best_leave.array[need] < 2) { ok = 0; break; }
+            }
+            if (!ok) continue;
+            if (slot->exchange == 0 && slot->leave_length >= 3) {
               if (!best_type_known) {
                 best_type = force_classify_leave(&best_leave, ld);
                 best_type_known = true;
               }
-              if (best_type != target->leave_type) {
+              if (best_type != (LeaveType)slot->leave_type) {
                 continue;
               }
             }
+            ForceTarget *target = slot->cold;
             game_runner->force_triggered = true;
             game_runner->pending_force_target = target;
             game_runner->pending_force_player_index = p_idx;
@@ -908,11 +920,11 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
     get_leave_for_move(move, game, &leaves[m]);
   }
 
-  // A2: per-move iteration uses force_table_lookup_by_shape to fetch only the
-  // targets compatible with this move's (leave_length, exchange) — typically a
-  // few hundred targets vs the ~23K at the bag. Loop order is
-  // (priority, move, target-in-bucket) to preserve PAIR > TILE > STRATUM
-  // priority; first match in priority order wins.
+  // A2 + slot-based fallback: per-move iteration uses
+  // force_table_lookup_slots_by_shape to fetch only the slots compatible with
+  // this move's (leave_length, exchange). Hot-loop reads inline slot fields
+  // (cache-friendly sequential access) instead of pointer-chasing through
+  // scattered ForceTarget structs.
   (void)targets; // bag-level array no longer used in inner loop
   for (int priority = FORCE_TARGET_PAIR; priority >= FORCE_TARGET_STRATUM;
        priority--) {
@@ -925,7 +937,7 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
         continue;
       }
       int bucket_count = 0;
-      ForceTarget **bucket = force_table_lookup_by_shape(
+      ForceTargetSlot *slots = force_table_lookup_slots_by_shape(
           ft, bag_count, leave_len, is_exch ? 1 : 0, &bucket_count);
       if (bucket_count == 0) {
         continue;
@@ -933,22 +945,32 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
       LeaveType move_type = LEAVE_TYPE_ALL;
       bool move_type_known = false;
       for (int t = 0; t < bucket_count; t++) {
-        ForceTarget *target = bucket[t];
-        if (target->deficit <= 0 || (int)target->kind != priority) {
+        ForceTargetSlot *slot = &slots[t];
+        if (slot->deficit <= 0 || (int)slot->kind != priority) {
           continue;
         }
-        if (!force_target_matches(target, &leaves[m], score, cur_diff)) {
+        if (cur_diff < slot->diff_min || cur_diff > slot->diff_max) {
           continue;
         }
-        if (target->exchange == 0 && target->leave_length >= 3) {
+        // Subleave tile check (inline — same as force_target_matches body).
+        int ok = 1;
+        for (int i = 0; i < slot->subleave_count; i++) {
+          const MachineLetter need = slot->subleave_mls[i];
+          if (leaves[m].array[need] <= 0) { ok = 0; break; }
+          if (i == 1 && slot->subleave_mls[0] == slot->subleave_mls[1] &&
+              leaves[m].array[need] < 2) { ok = 0; break; }
+        }
+        if (!ok) continue;
+        if (slot->exchange == 0 && slot->leave_length >= 3) {
           if (!move_type_known) {
             move_type = force_classify_leave(&leaves[m], ld);
             move_type_known = true;
           }
-          if (move_type != target->leave_type) {
+          if (move_type != (LeaveType)slot->leave_type) {
             continue;
           }
         }
+        ForceTarget *target = slot->cold;
         game_runner->force_triggered = true;
         game_runner->pending_force_target = target;
         game_runner->pending_force_player_index = p_idx;
