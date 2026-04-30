@@ -29,10 +29,13 @@
 #include "rack.h"
 #include "stats.h"
 #include "words.h"
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 enum { DEFAULT_WRITE_BUFFER_SIZE = 1024 };
@@ -464,8 +467,23 @@ char *game_data_sets_str(Recorder *recorder, const RecorderArgs *args) {
 }
 
 // FJ recorders
-enum { MAX_NUMBER_OF_MOVES = 100, MAX_NUMBER_OF_TILES = 100 };
-#define FJ_FILENAME "fj_log.csv"
+//
+// Output layout (per autoplay run, in cwd):
+//   play/<leave_len>/<bag>.csv   for tile-placement moves
+//   exch/<leave_len>/<bag>.csv   for exchange moves
+//
+// leave_len is the post-move kept-tile count (0..6). Pass moves and any
+// move with leave_len > 6 are not recorded. bag is unseen_total =
+// bag_letters + RACK_SIZE (matches the prior bucket convention).
+enum {
+  MAX_NUMBER_OF_MOVES = 100,
+  MAX_NUMBER_OF_TILES = 100,
+  FJ_KIND_PLAY = 0,
+  FJ_KIND_EXCH = 1,
+  FJ_NUM_KINDS = 2,
+  FJ_MAX_LEAVE_LEN = 6,
+  FJ_NUM_LEAVE_LENS = FJ_MAX_LEAVE_LEN + 1,
+};
 
 typedef struct FJMove {
   int unseen_counts[MAX_ALPHABET_SIZE];
@@ -474,17 +492,20 @@ typedef struct FJMove {
   int score_diff;
   int unseen_total;
   int player_index;
+  uint8_t kind;
+  uint8_t leave_len;
 } FJMove;
 
 typedef struct FJData {
-  StringBuilder *sbs[MAX_NUMBER_OF_TILES];
+  StringBuilder *sbs[FJ_NUM_KINDS][FJ_NUM_LEAVE_LENS][MAX_NUMBER_OF_TILES];
   FJMove moves[MAX_NUMBER_OF_MOVES];
   int move_count;
 } FJData;
 
 typedef struct FJSharedData {
-  cpthread_mutex_t fh_mutexes[MAX_NUMBER_OF_TILES];
-  FILE *fhs[MAX_NUMBER_OF_TILES];
+  cpthread_mutex_t
+      fh_mutexes[FJ_NUM_KINDS][FJ_NUM_LEAVE_LENS][MAX_NUMBER_OF_TILES];
+  FILE *fhs[FJ_NUM_KINDS][FJ_NUM_LEAVE_LENS][MAX_NUMBER_OF_TILES];
 } FJSharedData;
 
 // Bucket index = bag_letters + RACK_SIZE. The recorder skips writes at
@@ -496,23 +517,60 @@ static bool fj_bag_is_valid(int i) {
   return i == opener || (i >= RACK_SIZE + 1 && i <= opener - 2);
 }
 
+static const char *fj_kind_dir(int kind) {
+  return kind == FJ_KIND_EXCH ? "exch" : "play";
+}
+
+static void fj_mkdir_or_die(const char *path) {
+  if (mkdir(path, 0775) != 0 && errno != EEXIST) {
+    log_fatal("error creating directory: %s (%s)", path, strerror(errno));
+  }
+}
+
+// Raise RLIMIT_NOFILE so we can keep ~1190 per-bucket files open. Default
+// soft limit on Linux is often 1024. We bump to min(8192, hard).
+static void fj_raise_nofile_limit(void) {
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+    return;
+  }
+  rlim_t want = 8192;
+  if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max) {
+    want = rl.rlim_max;
+  }
+  if (rl.rlim_cur < want) {
+    rl.rlim_cur = want;
+    if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+      log_fatal("error raising RLIMIT_NOFILE soft to %llu: %s",
+                (unsigned long long)want, strerror(errno));
+    }
+  }
+}
+
 void fj_data_reset_fh(FJSharedData *shared_data) {
-  for (int i = 0; i < MAX_NUMBER_OF_TILES; i++) {
-    if (shared_data->fhs[i]) {
-      fclose_or_die(shared_data->fhs[i]);
-      shared_data->fhs[i] = NULL;
+  fj_raise_nofile_limit();
+  for (int kind = 0; kind < FJ_NUM_KINDS; kind++) {
+    fj_mkdir_or_die(fj_kind_dir(kind));
+    for (int ll = 0; ll < FJ_NUM_LEAVE_LENS; ll++) {
+      char *dir = get_formatted_string("%s/%d", fj_kind_dir(kind), ll);
+      fj_mkdir_or_die(dir);
+      for (int b = 0; b < MAX_NUMBER_OF_TILES; b++) {
+        if (shared_data->fhs[kind][ll][b]) {
+          fclose_or_die(shared_data->fhs[kind][ll][b]);
+          shared_data->fhs[kind][ll][b] = NULL;
+        }
+        if (!fj_bag_is_valid(b)) {
+          continue;
+        }
+        char *path = get_formatted_string("%s/%d.csv", dir, b);
+        shared_data->fhs[kind][ll][b] = fopen_or_die(path, "w");
+        if (!shared_data->fhs[kind][ll][b]) {
+          log_fatal("error opening fj file for writing: %s", path);
+        }
+        free(path);
+      }
+      free(dir);
     }
-    if (!fj_bag_is_valid(i)) {
-      continue;
-    }
-    char *filename_num_remaining =
-        get_formatted_string("autoplay_record_fj_%d", i);
-    shared_data->fhs[i] = fopen_or_die(filename_num_remaining, "w");
-    if (!shared_data->fhs[i]) {
-      log_fatal("error opening fj file for writing: %s",
-                filename_num_remaining);
-    }
-    free(filename_num_remaining);
   }
 }
 
@@ -524,8 +582,12 @@ void fj_data_reset_fh(FJSharedData *shared_data) {
 // is now done exactly once, in fj_data_create at recorder construction.
 void fj_data_reset(Recorder *recorder) {
   FJData *fj_data = (FJData *)recorder->data;
-  for (int i = 0; i < MAX_NUMBER_OF_TILES; i++) {
-    string_builder_clear(fj_data->sbs[i]);
+  for (int kind = 0; kind < FJ_NUM_KINDS; kind++) {
+    for (int ll = 0; ll < FJ_NUM_LEAVE_LENS; ll++) {
+      for (int b = 0; b < MAX_NUMBER_OF_TILES; b++) {
+        string_builder_clear(fj_data->sbs[kind][ll][b]);
+      }
+    }
   }
   for (int i = 0; i < MAX_NUMBER_OF_MOVES; i++) {
     for (int j = 0; j < MAX_ALPHABET_SIZE; j++) {
@@ -537,26 +599,34 @@ void fj_data_reset(Recorder *recorder) {
 
 void fj_data_create(Recorder *recorder) {
   FJData *data = malloc_or_die(sizeof(FJData));
-  for (int i = 0; i < MAX_NUMBER_OF_TILES; i++) {
-    data->sbs[i] = string_builder_create();
+  for (int kind = 0; kind < FJ_NUM_KINDS; kind++) {
+    for (int ll = 0; ll < FJ_NUM_LEAVE_LENS; ll++) {
+      for (int b = 0; b < MAX_NUMBER_OF_TILES; b++) {
+        data->sbs[kind][ll][b] = string_builder_create();
+      }
+    }
   }
   FJSharedData *shared_data = NULL;
   // If this recorder is not the owner, the thread shared data will be
   // assigned in the recorder_create function.
   if (recorder->owns_thread_shared_data) {
     shared_data = malloc_or_die(sizeof(FJSharedData));
-    for (int i = 0; i < MAX_NUMBER_OF_TILES; i++) {
-      cpthread_mutex_init(&shared_data->fh_mutexes[i]);
-      shared_data->fhs[i] = NULL;
+    for (int kind = 0; kind < FJ_NUM_KINDS; kind++) {
+      for (int ll = 0; ll < FJ_NUM_LEAVE_LENS; ll++) {
+        for (int b = 0; b < MAX_NUMBER_OF_TILES; b++) {
+          cpthread_mutex_init(&shared_data->fh_mutexes[kind][ll][b]);
+          shared_data->fhs[kind][ll][b] = NULL;
+        }
+      }
     }
   }
   recorder->data = data;
   recorder->thread_shared_data = shared_data;
   fj_data_reset(recorder);
-  // Open the per-bag files (truncating any prior contents) exactly once,
+  // Open the per-bucket files (truncating any prior contents) exactly once,
   // here at recorder construction. fj_data_reset is also called before
   // consolidate at autoplay end, where re-opening with "w" would
-  // destroy the per-bag data accumulated during the run.
+  // destroy the per-bucket data accumulated during the run.
   if (recorder->owns_thread_shared_data) {
     fj_data_reset_fh(recorder->thread_shared_data);
   }
@@ -564,14 +634,22 @@ void fj_data_create(Recorder *recorder) {
 
 void fj_data_destroy(Recorder *recorder) {
   FJData *fj_data = (FJData *)recorder->data;
-  for (int i = 0; i < MAX_NUMBER_OF_TILES; i++) {
-    string_builder_destroy(fj_data->sbs[i]);
+  for (int kind = 0; kind < FJ_NUM_KINDS; kind++) {
+    for (int ll = 0; ll < FJ_NUM_LEAVE_LENS; ll++) {
+      for (int b = 0; b < MAX_NUMBER_OF_TILES; b++) {
+        string_builder_destroy(fj_data->sbs[kind][ll][b]);
+      }
+    }
   }
   if (recorder->owns_thread_shared_data) {
     FJSharedData *shared_data = (FJSharedData *)recorder->thread_shared_data;
-    for (int i = 0; i < MAX_NUMBER_OF_TILES; i++) {
-      if (shared_data->fhs[i]) {
-        fclose_or_die(shared_data->fhs[i]);
+    for (int kind = 0; kind < FJ_NUM_KINDS; kind++) {
+      for (int ll = 0; ll < FJ_NUM_LEAVE_LENS; ll++) {
+        for (int b = 0; b < MAX_NUMBER_OF_TILES; b++) {
+          if (shared_data->fhs[kind][ll][b]) {
+            fclose_or_die(shared_data->fhs[kind][ll][b]);
+          }
+        }
       }
     }
     free(shared_data);
@@ -586,8 +664,23 @@ void fj_data_add_move(Recorder *recorder, const RecorderArgs *args) {
   if (fj_data->move_count >= MAX_NUMBER_OF_MOVES || bag_get_letters(bag) == 0) {
     return;
   }
-  FJMove *fj_move = &fj_data->moves[fj_data->move_count];
+  const game_event_t mt = move_get_type(args->move);
+  int kind;
+  if (mt == GAME_EVENT_TILE_PLACEMENT_MOVE) {
+    kind = FJ_KIND_PLAY;
+  } else if (mt == GAME_EVENT_EXCHANGE) {
+    kind = FJ_KIND_EXCH;
+  } else {
+    return; // pass / other event types are not recorded
+  }
   const Rack *leave = args->leave;
+  const int leave_len = (int)rack_get_total_letters(leave);
+  if (leave_len > FJ_MAX_LEAVE_LEN) {
+    return;
+  }
+  FJMove *fj_move = &fj_data->moves[fj_data->move_count];
+  fj_move->kind = (uint8_t)kind;
+  fj_move->leave_len = (uint8_t)leave_len;
   rack_copy(&fj_move->leave, leave);
   fj_move->move_score = equity_to_int(move_get_score(args->move));
   fj_move->player_index = game_get_player_on_turn_index(game);
@@ -602,24 +695,24 @@ void fj_data_add_move(Recorder *recorder, const RecorderArgs *args) {
   fj_data->move_count++;
 }
 
-void fj_write_buffer_to_output(Recorder *recorder, int remaining_tiles,
-                               bool always_flush) {
+void fj_write_buffer_to_output(Recorder *recorder, int kind, int leave_len,
+                               int bag, bool always_flush) {
   FJData *fj_data = (FJData *)recorder->data;
   FJSharedData *shared_data = (FJSharedData *)recorder->thread_shared_data;
   const RecorderContext *recorder_context = recorder->recorder_context;
-  StringBuilder *sb = fj_data->sbs[remaining_tiles];
+  StringBuilder *sb = fj_data->sbs[kind][leave_len][bag];
   size_t str_len = string_builder_length(sb);
   if (str_len > 0 &&
       (always_flush || str_len >= recorder_context->write_buffer_size)) {
-    cpthread_mutex_lock(&shared_data->fh_mutexes[remaining_tiles]);
-    if (fputs(string_builder_peek(sb), shared_data->fhs[remaining_tiles]) ==
-        EOF) {
-      fclose_or_die(shared_data->fhs[remaining_tiles]);
-      log_fatal("error writing to fj file of remaining tiles: %d",
-                remaining_tiles);
+    cpthread_mutex_lock(&shared_data->fh_mutexes[kind][leave_len][bag]);
+    if (fputs(string_builder_peek(sb),
+              shared_data->fhs[kind][leave_len][bag]) == EOF) {
+      fclose_or_die(shared_data->fhs[kind][leave_len][bag]);
+      log_fatal("error writing to fj file: %s/%d/%d.csv",
+                fj_kind_dir(kind), leave_len, bag);
     }
-    fflush_or_die(shared_data->fhs[remaining_tiles]);
-    cpthread_mutex_unlock(&shared_data->fh_mutexes[remaining_tiles]);
+    fflush_or_die(shared_data->fhs[kind][leave_len][bag]);
+    cpthread_mutex_unlock(&shared_data->fh_mutexes[kind][leave_len][bag]);
     string_builder_clear(sb);
   }
 }
@@ -645,7 +738,8 @@ void fj_data_add_game(Recorder *recorder, const RecorderArgs *args) {
     const double player_result =
         fj_move->player_index * (1 - player_one_result) +
         (1 - fj_move->player_index) * player_one_result;
-    StringBuilder *sb = fj_data->sbs[fj_move->unseen_total];
+    StringBuilder *sb =
+        fj_data->sbs[fj_move->kind][fj_move->leave_len][fj_move->unseen_total];
     string_builder_add_formatted_string(sb, "%d,", fj_move->move_score);
     string_builder_add_rack(sb, &fj_move->leave, ld, false);
     string_builder_add_formatted_string(sb, ",%.1f,%d", player_result,
@@ -656,7 +750,8 @@ void fj_data_add_game(Recorder *recorder, const RecorderArgs *args) {
       fj_move->unseen_counts[ml] = 0;
     }
     string_builder_add_char(sb, '\n');
-    fj_write_buffer_to_output(recorder, fj_move->unseen_total, false);
+    fj_write_buffer_to_output(recorder, fj_move->kind, fj_move->leave_len,
+                              fj_move->unseen_total, false);
   }
   fj_data->move_count = 0;
 }
@@ -667,8 +762,12 @@ void fj_data_consolidate(Recorder **recorders, int num_recorders,
     Recorder *recorder = recorders[i];
     FJData *fj_data = (FJData *)recorder->data;
     fj_data->move_count = 0;
-    for (int j = 0; j < MAX_NUMBER_OF_TILES; j++) {
-      fj_write_buffer_to_output(recorder, j, true);
+    for (int kind = 0; kind < FJ_NUM_KINDS; kind++) {
+      for (int ll = 0; ll < FJ_NUM_LEAVE_LENS; ll++) {
+        for (int b = 0; b < MAX_NUMBER_OF_TILES; b++) {
+          fj_write_buffer_to_output(recorder, kind, ll, b, true);
+        }
+      }
     }
   }
 }
