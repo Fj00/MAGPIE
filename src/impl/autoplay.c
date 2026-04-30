@@ -834,33 +834,47 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
       rack_set_dist_size(&best_leave, ld_size);
       get_leave_for_move(best_move, game, &best_leave);
       const int best_score = equity_to_int(move_get_score(best_move));
-      bool best_type_known = false;
-      LeaveType best_type = LEAVE_TYPE_ALL;
-      for (int priority = FORCE_TARGET_PAIR;
-           priority >= FORCE_TARGET_STRATUM; priority--) {
-        for (int t = 0; t < target_count; t++) {
-          ForceTarget *target = targets[t];
-          if (target->deficit <= 0 || (int)target->kind != priority) {
-            continue;
-          }
-          if (!force_target_matches(target, &best_leave, best_score,
-                                    cur_diff)) {
-            continue;
-          }
-          if (target->exchange == 0 && target->leave_length >= 3) {
-            if (!best_type_known) {
-              best_type = force_classify_leave(&best_leave, ld);
-              best_type_known = true;
-            }
-            if (best_type != target->leave_type) {
+      const int best_leave_len = (int)best_leave.number_of_letters;
+      const bool best_is_exch = (best_score == 0);
+      // Use the shape bucket for natural-best instead of the full bag bucket
+      // — natural-best can only match targets with matching (leave_length,
+      // exchange). Cuts iteration from ~23K targets-at-bag to ~few hundred.
+      int best_bucket_count = 0;
+      ForceTarget **best_bucket = NULL;
+      if (best_leave_len >= 0 && best_leave_len < 8) {
+        best_bucket = force_table_lookup_by_shape(
+            ft, bag_count, best_leave_len, best_is_exch ? 1 : 0,
+            &best_bucket_count);
+      }
+      if (best_bucket_count > 0) {
+        bool best_type_known = false;
+        LeaveType best_type = LEAVE_TYPE_ALL;
+        for (int priority = FORCE_TARGET_PAIR;
+             priority >= FORCE_TARGET_STRATUM; priority--) {
+          for (int t = 0; t < best_bucket_count; t++) {
+            ForceTarget *target = best_bucket[t];
+            if (target->deficit <= 0 || (int)target->kind != priority) {
               continue;
             }
+            if (!force_target_matches(target, &best_leave, best_score,
+                                      cur_diff)) {
+              continue;
+            }
+            if (target->exchange == 0 && target->leave_length >= 3) {
+              if (!best_type_known) {
+                best_type = force_classify_leave(&best_leave, ld);
+                best_type_known = true;
+              }
+              if (best_type != target->leave_type) {
+                continue;
+              }
+            }
+            game_runner->force_triggered = true;
+            game_runner->pending_force_target = target;
+            game_runner->pending_force_player_index = p_idx;
+            game_runner->pending_force_diff = cur_diff;
+            return best_move;
           }
-          game_runner->force_triggered = true;
-          game_runner->pending_force_target = target;
-          game_runner->pending_force_player_index = p_idx;
-          game_runner->pending_force_diff = cur_diff;
-          return best_move;
         }
       }
     }
