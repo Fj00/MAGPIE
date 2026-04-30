@@ -7,7 +7,9 @@
 #include "../def/letter_distribution_defs.h"
 #include "../def/players_data_defs.h"
 #include "../def/rack_defs.h"
+#include "../str/game_string.h"
 #include "../str/letter_distribution_string.h"
+#include "../str/move_string.h"
 #include "../str/rack_string.h"
 #include "../util/io_util.h"
 #include "../util/math_util.h"
@@ -1476,6 +1478,149 @@ void word_stats_data_consolidate(Recorder **recorder_list, int list_size,
   free(word_stats_name);
 }
 
+// Triple-triple recorder: saves games where 3 or 4 triple-triples are played
+// (combined across both players), with at least 2 by a single player.
+// Output: one .txt file per qualifying game in /Users/eric/S/3x3_games/
+
+#define TT_OUTPUT_DIR "/Users/eric/S/3x3_games"
+
+typedef struct TTData {
+  StringBuilder *game_log;
+  int player_tt_count[2];
+} TTData;
+
+void tt_data_reset(Recorder *recorder) {
+  TTData *data = (TTData *)recorder->data;
+  string_builder_clear(data->game_log);
+  data->player_tt_count[0] = 0;
+  data->player_tt_count[1] = 0;
+}
+
+void tt_data_create(Recorder *recorder) {
+  TTData *data = malloc_or_die(sizeof(TTData));
+  data->game_log = string_builder_create();
+  data->player_tt_count[0] = 0;
+  data->player_tt_count[1] = 0;
+  recorder->data = data;
+  recorder->thread_shared_data = NULL;
+}
+
+void tt_data_destroy(Recorder *recorder) {
+  TTData *data = (TTData *)recorder->data;
+  string_builder_destroy(data->game_log);
+  free(data);
+}
+
+// Returns true if the move covers 2 or more TWS squares with newly-placed
+// tiles.
+static bool move_is_triple_triple(const Move *move, const Board *board) {
+  if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
+    return false;
+  }
+  const int tiles_length = move_get_tiles_length(move);
+  const int row_start = move_get_row_start(move);
+  const int col_start = move_get_col_start(move);
+  const int dir = move_get_dir(move);
+  int tws_covered = 0;
+  for (int idx = 0; idx < tiles_length; idx++) {
+    const MachineLetter ml = move_get_tile(move, idx);
+    if (ml == PLAYED_THROUGH_MARKER) {
+      continue;
+    }
+    int row = row_start;
+    int col = col_start;
+    if (dir == BOARD_HORIZONTAL_DIRECTION) {
+      col += idx;
+    } else {
+      row += idx;
+    }
+    const BonusSquare bs = board_get_bonus_square(board, row, col);
+    if (bonus_square_get_word_multiplier(bs) == 3) {
+      tws_covered++;
+    }
+  }
+  return tws_covered >= 2;
+}
+
+void tt_data_add_move(Recorder *recorder, const RecorderArgs *args) {
+  TTData *data = (TTData *)recorder->data;
+  const Game *game = args->game;
+  const Move *move = args->move;
+  const int player_index = game_get_player_on_turn_index(game);
+  const Board *board = game_get_board(game);
+  const LetterDistribution *ld = game_get_ld(game);
+
+  bool is_tt = move_is_triple_triple(move, board);
+  if (is_tt) {
+    data->player_tt_count[player_index]++;
+  }
+
+  string_builder_add_formatted_string(data->game_log, "P%d ", player_index + 1);
+  string_builder_add_move(data->game_log, board, move, ld, true);
+  if (is_tt) {
+    string_builder_add_string(data->game_log, " [TT]");
+  }
+  string_builder_add_string(data->game_log, "\n");
+}
+
+void tt_data_add_game(Recorder *recorder, const RecorderArgs *args) {
+  TTData *data = (TTData *)recorder->data;
+  const int p1 = data->player_tt_count[0];
+  const int p2 = data->player_tt_count[1];
+  const int total = p1 + p2;
+  const bool single_player_qualifies = p1 >= 2 || p2 >= 2;
+  const bool combined_qualifies = total >= 3;
+  if (!combined_qualifies && !single_player_qualifies) {
+    tt_data_reset(recorder);
+    return;
+  }
+
+  // Filename category: use combined total, capped at 4 for naming.
+  int category = total;
+  if (category < 2) {
+    category = 2;
+  }
+
+  const Game *game = args->game;
+  StringBuilder *out = string_builder_create();
+  string_builder_add_formatted_string(
+      out, "Seed: %llu\n", (unsigned long long)args->seed);
+  string_builder_add_formatted_string(
+      out, "TT counts: P1=%d P2=%d total=%d\n", p1, p2, total);
+  string_builder_add_string(out, "\nMoves:\n");
+  string_builder_add_string(out, string_builder_peek(data->game_log));
+  string_builder_add_string(out, "\nFinal board:\n");
+  string_builder_add_game(game, NULL, NULL, NULL, out);
+
+  char *filename = get_formatted_string("%s/tt_%d_%llu.txt", TT_OUTPUT_DIR,
+                                        category,
+                                        (unsigned long long)args->seed);
+  FILE *fh = fopen(filename, "w");
+  if (fh) {
+    fputs(string_builder_peek(out), fh);
+    fclose(fh);
+  } else {
+    fprintf(stderr, "tt recorder: could not open %s\n", filename);
+  }
+
+  // For games with 4+ triple-triples, also print the move sequence to stderr.
+  if (total >= 4) {
+    fprintf(stderr, "\n=== %d TRIPLE-TRIPLES (seed %llu, P1=%d P2=%d) ===\n",
+            total, (unsigned long long)args->seed, p1, p2);
+    fputs(string_builder_peek(data->game_log), stderr);
+    fprintf(stderr, "===\n");
+  }
+
+  free(filename);
+  string_builder_destroy(out);
+  tt_data_reset(recorder);
+}
+
+void tt_data_consolidate(Recorder __attribute__((unused)) **recorders,
+                         int __attribute__((unused)) num_recorders,
+                         Recorder __attribute__((unused)) * primary_recorder) {
+}
+
 // Generic recorder and autoplay results functions
 
 Recorder *recorder_create(const Recorder *primary_recorder,
@@ -1607,6 +1752,10 @@ void autoplay_results_set_options_int(AutoplayResults *autoplay_results,
       word_stats_data_reset, word_stats_data_create, word_stats_data_destroy,
       word_stats_data_add_move, add_game_noop, word_stats_data_consolidate,
       get_str_noop);
+  autoplay_results_set_recorder(
+      autoplay_results, options, primary, AUTOPLAY_RECORDER_TYPE_TRIPLE_TRIPLE,
+      tt_data_reset, tt_data_create, tt_data_destroy, tt_data_add_move,
+      tt_data_add_game, tt_data_consolidate, get_str_noop);
   autoplay_results->options = options;
 }
 
@@ -1636,6 +1785,9 @@ void autoplay_results_set_options_with_splitter(
     } else if (has_iprefix(option_str, "wordstats")) {
       options |=
           autoplay_results_build_option(AUTOPLAY_RECORDER_TYPE_WORD_STATS);
+    } else if (has_iprefix(option_str, "tripletriple")) {
+      options |=
+          autoplay_results_build_option(AUTOPLAY_RECORDER_TYPE_TRIPLE_TRIPLE);
     } else {
       error_stack_push(
           error_stack, ERROR_STATUS_AUTOPLAY_INVALID_OPTIONS,

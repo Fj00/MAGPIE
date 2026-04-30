@@ -894,56 +894,44 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
     get_leave_for_move(move, game, &leaves[m]);
   }
 
-  // B2: precompute per-(exchange, leave_length) bitmasks of active targets at
-  // this bag, so we can skip moves whose (exchange, leave_length) can't match
-  // any active target. Cuts the inner-loop iteration when force-table is dense
-  // but the move's leave shape isn't a possible match.
-  uint32_t active_play_lengths = 0;   // exchange == 0
-  uint32_t active_exch_lengths = 0;   // exchange == 1
-  for (int t = 0; t < target_count; t++) {
-    ForceTarget *target = targets[t];
-    if (target->deficit <= 0) {
-      continue;
-    }
-    if (target->exchange) {
-      active_exch_lengths |= (1u << (uint32_t)target->leave_length);
-    } else {
-      active_play_lengths |= (1u << (uint32_t)target->leave_length);
-    }
-  }
-
-  // Per-move filter cache: 0 = move's (exchange, leave_length) can't match any
-  // active target, 1 = potential match, must run target loop. Computed once.
-  // Stack-allocated to force_move_list capacity (2000 in worker_create).
-  uint8_t move_can_match[2048];
-  for (int m = 0; m < n_moves; m++) {
-    Move *move = move_list_get_move(ml, m);
-    const int score = equity_to_int(move_get_score(move));
-    const bool is_exch = (score == 0);
-    const int leave_len = (int)leaves[m].number_of_letters;
-    const uint32_t mask =
-        is_exch ? active_exch_lengths : active_play_lengths;
-    move_can_match[m] = (uint8_t)((mask >> leave_len) & 1u);
-  }
-
+  // A2: per-move iteration uses force_table_lookup_by_shape to fetch only the
+  // targets compatible with this move's (leave_length, exchange) — typically a
+  // few hundred targets vs the ~23K at the bag. Loop order is
+  // (priority, move, target-in-bucket) to preserve PAIR > TILE > STRATUM
+  // priority; first match in priority order wins.
+  (void)targets; // bag-level array no longer used in inner loop
   for (int priority = FORCE_TARGET_PAIR; priority >= FORCE_TARGET_STRATUM;
        priority--) {
-    for (int t = 0; t < target_count; t++) {
-      ForceTarget *target = targets[t];
-      if (target->deficit <= 0 || (int)target->kind != priority) {
+    for (int m = 0; m < n_moves; m++) {
+      Move *move = move_list_get_move(ml, m);
+      const int score = equity_to_int(move_get_score(move));
+      const bool is_exch = (score == 0);
+      const int leave_len = (int)leaves[m].number_of_letters;
+      if (leave_len < 0 || leave_len >= 8) {
         continue;
       }
-      for (int m = 0; m < n_moves; m++) {
-        if (!move_can_match[m]) {
+      int bucket_count = 0;
+      ForceTarget **bucket = force_table_lookup_by_shape(
+          ft, bag_count, leave_len, is_exch ? 1 : 0, &bucket_count);
+      if (bucket_count == 0) {
+        continue;
+      }
+      LeaveType move_type = LEAVE_TYPE_ALL;
+      bool move_type_known = false;
+      for (int t = 0; t < bucket_count; t++) {
+        ForceTarget *target = bucket[t];
+        if (target->deficit <= 0 || (int)target->kind != priority) {
           continue;
         }
-        Move *move = move_list_get_move(ml, m);
-        const int score = equity_to_int(move_get_score(move));
         if (!force_target_matches(target, &leaves[m], score, cur_diff)) {
           continue;
         }
         if (target->exchange == 0 && target->leave_length >= 3) {
-          if (force_classify_leave(&leaves[m], ld) != target->leave_type) {
+          if (!move_type_known) {
+            move_type = force_classify_leave(&leaves[m], ld);
+            move_type_known = true;
+          }
+          if (move_type != target->leave_type) {
             continue;
           }
         }

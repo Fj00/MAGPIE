@@ -26,6 +26,12 @@ typedef struct StratumTally {
   _Atomic uint64_t buckets[FORCE_DIFF_BUCKETS];
 } StratumTally;
 
+// A2 optimization: bucket targets by (bag, leave_length, exchange) so per-move
+// matching iterates only the small subset compatible with that move's leave
+// shape, instead of the full ~23K targets at the bag.
+#define FORCE_LEAVE_LEN_MAX 8 // valid leave_length values 0..7
+#define FORCE_EXCHANGE_MAX 2  // exchange flag is 0 or 1
+
 struct ForceTable {
   ForceTarget *targets; // heap-allocated array
   int num_targets;
@@ -37,6 +43,12 @@ struct ForceTable {
   // target stays in the array (its deficit==0) — lookup callers must filter.
   ForceTarget **by_bag_ptrs[FORCE_BAG_MAX];
   int by_bag_count[FORCE_BAG_MAX];
+  // A2: finer-grained index — per (bag, leave_length, exchange) shape, an
+  // array of pointers into targets[]. Lookup callers still need to filter
+  // for deficit>0 and matching kind/diff/subleave/type.
+  ForceTarget **by_shape_ptrs[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX]
+                             [FORCE_EXCHANGE_MAX];
+  int by_shape_count[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX][FORCE_EXCHANGE_MAX];
   // Per-target diff tally for stratum-kind targets only (NULL otherwise).
   // Indexed by target's offset within targets[]. Used by
   // force_table_credit_game to decrement deficit only on min(w,l) bumps.
@@ -234,6 +246,19 @@ ForceTarget **force_table_lookup(ForceTable *table, int bag, int *count) {
   return table->by_bag_ptrs[bag];
 }
 
+ForceTarget **force_table_lookup_by_shape(ForceTable *table, int bag,
+                                          int leave_length, int exchange,
+                                          int *count) {
+  if (bag < 0 || bag >= FORCE_BAG_MAX || leave_length < 0 ||
+      leave_length >= FORCE_LEAVE_LEN_MAX) {
+    *count = 0;
+    return NULL;
+  }
+  const int ex = exchange ? 1 : 0;
+  *count = table->by_shape_count[bag][leave_length][ex];
+  return table->by_shape_ptrs[bag][leave_length][ex];
+}
+
 int64_t force_table_total_remaining(const ForceTable *table) {
   int64_t total = 0;
   for (int i = 0; i < table->num_targets; i++) {
@@ -409,6 +434,47 @@ ForceTable *force_table_create(const char *csv_path,
     }
   }
 
+  // A2: build by_shape index per (bag, leave_length, exchange). Iterate the
+  // already-sorted by_bag_ptrs so each shape bucket inherits deficit-ascending
+  // order. This lets per-move matching iterate only the small subset whose
+  // (leave_length, exchange) matches the move, instead of all targets at the
+  // bag.
+  memset(table->by_shape_count, 0, sizeof(table->by_shape_count));
+  for (int b = 0; b < FORCE_BAG_MAX; b++) {
+    for (int i = 0; i < table->by_bag_count[b]; i++) {
+      ForceTarget *t = table->by_bag_ptrs[b][i];
+      if (t->leave_length < 0 || t->leave_length >= FORCE_LEAVE_LEN_MAX) {
+        continue;
+      }
+      const int ex = t->exchange ? 1 : 0;
+      table->by_shape_count[b][t->leave_length][ex]++;
+    }
+  }
+  for (int b = 0; b < FORCE_BAG_MAX; b++) {
+    for (int L = 0; L < FORCE_LEAVE_LEN_MAX; L++) {
+      for (int ex = 0; ex < FORCE_EXCHANGE_MAX; ex++) {
+        const int n = table->by_shape_count[b][L][ex];
+        if (n > 0) {
+          table->by_shape_ptrs[b][L][ex] =
+              (ForceTarget **)malloc_or_die(sizeof(ForceTarget *) * n);
+        }
+      }
+    }
+  }
+  int by_shape_fill[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX][FORCE_EXCHANGE_MAX];
+  memset(by_shape_fill, 0, sizeof(by_shape_fill));
+  for (int b = 0; b < FORCE_BAG_MAX; b++) {
+    for (int i = 0; i < table->by_bag_count[b]; i++) {
+      ForceTarget *t = table->by_bag_ptrs[b][i];
+      if (t->leave_length < 0 || t->leave_length >= FORCE_LEAVE_LEN_MAX) {
+        continue;
+      }
+      const int ex = t->exchange ? 1 : 0;
+      table->by_shape_ptrs[b][t->leave_length][ex]
+                          [by_shape_fill[b][t->leave_length][ex]++] = t;
+    }
+  }
+
   atomic_store_explicit(&table->active_targets, table->num_targets,
                         memory_order_relaxed);
 
@@ -480,6 +546,11 @@ void force_table_destroy(ForceTable *table) {
   }
   for (int b = 0; b < FORCE_BAG_MAX; b++) {
     free(table->by_bag_ptrs[b]);
+    for (int L = 0; L < FORCE_LEAVE_LEN_MAX; L++) {
+      for (int ex = 0; ex < FORCE_EXCHANGE_MAX; ex++) {
+        free(table->by_shape_ptrs[b][L][ex]);
+      }
+    }
   }
   if (table->stratum_tallies) {
     for (int i = 0; i < table->num_targets; i++) {

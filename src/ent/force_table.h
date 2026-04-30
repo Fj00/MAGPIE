@@ -52,6 +52,13 @@ void force_table_destroy(ForceTable *table);
 // NULL is returned and *count set to 0 if no targets exist for the bag.
 ForceTarget **force_table_lookup(ForceTable *table, int bag, int *count);
 
+// A2: lookup targets at a specific (bag, leave_length, exchange) shape. Lets
+// per-move matching skip iteration over targets whose shape can't match the
+// move's leave. Same target pointers as force_table_lookup, just bucketed.
+ForceTarget **force_table_lookup_by_shape(ForceTable *table, int bag,
+                                          int leave_length, int exchange,
+                                          int *count);
+
 // Check whether a candidate move's leave + score + current score-diff matches
 // the given target. `leave` is the post-move kept-tile rack. `score` is the
 // move's score. `diff` is the current score difference (player_on_turn minus
