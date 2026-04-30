@@ -809,34 +809,34 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
       equity_to_int(player_get_score(game_get_player(game, 1 - p_idx)));
   const int cur_diff = my_score - opp_score;
 
-  // B4 fast path: try the natural best-equity move against active targets first.
-  // This avoids MOVE_RECORD_ALL enumeration on most turns since natural-best
-  // commonly matches at least one PAIR/TILE/STRATUM target. Falls back to full
-  // enum below if no match.
+  // B4 fast path: try moves within X equity of best against active targets
+  // first. Uses MOVE_RECORD_WITHIN_X_EQUITY_OF_BEST which prunes moves below
+  // the cutoff during search (much cheaper than MOVE_RECORD_ALL). Most turns
+  // get a match in the top handful of equity moves, avoiding full enumeration.
+  // Falls back to full MOVE_RECORD_ALL enum below if no match.
+  // 10 equity points = 10 * EQUITY_RESOLUTION (1000) = 10000 internal units.
   {
     const MoveGenArgs best_args = {
         .game = game,
         .move_list = ml,
-        .move_record_type = MOVE_RECORD_BEST,
+        .move_record_type = MOVE_RECORD_WITHIN_X_EQUITY_OF_BEST,
         .move_sort_type = MOVE_SORT_EQUITY,
         .override_kwg = NULL,
         .thread_index = autoplay_worker->worker_index,
-        .eq_margin_movegen = 0,
+        .eq_margin_movegen = 10 * EQUITY_RESOLUTION,
         .target_equity = EQUITY_MAX_VALUE,
         .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
         .tiles_played_bv = NULL,
         .initial_tiles_bv = 0};
     generate_moves(&best_args);
-    if (move_list_get_count(ml) > 0) {
-      Move *best_move = move_list_get_move(ml, 0);
-      Rack best_leave;
-      rack_set_dist_size(&best_leave, ld_size);
-      get_leave_for_move(best_move, game, &best_leave);
-      const int best_score = equity_to_int(move_get_score(best_move));
-      // Cache the type classification once (only computed if any active
-      // length>=3 play target actually requires it).
-      bool best_type_known = false;
-      LeaveType best_type = LEAVE_TYPE_ALL;
+    const int n_top = move_list_get_count(ml);
+    if (n_top > 0) {
+      Rack *top_leaves = autoplay_worker->force_leaves;
+      for (int m = 0; m < n_top; m++) {
+        rack_set_dist_size(&top_leaves[m], ld_size);
+        Move *move = move_list_get_move(ml, m);
+        get_leave_for_move(move, game, &top_leaves[m]);
+      }
       for (int priority = FORCE_TARGET_PAIR;
            priority >= FORCE_TARGET_STRATUM; priority--) {
         for (int t = 0; t < target_count; t++) {
@@ -844,24 +844,25 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
           if (target->deficit <= 0 || (int)target->kind != priority) {
             continue;
           }
-          if (!force_target_matches(target, &best_leave, best_score,
-                                    cur_diff)) {
-            continue;
-          }
-          if (target->exchange == 0 && target->leave_length >= 3) {
-            if (!best_type_known) {
-              best_type = force_classify_leave(&best_leave, ld);
-              best_type_known = true;
-            }
-            if (best_type != target->leave_type) {
+          for (int m = 0; m < n_top; m++) {
+            Move *move = move_list_get_move(ml, m);
+            const int score = equity_to_int(move_get_score(move));
+            if (!force_target_matches(target, &top_leaves[m], score,
+                                      cur_diff)) {
               continue;
             }
+            if (target->exchange == 0 && target->leave_length >= 3) {
+              if (force_classify_leave(&top_leaves[m], ld) !=
+                  target->leave_type) {
+                continue;
+              }
+            }
+            game_runner->force_triggered = true;
+            game_runner->pending_force_target = target;
+            game_runner->pending_force_player_index = p_idx;
+            game_runner->pending_force_diff = cur_diff;
+            return move;
           }
-          game_runner->force_triggered = true;
-          game_runner->pending_force_target = target;
-          game_runner->pending_force_player_index = p_idx;
-          game_runner->pending_force_diff = cur_diff;
-          return best_move;
         }
       }
     }
