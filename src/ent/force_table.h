@@ -38,6 +38,12 @@ typedef struct ForceTarget {
   // INT_MIN/INT_MAX = no constraint (backward-compatible with 10-column CSVs).
   int diff_min;
   int diff_max;
+  // B5: per-bucket index pointers — used to swap-to-back when deficit hits 0.
+  // Lookups return only the active prefix of each bucket (entries with
+  // deficit > 0 are kept at indices 0..active-1; satisfied entries get pushed
+  // to the back).
+  int by_bag_idx;
+  int by_shape_idx;
 } ForceTarget;
 
 typedef struct ForceTable ForceTable;

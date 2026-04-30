@@ -1484,16 +1484,39 @@ void word_stats_data_consolidate(Recorder **recorder_list, int list_size,
 
 #define TT_OUTPUT_DIR "/Users/eric/S/3x3_games"
 
+typedef struct TTSharedData {
+  cpthread_mutex_t counter_mutex;
+  uint64_t cat2hi_count;
+  uint64_t cat3_count;
+  uint64_t cat4_count;
+} TTSharedData;
+
 typedef struct TTData {
   StringBuilder *game_log;
   int player_tt_count[2];
+  // Aggregate stats across all games played by this recorder
+  uint64_t games_played;
+  uint64_t games_with_2;
+  uint64_t games_with_2_hi;
+  uint64_t games_with_3;
+  uint64_t games_with_4plus;
 } TTData;
 
-void tt_data_reset(Recorder *recorder) {
-  TTData *data = (TTData *)recorder->data;
+// Resets only per-game state; aggregate stats persist.
+void tt_data_reset_game(TTData *data) {
   string_builder_clear(data->game_log);
   data->player_tt_count[0] = 0;
   data->player_tt_count[1] = 0;
+}
+
+void tt_data_reset(Recorder *recorder) {
+  TTData *data = (TTData *)recorder->data;
+  tt_data_reset_game(data);
+  data->games_played = 0;
+  data->games_with_2 = 0;
+  data->games_with_2_hi = 0;
+  data->games_with_3 = 0;
+  data->games_with_4plus = 0;
 }
 
 void tt_data_create(Recorder *recorder) {
@@ -1501,13 +1524,29 @@ void tt_data_create(Recorder *recorder) {
   data->game_log = string_builder_create();
   data->player_tt_count[0] = 0;
   data->player_tt_count[1] = 0;
+  data->games_played = 0;
+  data->games_with_2 = 0;
+  data->games_with_2_hi = 0;
+  data->games_with_3 = 0;
+  data->games_with_4plus = 0;
   recorder->data = data;
-  recorder->thread_shared_data = NULL;
+  TTSharedData *shared_data = NULL;
+  if (recorder->owns_thread_shared_data) {
+    shared_data = malloc_or_die(sizeof(TTSharedData));
+    cpthread_mutex_init(&shared_data->counter_mutex);
+    shared_data->cat2hi_count = 0;
+    shared_data->cat3_count = 0;
+    shared_data->cat4_count = 0;
+  }
+  recorder->thread_shared_data = shared_data;
 }
 
 void tt_data_destroy(Recorder *recorder) {
   TTData *data = (TTData *)recorder->data;
   string_builder_destroy(data->game_log);
+  if (recorder->owns_thread_shared_data) {
+    free(recorder->thread_shared_data);
+  }
   free(data);
 }
 
@@ -1570,31 +1609,71 @@ void tt_data_add_game(Recorder *recorder, const RecorderArgs *args) {
   const int total = p1 + p2;
   const bool single_player_qualifies = p1 >= 2 || p2 >= 2;
   const bool combined_qualifies = total >= 3;
+
+  data->games_played++;
+
   if (!combined_qualifies && !single_player_qualifies) {
-    tt_data_reset(recorder);
+    tt_data_reset_game(data);
     return;
   }
 
-  // Filename category: use combined total, capped at 4 for naming.
-  int category = total;
-  if (category < 2) {
-    category = 2;
+  const Game *game = args->game;
+  const int p1_score =
+      equity_to_int(player_get_score(game_get_player(game, 0)));
+  const int p2_score =
+      equity_to_int(player_get_score(game_get_player(game, 1)));
+  const bool two_tt_high_score =
+      total == 2 && (p1_score > 800 || p2_score > 800);
+
+  // Track aggregate counts.
+  if (total >= 4) {
+    data->games_with_4plus++;
+  } else if (total == 3) {
+    data->games_with_3++;
+  } else {
+    // Single player has 2 (and total < 3, so total == 2)
+    data->games_with_2++;
+    if (two_tt_high_score) {
+      data->games_with_2_hi++;
+    }
   }
 
-  const Game *game = args->game;
+  // For 2-TT games, only save if a player scored over 800.
+  if (total < 3 && !two_tt_high_score) {
+    tt_data_reset_game(data);
+    return;
+  }
+
   StringBuilder *out = string_builder_create();
   string_builder_add_formatted_string(
       out, "Seed: %llu\n", (unsigned long long)args->seed);
   string_builder_add_formatted_string(
       out, "TT counts: P1=%d P2=%d total=%d\n", p1, p2, total);
+  string_builder_add_formatted_string(
+      out, "Scores: P1=%d P2=%d\n", p1_score, p2_score);
   string_builder_add_string(out, "\nMoves:\n");
   string_builder_add_string(out, string_builder_peek(data->game_log));
   string_builder_add_string(out, "\nFinal board:\n");
   string_builder_add_game(game, NULL, NULL, NULL, out);
 
-  char *filename = get_formatted_string("%s/tt_%d_%llu.txt", TT_OUTPUT_DIR,
-                                        category,
-                                        (unsigned long long)args->seed);
+  TTSharedData *shared_data = (TTSharedData *)recorder->thread_shared_data;
+  cpthread_mutex_lock(&shared_data->counter_mutex);
+  uint64_t file_idx;
+  const char *category_str;
+  if (total >= 4) {
+    file_idx = ++shared_data->cat4_count;
+    category_str = "4";
+  } else if (total == 3) {
+    file_idx = ++shared_data->cat3_count;
+    category_str = "3";
+  } else {
+    file_idx = ++shared_data->cat2hi_count;
+    category_str = "2hi";
+  }
+  cpthread_mutex_unlock(&shared_data->counter_mutex);
+  char *filename = get_formatted_string("%s/%s_%llu.txt", TT_OUTPUT_DIR,
+                                        category_str,
+                                        (unsigned long long)file_idx);
   FILE *fh = fopen(filename, "w");
   if (fh) {
     fputs(string_builder_peek(out), fh);
@@ -1613,12 +1692,49 @@ void tt_data_add_game(Recorder *recorder, const RecorderArgs *args) {
 
   free(filename);
   string_builder_destroy(out);
-  tt_data_reset(recorder);
+  tt_data_reset_game(data);
 }
 
-void tt_data_consolidate(Recorder __attribute__((unused)) **recorders,
-                         int __attribute__((unused)) num_recorders,
-                         Recorder __attribute__((unused)) * primary_recorder) {
+void tt_data_consolidate(Recorder **recorders, int num_recorders,
+                         Recorder *primary_recorder) {
+  TTData *primary = (TTData *)primary_recorder->data;
+  primary->games_played = 0;
+  primary->games_with_2 = 0;
+  primary->games_with_2_hi = 0;
+  primary->games_with_3 = 0;
+  primary->games_with_4plus = 0;
+  for (int i = 0; i < num_recorders; i++) {
+    const TTData *thread_data = (const TTData *)recorders[i]->data;
+    primary->games_played += thread_data->games_played;
+    primary->games_with_2 += thread_data->games_with_2;
+    primary->games_with_2_hi += thread_data->games_with_2_hi;
+    primary->games_with_3 += thread_data->games_with_3;
+    primary->games_with_4plus += thread_data->games_with_4plus;
+  }
+
+  StringBuilder *summary = string_builder_create();
+  string_builder_add_formatted_string(
+      summary,
+      "Triple-triple summary:\n  Games played: %llu\n  Games with 2 (single "
+      "player): %llu\n    of which a player scored >800: %llu\n"
+      "  Games with 3 combined: %llu\n  Games with 4+ combined: %llu\n",
+      (unsigned long long)primary->games_played,
+      (unsigned long long)primary->games_with_2,
+      (unsigned long long)primary->games_with_2_hi,
+      (unsigned long long)primary->games_with_3,
+      (unsigned long long)primary->games_with_4plus);
+
+  char *filename = get_formatted_string("%s/tt_summary.txt", TT_OUTPUT_DIR);
+  FILE *fh = fopen(filename, "w");
+  if (fh) {
+    fputs(string_builder_peek(summary), fh);
+    fclose(fh);
+  } else {
+    fprintf(stderr, "tt recorder: could not open %s\n", filename);
+  }
+  fputs(string_builder_peek(summary), stderr);
+  free(filename);
+  string_builder_destroy(summary);
 }
 
 // Generic recorder and autoplay results functions

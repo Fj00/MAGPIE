@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,16 +40,24 @@ struct ForceTable {
   // Count of targets whose deficit is still > 0. Decrements when a target's
   // deficit reaches zero; reaches zero when every target is satisfied.
   atomic_int active_targets;
-  // Index: per bag count, an array of pointers into targets[]. A satisfied
-  // target stays in the array (its deficit==0) — lookup callers must filter.
+  // Index: per bag count, an array of pointers into targets[]. The first
+  // by_bag_active[bag] entries are active (deficit > 0); entries beyond are
+  // already-satisfied targets pushed to the back via swap-on-decrement (B5).
   ForceTarget **by_bag_ptrs[FORCE_BAG_MAX];
-  int by_bag_count[FORCE_BAG_MAX];
-  // A2: finer-grained index — per (bag, leave_length, exchange) shape, an
-  // array of pointers into targets[]. Lookup callers still need to filter
-  // for deficit>0 and matching kind/diff/subleave/type.
+  int by_bag_count[FORCE_BAG_MAX]; // total entries (active + dead)
+  _Atomic(int) by_bag_active[FORCE_BAG_MAX]; // active prefix size
+  // A2: finer-grained index — per (bag, leave_length, exchange) shape. Same
+  // active-prefix invariant as by_bag_ptrs.
   ForceTarget **by_shape_ptrs[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX]
                              [FORCE_EXCHANGE_MAX];
   int by_shape_count[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX][FORCE_EXCHANGE_MAX];
+  _Atomic(int) by_shape_active[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX]
+                              [FORCE_EXCHANGE_MAX];
+  // B5: serializes the swap-to-back operation when a target hits deficit==0.
+  // Only acquired on the rare deficit-hits-zero transition; readers iterate
+  // active prefix without locking (they may briefly see torn order on
+  // concurrent swaps, but only ever read valid target pointers).
+  pthread_mutex_t bucket_mutex;
   // Per-target diff tally for stratum-kind targets only (NULL otherwise).
   // Indexed by target's offset within targets[]. Used by
   // force_table_credit_game to decrement deficit only on min(w,l) bumps.
@@ -179,12 +188,66 @@ bool force_target_matches(const ForceTarget *target, const Rack *leave,
   return true;
 }
 
+// B5: when a target hits deficit==0, swap it to the back of each of its
+// buckets (by_bag and by_shape) and decrement that bucket's active count.
+// Caller must hold table->bucket_mutex. Workers iterate only the active
+// prefix, so dead entries swapped to the back never get visited again.
+static void swap_to_back_bag(ForceTable *table, ForceTarget *target) {
+  const int bag = target->bag;
+  if (bag < 0 || bag >= FORCE_BAG_MAX) return;
+  ForceTarget **ptrs = table->by_bag_ptrs[bag];
+  if (!ptrs) return;
+  int last = atomic_load_explicit(&table->by_bag_active[bag],
+                                   memory_order_relaxed) - 1;
+  int idx = target->by_bag_idx;
+  if (idx < 0 || idx > last) return; // already inactive
+  if (idx != last) {
+    ForceTarget *swapped = ptrs[last];
+    ptrs[idx] = swapped;
+    ptrs[last] = target;
+    swapped->by_bag_idx = idx;
+    target->by_bag_idx = last;
+  }
+  atomic_store_explicit(&table->by_bag_active[bag], last,
+                        memory_order_release);
+}
+
+static void swap_to_back_shape(ForceTable *table, ForceTarget *target) {
+  const int bag = target->bag;
+  const int L = target->leave_length;
+  const int ex = target->exchange ? 1 : 0;
+  if (bag < 0 || bag >= FORCE_BAG_MAX) return;
+  if (L < 0 || L >= FORCE_LEAVE_LEN_MAX) return;
+  ForceTarget **ptrs = table->by_shape_ptrs[bag][L][ex];
+  if (!ptrs) return;
+  int last = atomic_load_explicit(&table->by_shape_active[bag][L][ex],
+                                   memory_order_relaxed) - 1;
+  int idx = target->by_shape_idx;
+  if (idx < 0 || idx > last) return;
+  if (idx != last) {
+    ForceTarget *swapped = ptrs[last];
+    ptrs[idx] = swapped;
+    ptrs[last] = target;
+    swapped->by_shape_idx = idx;
+    target->by_shape_idx = last;
+  }
+  atomic_store_explicit(&table->by_shape_active[bag][L][ex], last,
+                        memory_order_release);
+}
+
 bool force_table_decrement_target(ForceTable *table, ForceTarget *target) {
   if (target->deficit > 0) {
     target->deficit--;
     if (target->deficit == 0) {
       atomic_fetch_sub_explicit(&table->active_targets, 1,
                                 memory_order_relaxed);
+      // B5: push the now-satisfied target to the back of each of its buckets
+      // so workers stop iterating it. Brief lock — only contended on the
+      // (rare) deficit-hits-zero transition.
+      pthread_mutex_lock(&table->bucket_mutex);
+      swap_to_back_bag(table, target);
+      swap_to_back_shape(table, target);
+      pthread_mutex_unlock(&table->bucket_mutex);
       return true;
     }
   }
@@ -242,7 +305,10 @@ ForceTarget **force_table_lookup(ForceTable *table, int bag, int *count) {
     *count = 0;
     return NULL;
   }
-  *count = table->by_bag_count[bag];
+  // Return only the active prefix size — dead entries (deficit==0) get
+  // swapped past this index by force_table_decrement_target.
+  *count = atomic_load_explicit(&table->by_bag_active[bag],
+                                memory_order_acquire);
   return table->by_bag_ptrs[bag];
 }
 
@@ -255,7 +321,8 @@ ForceTarget **force_table_lookup_by_shape(ForceTable *table, int bag,
     return NULL;
   }
   const int ex = exchange ? 1 : 0;
-  *count = table->by_shape_count[bag][leave_length][ex];
+  *count = atomic_load_explicit(&table->by_shape_active[bag][leave_length][ex],
+                                memory_order_acquire);
   return table->by_shape_ptrs[bag][leave_length][ex];
 }
 
@@ -304,6 +371,7 @@ ForceTable *force_table_create(const char *csv_path,
   }
   ForceTable *table = (ForceTable *)malloc_or_die(sizeof(ForceTable));
   memset(table, 0, sizeof(*table));
+  pthread_mutex_init(&table->bucket_mutex, NULL);
   table->capacity = 1024;
   table->targets =
       (ForceTarget *)malloc_or_die(sizeof(ForceTarget) * table->capacity);
@@ -411,11 +479,25 @@ ForceTable *force_table_create(const char *csv_path,
   }
   int by_bag_fill[FORCE_BAG_MAX];
   memset(by_bag_fill, 0, sizeof(by_bag_fill));
+  // Initialize all targets' bucket indices to -1 (will be set when placed).
+  for (int i = 0; i < table->num_targets; i++) {
+    table->targets[i].by_bag_idx = -1;
+    table->targets[i].by_shape_idx = -1;
+  }
   for (int i = 0; i < table->num_targets; i++) {
     int bag = table->targets[i].bag;
     if (bag >= 0 && bag < FORCE_BAG_MAX) {
-      table->by_bag_ptrs[bag][by_bag_fill[bag]++] = &table->targets[i];
+      const int idx = by_bag_fill[bag]++;
+      table->by_bag_ptrs[bag][idx] = &table->targets[i];
+      table->targets[i].by_bag_idx = idx;
     }
+  }
+  // B5: initialize by_bag_active to full bucket size (all loaded targets are
+  // active initially; satisfied ones get swapped to back via swap_to_back_bag
+  // at decrement time).
+  for (int b = 0; b < FORCE_BAG_MAX; b++) {
+    atomic_store_explicit(&table->by_bag_active[b], table->by_bag_count[b],
+                          memory_order_relaxed);
   }
   // Note: deficit-asc sort removed. The sort put low-deficit targets at the
   // front of each bucket so rare targets would be matched first. But once a
@@ -463,8 +545,19 @@ ForceTable *force_table_create(const char *csv_path,
         continue;
       }
       const int ex = t->exchange ? 1 : 0;
-      table->by_shape_ptrs[b][t->leave_length][ex]
-                          [by_shape_fill[b][t->leave_length][ex]++] = t;
+      const int idx = by_shape_fill[b][t->leave_length][ex]++;
+      table->by_shape_ptrs[b][t->leave_length][ex][idx] = t;
+      t->by_shape_idx = idx;
+    }
+  }
+  // B5: initialize by_shape_active to full bucket size.
+  for (int b = 0; b < FORCE_BAG_MAX; b++) {
+    for (int L = 0; L < FORCE_LEAVE_LEN_MAX; L++) {
+      for (int ex = 0; ex < FORCE_EXCHANGE_MAX; ex++) {
+        atomic_store_explicit(&table->by_shape_active[b][L][ex],
+                              table->by_shape_count[b][L][ex],
+                              memory_order_relaxed);
+      }
     }
   }
 
@@ -545,6 +638,7 @@ void force_table_destroy(ForceTable *table) {
       }
     }
   }
+  pthread_mutex_destroy(&table->bucket_mutex);
   if (table->stratum_tallies) {
     for (int i = 0; i < table->num_targets; i++) {
       free(table->stratum_tallies[i]);
