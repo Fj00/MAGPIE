@@ -286,6 +286,11 @@ typedef struct AutoplayWorker {
   // Used only when a force table is active. Holds the full move list with
   // MOVE_RECORD_ALL so we can filter by leave profile.
   MoveList *force_move_list;
+  // Pre-computed leaves per move in force_move_list, populated once per turn
+  // before the target-matching loop. Avoids 46M get_leave_for_move calls/turn
+  // in the worst case (B1 optimization).
+  Rack *force_leaves;
+  int force_leaves_capacity;
 } AutoplayWorker;
 
 AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
@@ -320,8 +325,13 @@ AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
   autoplay_worker->move_lists[1] =
       move_list_create(ap_args->p2_sim_args.num_plays);
   autoplay_worker->force_move_list = NULL;
+  autoplay_worker->force_leaves = NULL;
+  autoplay_worker->force_leaves_capacity = 0;
   if (shared_data->force_table) {
     autoplay_worker->force_move_list = move_list_create(2000);
+    autoplay_worker->force_leaves_capacity = 2000;
+    autoplay_worker->force_leaves =
+        malloc_or_die(sizeof(Rack) * (size_t)autoplay_worker->force_leaves_capacity);
   }
 
   autoplay_worker->sim_results = NULL;
@@ -358,6 +368,7 @@ void autoplay_worker_destroy(AutoplayWorker *autoplay_worker) {
   move_list_destroy(autoplay_worker->move_lists[0]);
   move_list_destroy(autoplay_worker->move_lists[1]);
   move_list_destroy(autoplay_worker->force_move_list);
+  free(autoplay_worker->force_leaves);
   free(autoplay_worker);
 }
 
@@ -537,6 +548,9 @@ typedef struct GameRunner {
   // Each entry encodes "<rack>:<move>" where move is "P" or "X<tiles>".
   char pass_cycle_history[6][24];
   int pass_cycle_n_moves;
+  // Set true once we know this game cannot be a recorded 6-pass-cycle game
+  // (e.g. a tile was placed). Causes game_runner_is_game_over to short-circuit.
+  bool pass_cycle_abandoned;
 } GameRunner;
 
 GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
@@ -609,6 +623,7 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   game_runner->pass_cycle_bot_rack_str = NULL;
   game_runner->pass_cycle_opp_rack_str = NULL;
   game_runner->pass_cycle_n_moves = 0;
+  game_runner->pass_cycle_abandoned = false;
   if (!used_forced_rack && game_runner->shared_data->pass_cycle_table) {
     PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
     const char *p1_rack = NULL;
@@ -670,7 +685,8 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
 bool game_runner_is_game_over(GameRunner *game_runner) {
   return game_over(game_runner->game) ||
          (game_runner->shared_data->leavegen_shared_data &&
-          bag_get_letters(game_get_bag(game_runner->game)) < (RACK_SIZE));
+          bag_get_letters(game_get_bag(game_runner->game)) < (RACK_SIZE)) ||
+         game_runner->pass_cycle_abandoned;
 }
 
 const Move *game_runner_get_top_simming_move(AutoplayWorker *autoplay_worker,
@@ -782,7 +798,77 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
   }
 
   MoveList *ml = autoplay_worker->force_move_list;
-  const MoveGenArgs mg_args = {
+  const LetterDistribution *ld = game_get_ld(game);
+  const uint16_t ld_size = ld_get_size(ld);
+
+  // Diff once per turn — the player_on_turn's score minus opp's.
+  const int p_idx = game_get_player_on_turn_index(game);
+  const int my_score =
+      equity_to_int(player_get_score(game_get_player(game, p_idx)));
+  const int opp_score =
+      equity_to_int(player_get_score(game_get_player(game, 1 - p_idx)));
+  const int cur_diff = my_score - opp_score;
+
+  // B4 fast path: try the natural best-equity move against active targets first.
+  // This avoids MOVE_RECORD_ALL enumeration on most turns since natural-best
+  // commonly matches at least one PAIR/TILE/STRATUM target. Falls back to full
+  // enum below if no match.
+  {
+    const MoveGenArgs best_args = {
+        .game = game,
+        .move_list = ml,
+        .move_record_type = MOVE_RECORD_BEST,
+        .move_sort_type = MOVE_SORT_EQUITY,
+        .override_kwg = NULL,
+        .thread_index = autoplay_worker->worker_index,
+        .eq_margin_movegen = 0,
+        .target_equity = EQUITY_MAX_VALUE,
+        .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+        .tiles_played_bv = NULL,
+        .initial_tiles_bv = 0};
+    generate_moves(&best_args);
+    if (move_list_get_count(ml) > 0) {
+      Move *best_move = move_list_get_move(ml, 0);
+      Rack best_leave;
+      rack_set_dist_size(&best_leave, ld_size);
+      get_leave_for_move(best_move, game, &best_leave);
+      const int best_score = equity_to_int(move_get_score(best_move));
+      // Cache the type classification once (only computed if any active
+      // length>=3 play target actually requires it).
+      bool best_type_known = false;
+      LeaveType best_type = LEAVE_TYPE_ALL;
+      for (int priority = FORCE_TARGET_PAIR;
+           priority >= FORCE_TARGET_STRATUM; priority--) {
+        for (int t = 0; t < target_count; t++) {
+          ForceTarget *target = targets[t];
+          if (target->deficit <= 0 || (int)target->kind != priority) {
+            continue;
+          }
+          if (!force_target_matches(target, &best_leave, best_score,
+                                    cur_diff)) {
+            continue;
+          }
+          if (target->exchange == 0 && target->leave_length >= 3) {
+            if (!best_type_known) {
+              best_type = force_classify_leave(&best_leave, ld);
+              best_type_known = true;
+            }
+            if (best_type != target->leave_type) {
+              continue;
+            }
+          }
+          game_runner->force_triggered = true;
+          game_runner->pending_force_target = target;
+          game_runner->pending_force_player_index = p_idx;
+          game_runner->pending_force_diff = cur_diff;
+          return best_move;
+        }
+      }
+    }
+  }
+
+  // Fallback: full MOVE_RECORD_ALL enumeration when natural-best didn't match.
+  const MoveGenArgs all_args = {
       .game = game,
       .move_list = ml,
       .move_record_type = MOVE_RECORD_ALL,
@@ -794,15 +880,21 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
       .tiles_played_bv = NULL,
       .initial_tiles_bv = 0};
-  generate_moves(&mg_args);
+  generate_moves(&all_args);
   const int n_moves = move_list_get_count(ml);
   if (n_moves == 0) {
     return NULL;
   }
 
-  const LetterDistribution *ld = game_get_ld(game);
-  Rack leave;
-  rack_set_dist_size(&leave, ld_get_size(ld));
+  // B1: pre-compute leaves for every move once (vs computing per (target,move)
+  // pair in the original triple-nested loop, which was 46M ops/turn worst case).
+  Rack *leaves = autoplay_worker->force_leaves;
+  for (int m = 0; m < n_moves; m++) {
+    rack_set_dist_size(&leaves[m], ld_size);
+    Move *move = move_list_get_move(ml, m);
+    get_leave_for_move(move, game, &leaves[m]);
+  }
+
   for (int priority = FORCE_TARGET_PAIR; priority >= FORCE_TARGET_STRATUM;
        priority--) {
     for (int t = 0; t < target_count; t++) {
@@ -810,33 +902,18 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
       if (target->deficit <= 0 || (int)target->kind != priority) {
         continue;
       }
-      // Compute current score-diff once per (target × move-list pass) so the
-      // force_target_matches diff-range check has it available. Diff is the
-      // player_on_turn's score minus opp's at the moment of decision.
-      const int p_idx = game_get_player_on_turn_index(game);
-      const int my_score =
-          equity_to_int(player_get_score(game_get_player(game, p_idx)));
-      const int opp_score =
-          equity_to_int(player_get_score(game_get_player(game, 1 - p_idx)));
-      const int cur_diff = my_score - opp_score;
       for (int m = 0; m < n_moves; m++) {
         Move *move = move_list_get_move(ml, m);
-        get_leave_for_move(move, game, &leave);
         const int score = equity_to_int(move_get_score(move));
-        if (!force_target_matches(target, &leave, score, cur_diff)) {
+        if (!force_target_matches(target, &leaves[m], score, cur_diff)) {
           continue;
         }
-        // force_target_matches does not check the cons/mixed/vowel type
-        // because it does not carry the LetterDistribution. Do it here.
         if (target->exchange == 0 && target->leave_length >= 3) {
-          if (force_classify_leave(&leave, ld) != target->leave_type) {
+          if (force_classify_leave(&leaves[m], ld) != target->leave_type) {
             continue;
           }
         }
         game_runner->force_triggered = true;
-        // Capture the force-turn state. The deficit is credited at game-end
-        // (autoplay_add_game) once the diff/outcome are final, so stratum
-        // targets only debit when min(wins, losses) actually moves.
         game_runner->pending_force_target = target;
         game_runner->pending_force_player_index = p_idx;
         game_runner->pending_force_diff = cur_diff;
@@ -1048,7 +1125,23 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     game_runner->pass_cycle_n_moves++;
   }
 
+  // Pass-cycle early-exit: once a tile is placed, the game can no longer
+  // qualify for 6-pass-cycle recording (which requires tiles_played==0).
+  // Same once we've seen 6 zero-score turns without the engine ending the
+  // game (rare but means the cycle won't trigger here).
+  if (game_runner->pass_cycle_active &&
+      move_get_type(move) == GAME_EVENT_TILE_PLACEMENT_MOVE) {
+    game_runner->pass_cycle_abandoned = true;
+  }
+
   play_move(move, game, NULL);
+
+  // After 6 turns: if the game didn't end via consecutive-zeros on this move,
+  // it never will be a recorded 6-pass-cycle game.
+  if (game_runner->pass_cycle_active && game_runner->pass_cycle_n_moves >= 6 &&
+      !game_over(game)) {
+    game_runner->pass_cycle_abandoned = true;
+  }
   if (game_runner->game_one_move_behind && game_runner->turn_number > 0) {
     play_move(&game_runner->previous_move, game_runner->game_one_move_behind,
               NULL);
