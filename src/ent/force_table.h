@@ -93,6 +93,14 @@ ForceTargetSlot *force_table_lookup_slots_by_shape(ForceTable *table, int bag,
                                                     int leave_length,
                                                     int exchange, int *count);
 
+// Returns the parallel required-tile-bitmap array for a shape bucket. Workers
+// AND each entry with their leave's tile bitmap — if the result != entry,
+// the target's required tiles aren't all in the leave and the slot can be
+// skipped without further checks. Compact 4 bytes per slot, fits in L1 cache
+// for fast pre-filter.
+uint32_t *force_table_lookup_bitmaps_by_shape(ForceTable *table, int bag,
+                                              int leave_length, int exchange);
+
 // Check whether a candidate move's leave + score + current score-diff matches
 // the given target. `leave` is the post-move kept-tile rack. `score` is the
 // move's score. `diff` is the current score difference (player_on_turn minus

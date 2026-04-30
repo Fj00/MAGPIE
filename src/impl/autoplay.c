@@ -836,41 +836,49 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
       const int best_score = equity_to_int(move_get_score(best_move));
       const int best_leave_len = (int)best_leave.number_of_letters;
       const bool best_is_exch = (best_score == 0);
-      // Use the shape bucket for natural-best instead of the full bag bucket.
-      // Hot-loop slots: contains inline hot fields + cold pointer per slot,
-      // cache-friendly sequential read.
+      // Use the shape bucket for natural-best. Slot iteration plus parallel
+      // required-tile-bitmap pre-filter for fast rejection.
       int best_bucket_count = 0;
       ForceTargetSlot *best_slots = NULL;
+      uint32_t *best_bitmaps = NULL;
+      uint32_t best_leave_bitmap = 0;
       if (best_leave_len >= 0 && best_leave_len < 8) {
         best_slots = force_table_lookup_slots_by_shape(
             ft, bag_count, best_leave_len, best_is_exch ? 1 : 0,
             &best_bucket_count);
+        best_bitmaps = force_table_lookup_bitmaps_by_shape(
+            ft, bag_count, best_leave_len, best_is_exch ? 1 : 0);
+        // Compute leave's tile bitmap once for the bucket scan's pre-filter.
+        for (uint16_t i = 0; i < best_leave.dist_size && i < 32; i++) {
+          if (best_leave.array[i] > 0) {
+            best_leave_bitmap |= ((uint32_t)1) << i;
+          }
+        }
       }
-      if (best_bucket_count > 0) {
+      if (best_bucket_count > 0 && best_bitmaps != NULL) {
         bool best_type_known = false;
         LeaveType best_type = LEAVE_TYPE_ALL;
         for (int priority = FORCE_TARGET_PAIR;
              priority >= FORCE_TARGET_STRATUM; priority--) {
           for (int t = 0; t < best_bucket_count; t++) {
+            // Pre-filter: target's required tiles must all be present in leave.
+            // Compact 4-byte AND-equal check rejects most slots without ever
+            // touching the slot struct or its cache lines.
+            const uint32_t req = best_bitmaps[t];
+            if ((best_leave_bitmap & req) != req) continue;
             ForceTargetSlot *slot = &best_slots[t];
             if (slot->deficit <= 0 || (int)slot->kind != priority) {
               continue;
             }
-            // Inline check (avoid function call) — same logic as
-            // force_target_matches but reads slot's hot fields. Length matches
-            // by definition (we looked up the matching shape). Exchange too.
             if (cur_diff < slot->diff_min || cur_diff > slot->diff_max) {
               continue;
             }
-            // Subleave tile check.
-            int ok = 1;
-            for (int i = 0; i < slot->subleave_count; i++) {
-              const MachineLetter need = slot->subleave_mls[i];
-              if (best_leave.array[need] <= 0) { ok = 0; break; }
-              if (i == 1 && slot->subleave_mls[0] == slot->subleave_mls[1] &&
-                  best_leave.array[need] < 2) { ok = 0; break; }
+            // Same-tile pair (e.g. "??") still needs the count >= 2 check.
+            if (slot->subleave_count == 2 &&
+                slot->subleave_mls[0] == slot->subleave_mls[1] &&
+                best_leave.array[slot->subleave_mls[0]] < 2) {
+              continue;
             }
-            if (!ok) continue;
             if (slot->exchange == 0 && slot->leave_length >= 3) {
               if (!best_type_known) {
                 best_type = force_classify_leave(&best_leave, ld);
@@ -911,20 +919,27 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
     return NULL;
   }
 
-  // B1: pre-compute leaves for every move once (vs computing per (target,move)
-  // pair in the original triple-nested loop, which was 46M ops/turn worst case).
+  // B1: pre-compute leaves for every move once. Also compute each leave's
+  // tile bitmap for the per-target bitmap pre-filter.
   Rack *leaves = autoplay_worker->force_leaves;
+  uint32_t leave_bitmaps[2048] = {0};
   for (int m = 0; m < n_moves; m++) {
     rack_set_dist_size(&leaves[m], ld_size);
     Move *move = move_list_get_move(ml, m);
     get_leave_for_move(move, game, &leaves[m]);
+    uint32_t bm = 0;
+    for (uint16_t i = 0; i < leaves[m].dist_size && i < 32; i++) {
+      if (leaves[m].array[i] > 0) {
+        bm |= ((uint32_t)1) << i;
+      }
+    }
+    leave_bitmaps[m] = bm;
   }
 
-  // A2 + slot-based fallback: per-move iteration uses
-  // force_table_lookup_slots_by_shape to fetch only the slots compatible with
-  // this move's (leave_length, exchange). Hot-loop reads inline slot fields
-  // (cache-friendly sequential access) instead of pointer-chasing through
-  // scattered ForceTarget structs.
+  // A2 + slot-based fallback + bitmap pre-filter. For each move, scan the
+  // shape bucket using the parallel required-tile-bitmap array first to
+  // reject targets whose required tiles aren't in the leave (4-byte AND-equal,
+  // few cycles per slot).
   (void)targets; // bag-level array no longer used in inner loop
   for (int priority = FORCE_TARGET_PAIR; priority >= FORCE_TARGET_STRATUM;
        priority--) {
@@ -939,12 +954,17 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
       int bucket_count = 0;
       ForceTargetSlot *slots = force_table_lookup_slots_by_shape(
           ft, bag_count, leave_len, is_exch ? 1 : 0, &bucket_count);
-      if (bucket_count == 0) {
+      uint32_t *bitmaps = force_table_lookup_bitmaps_by_shape(
+          ft, bag_count, leave_len, is_exch ? 1 : 0);
+      if (bucket_count == 0 || bitmaps == NULL) {
         continue;
       }
+      const uint32_t leave_bm = leave_bitmaps[m];
       LeaveType move_type = LEAVE_TYPE_ALL;
       bool move_type_known = false;
       for (int t = 0; t < bucket_count; t++) {
+        const uint32_t req = bitmaps[t];
+        if ((leave_bm & req) != req) continue;
         ForceTargetSlot *slot = &slots[t];
         if (slot->deficit <= 0 || (int)slot->kind != priority) {
           continue;
@@ -952,15 +972,11 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
         if (cur_diff < slot->diff_min || cur_diff > slot->diff_max) {
           continue;
         }
-        // Subleave tile check (inline — same as force_target_matches body).
-        int ok = 1;
-        for (int i = 0; i < slot->subleave_count; i++) {
-          const MachineLetter need = slot->subleave_mls[i];
-          if (leaves[m].array[need] <= 0) { ok = 0; break; }
-          if (i == 1 && slot->subleave_mls[0] == slot->subleave_mls[1] &&
-              leaves[m].array[need] < 2) { ok = 0; break; }
+        if (slot->subleave_count == 2 &&
+            slot->subleave_mls[0] == slot->subleave_mls[1] &&
+            leaves[m].array[slot->subleave_mls[0]] < 2) {
+          continue;
         }
-        if (!ok) continue;
         if (slot->exchange == 0 && slot->leave_length >= 3) {
           if (!move_type_known) {
             move_type = force_classify_leave(&leaves[m], ld);

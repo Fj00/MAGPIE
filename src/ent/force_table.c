@@ -57,6 +57,12 @@ struct ForceTable {
   // cold pointer per slot. Workers iterate slots for cache-friendly matching.
   ForceTargetSlot *by_shape_slots[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX]
                                  [FORCE_EXCHANGE_MAX];
+  // Per-target required-tile bitmap (parallel to slots). Bit i = subleave
+  // requires tile i (0=blank). Workers AND this with their leave's bitmap
+  // and skip the slot when the result != required_bitmap. Compact 4 bytes
+  // per slot — fits in L1 cache for fast pre-filter.
+  uint32_t *by_shape_bitmaps[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX]
+                            [FORCE_EXCHANGE_MAX];
   // B5: serializes the swap-to-back operation when a target hits deficit==0.
   // Only acquired on the rare deficit-hits-zero transition; readers iterate
   // active prefix without locking (they may briefly see torn order on
@@ -192,6 +198,18 @@ bool force_target_matches(const ForceTarget *target, const Rack *leave,
   return true;
 }
 
+// Compute the required-tile bitmap for a target's subleave_mls. Bit i is set
+// for each tile type required to be present in the leave. For pair targets
+// with same-tile pairs (e.g. "??"), only one bit is set in the bitmap (the
+// count check is done downstream).
+static inline uint32_t required_bitmap_for_target(const ForceTarget *target) {
+  uint32_t bm = 0;
+  for (int i = 0; i < target->subleave_count; i++) {
+    bm |= ((uint32_t)1) << target->subleave_mls[i];
+  }
+  return bm;
+}
+
 // Populate a ForceTargetSlot from its full target. Used at load time and
 // to refresh slot.deficit when the cold deficit decrements.
 static inline void slot_init_from_target(ForceTargetSlot *slot,
@@ -241,6 +259,7 @@ static void swap_to_back_shape(ForceTable *table, ForceTarget *target) {
   if (L < 0 || L >= FORCE_LEAVE_LEN_MAX) return;
   ForceTarget **ptrs = table->by_shape_ptrs[bag][L][ex];
   ForceTargetSlot *slots = table->by_shape_slots[bag][L][ex];
+  uint32_t *bitmaps = table->by_shape_bitmaps[bag][L][ex];
   if (!ptrs) return;
   int last = atomic_load_explicit(&table->by_shape_active[bag][L][ex],
                                    memory_order_relaxed) - 1;
@@ -256,6 +275,11 @@ static void swap_to_back_shape(ForceTable *table, ForceTarget *target) {
       ForceTargetSlot tmp = slots[idx];
       slots[idx] = slots[last];
       slots[last] = tmp;
+    }
+    if (bitmaps) {
+      uint32_t tmpb = bitmaps[idx];
+      bitmaps[idx] = bitmaps[last];
+      bitmaps[last] = tmpb;
     }
   }
   atomic_store_explicit(&table->by_shape_active[bag][L][ex], last,
@@ -380,6 +404,16 @@ ForceTargetSlot *force_table_lookup_slots_by_shape(ForceTable *table, int bag,
   *count = atomic_load_explicit(&table->by_shape_active[bag][leave_length][ex],
                                 memory_order_acquire);
   return table->by_shape_slots[bag][leave_length][ex];
+}
+
+uint32_t *force_table_lookup_bitmaps_by_shape(ForceTable *table, int bag,
+                                              int leave_length, int exchange) {
+  if (bag < 0 || bag >= FORCE_BAG_MAX || leave_length < 0 ||
+      leave_length >= FORCE_LEAVE_LEN_MAX) {
+    return NULL;
+  }
+  const int ex = exchange ? 1 : 0;
+  return table->by_shape_bitmaps[bag][leave_length][ex];
 }
 
 int64_t force_table_total_remaining(const ForceTable *table) {
@@ -591,6 +625,9 @@ ForceTable *force_table_create(const char *csv_path,
           // Parallel slot array — populated below alongside the pointer array.
           table->by_shape_slots[b][L][ex] =
               (ForceTargetSlot *)malloc_or_die(sizeof(ForceTargetSlot) * n);
+          // Parallel required-tile-bitmap array — used as fast pre-filter.
+          table->by_shape_bitmaps[b][L][ex] =
+              (uint32_t *)malloc_or_die(sizeof(uint32_t) * n);
         }
       }
     }
@@ -608,6 +645,8 @@ ForceTable *force_table_create(const char *csv_path,
       table->by_shape_ptrs[b][t->leave_length][ex][idx] = t;
       slot_init_from_target(
           &table->by_shape_slots[b][t->leave_length][ex][idx], t);
+      table->by_shape_bitmaps[b][t->leave_length][ex][idx] =
+          required_bitmap_for_target(t);
       t->by_shape_idx = idx;
     }
   }
@@ -697,6 +736,7 @@ void force_table_destroy(ForceTable *table) {
       for (int ex = 0; ex < FORCE_EXCHANGE_MAX; ex++) {
         free(table->by_shape_ptrs[b][L][ex]);
         free(table->by_shape_slots[b][L][ex]);
+        free(table->by_shape_bitmaps[b][L][ex]);
       }
     }
   }
