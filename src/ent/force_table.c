@@ -417,22 +417,15 @@ ForceTable *force_table_create(const char *csv_path,
       table->by_bag_ptrs[bag][by_bag_fill[bag]++] = &table->targets[i];
     }
   }
-  // Sort each bag's targets by deficit ascending so rare targets get first
-  // shot at matching. High-deficit targets with common predicates would
-  // otherwise starve the rare ones.
-  for (int b = 0; b < FORCE_BAG_MAX; b++) {
-    int n = table->by_bag_count[b];
-    // Simple insertion sort — n typically ≤ few thousand, called once at load.
-    for (int i = 1; i < n; i++) {
-      ForceTarget *key = table->by_bag_ptrs[b][i];
-      int j = i - 1;
-      while (j >= 0 && table->by_bag_ptrs[b][j]->deficit > key->deficit) {
-        table->by_bag_ptrs[b][j + 1] = table->by_bag_ptrs[b][j];
-        j--;
-      }
-      table->by_bag_ptrs[b][j + 1] = key;
-    }
-  }
+  // Note: deficit-asc sort removed. The sort put low-deficit targets at the
+  // front of each bucket so rare targets would be matched first. But once a
+  // target's deficit hits 0 it stays at the front, and per-turn iteration
+  // walks past those dead entries to find active targets — causing per-turn
+  // cost to grow linearly with cumulative games played (quadratic total time).
+  // Current insertion order is fine; per-turn iteration is now bucket-size
+  // bounded and constant. Rare targets still get matched, just not
+  // preferentially — fairness over time is preserved by force-table reissue
+  // between iterations.
 
   // A2: build by_shape index per (bag, leave_length, exchange). Iterate the
   // already-sorted by_bag_ptrs so each shape bucket inherits deficit-ascending
