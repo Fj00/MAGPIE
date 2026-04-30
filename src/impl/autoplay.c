@@ -895,6 +895,38 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
     get_leave_for_move(move, game, &leaves[m]);
   }
 
+  // B2: precompute per-(exchange, leave_length) bitmasks of active targets at
+  // this bag, so we can skip moves whose (exchange, leave_length) can't match
+  // any active target. Cuts the inner-loop iteration when force-table is dense
+  // but the move's leave shape isn't a possible match.
+  uint32_t active_play_lengths = 0;   // exchange == 0
+  uint32_t active_exch_lengths = 0;   // exchange == 1
+  for (int t = 0; t < target_count; t++) {
+    ForceTarget *target = targets[t];
+    if (target->deficit <= 0) {
+      continue;
+    }
+    if (target->exchange) {
+      active_exch_lengths |= (1u << (uint32_t)target->leave_length);
+    } else {
+      active_play_lengths |= (1u << (uint32_t)target->leave_length);
+    }
+  }
+
+  // Per-move filter cache: 0 = move's (exchange, leave_length) can't match any
+  // active target, 1 = potential match, must run target loop. Computed once.
+  // Stack-allocated to force_move_list capacity (2000 in worker_create).
+  uint8_t move_can_match[2048];
+  for (int m = 0; m < n_moves; m++) {
+    Move *move = move_list_get_move(ml, m);
+    const int score = equity_to_int(move_get_score(move));
+    const bool is_exch = (score == 0);
+    const int leave_len = (int)leaves[m].number_of_letters;
+    const uint32_t mask =
+        is_exch ? active_exch_lengths : active_play_lengths;
+    move_can_match[m] = (uint8_t)((mask >> leave_len) & 1u);
+  }
+
   for (int priority = FORCE_TARGET_PAIR; priority >= FORCE_TARGET_STRATUM;
        priority--) {
     for (int t = 0; t < target_count; t++) {
@@ -903,6 +935,9 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
         continue;
       }
       for (int m = 0; m < n_moves; m++) {
+        if (!move_can_match[m]) {
+          continue;
+        }
         Move *move = move_list_get_move(ml, m);
         const int score = equity_to_int(move_get_score(move));
         if (!force_target_matches(target, &leaves[m], score, cur_diff)) {
