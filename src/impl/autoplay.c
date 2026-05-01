@@ -83,6 +83,10 @@ typedef struct AutoplaySharedData {
   bool stop_on_opening_pass_complete;
   PassCycleTable *pass_cycle_table;
   EmptyBoardRecorder *empty_board_recorder;
+  // Slice 2: K-way fork branching at empty-board cycle-alive turns. Activated
+  // by MAGPIE_EMPTY_BOARD_BRANCH=1. When set, play_autoplay_game_or_game_pair
+  // dispatches a single-runner DFS that explores forks at branchable turns.
+  bool eb_branch_active;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -467,6 +471,14 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   if (eb_out && eb_out[0] != '\0') {
     shared_data->empty_board_recorder = empty_board_recorder_create(eb_out);
   }
+  shared_data->eb_branch_active = false;
+  const char *eb_branch = getenv("MAGPIE_EMPTY_BOARD_BRANCH");
+  if (eb_branch && eb_branch[0] != '\0' && eb_branch[0] != '0') {
+    shared_data->eb_branch_active = true;
+    fprintf(stderr,
+            "empty_board: K-way fork branching ENABLED (turns 3-5 if "
+            "is_pass rack)\n");
+  }
   return shared_data;
 }
 
@@ -584,6 +596,18 @@ typedef struct GameRunner {
   // Slice 1: piggybacks on pass_cycle binary mode. True iff recorder is set
   // AND this game has pass_cycle_active.
   bool eb_active;
+
+  // Slice 2 K-way fork DFS state.
+  // eb_save_game: scratch Game used to checkpoint state at fork points.
+  //               Allocated only when shared_data->eb_branch_active.
+  // eb_forced_move: when non-NULL, game_runner_play_move uses this exact move
+  //                 instead of the normal selection logic. The DFS sets it
+  //                 right before each branch's play_move call.
+  // eb_action_buf:  pre-allocated Move slots for enumerate_eb_actions
+  //                 (pass / best-exch / best-play). Capacity matches K=3.
+  Game *eb_save_game;
+  Move *eb_forced_move;
+  Move *eb_action_buf[3];
 } GameRunner;
 
 GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
@@ -597,6 +621,17 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
   }
   game_runner->pair_game_number =
       0; // Will be set in game_runner_start if using pairs
+  game_runner->eb_save_game = NULL;
+  game_runner->eb_forced_move = NULL;
+  game_runner->eb_action_buf[0] = NULL;
+  game_runner->eb_action_buf[1] = NULL;
+  game_runner->eb_action_buf[2] = NULL;
+  if (autoplay_worker->shared_data->eb_branch_active) {
+    game_runner->eb_save_game = game_create(args->game_args);
+    game_runner->eb_action_buf[0] = move_create();
+    game_runner->eb_action_buf[1] = move_create();
+    game_runner->eb_action_buf[2] = move_create();
+  }
   return game_runner;
 }
 
@@ -606,6 +641,10 @@ void game_runner_destroy(GameRunner *game_runner) {
   }
   game_destroy(game_runner->game);
   game_destroy(game_runner->game_one_move_behind);
+  game_destroy(game_runner->eb_save_game);
+  for (int i = 0; i < 3; i++) {
+    free(game_runner->eb_action_buf[i]);
+  }
   free(game_runner);
 }
 
@@ -697,6 +736,7 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   game_runner->eb_active =
       game_runner->shared_data->empty_board_recorder != NULL &&
       game_runner->pass_cycle_active;
+  game_runner->eb_forced_move = NULL;
 
   if (game_runner->game_one_move_behind) {
     Game *game_one_move_behind = game_runner->game_one_move_behind;
@@ -1096,9 +1136,18 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
   }
 
   const Move *move = NULL;
+  // Empty-board K-way DFS (slice 2): if caller pre-decided the action for
+  // this fork branch, use it verbatim. Highest priority — overrides every
+  // other selection path.
+  if (game_runner->eb_forced_move) {
+    Move *spare = move_list_get_spare_move(
+        autoplay_worker->move_lists[player_on_turn_index]);
+    move_copy(spare, game_runner->eb_forced_move);
+    move = spare;
+  }
   // Opening-pass mode: on the opening turn of the starter (the player with
   // the forced rack) in the pass branch, override the move with a pass.
-  if (game_runner->opening_pass_rack_idx >= 0 &&
+  if (!move && game_runner->opening_pass_rack_idx >= 0 &&
       game_runner->opening_pass_branch == 0 &&
       game_runner->turn_number == 0 &&
       player_on_turn_index == game_runner->opening_pass_player_index) {
@@ -1434,11 +1483,203 @@ static void pass_cycle_stringify_rack(const Game *game, int player_index,
   out[n] = '\0';
 }
 
+// ---- Slice 2: K-way fork DFS over the empty-board cycle subtree ----
+//
+// At a fork point (cycle-alive empty-board turn, bot's current rack is
+// is_pass=1, turn ∈ {3,4,5}), the DFS enumerates K=3 actions {pass,
+// best-exchange, best-play}, plays each with full state save/restore, and
+// recurses to game-end. Each leaf branch emits its captured eb_snaps with
+// the leaf's eventual_outcome.
+//
+// Subset fan-out at turn 5 (no plays) and turn 6 is deferred to slice 2b.
+
+// Returns canonical rack string for player on turn into out (>= RACK_SIZE+2).
+static void eb_canonical_rack(const Game *game, int player_index, char *out) {
+  const LetterDistribution *ld = game_get_ld(game);
+  const Rack *rack = player_get_rack(game_get_player(game, player_index));
+  const uint16_t dist_size = rack_get_dist_size(rack);
+  int n = 0;
+  for (uint16_t i = 1; i < dist_size && n < RACK_SIZE; i++) {
+    const int c = rack_get_letter(rack, i);
+    for (int k = 0; k < c && n < RACK_SIZE; k++) {
+      out[n++] = ld->ld_ml_to_hl[i][0];
+    }
+  }
+  const int nblanks = rack_get_letter(rack, 0);
+  for (int k = 0; k < nblanks && n < RACK_SIZE; k++) {
+    out[n++] = '?';
+  }
+  out[n] = '\0';
+}
+
+// Save/restore wrapper for eb_active per-runner state that lives outside
+// game state (snap stack offsets and per-player action history buffers).
+typedef struct EbMetaSave {
+  int n_snaps;
+  int actions_p0_off;
+  int actions_p1_off;
+  char actions_p0[96];
+  char actions_p1[96];
+  bool pass_cycle_abandoned;
+  int pass_cycle_n_moves;
+  int turn_number;
+} EbMetaSave;
+
+static void eb_meta_save(const GameRunner *gr, EbMetaSave *s) {
+  s->n_snaps = gr->eb_n_snaps;
+  s->actions_p0_off = gr->eb_actions_p0_off;
+  s->actions_p1_off = gr->eb_actions_p1_off;
+  memcpy(s->actions_p0, gr->eb_actions_p0, sizeof(s->actions_p0));
+  memcpy(s->actions_p1, gr->eb_actions_p1, sizeof(s->actions_p1));
+  s->pass_cycle_abandoned = gr->pass_cycle_abandoned;
+  s->pass_cycle_n_moves = gr->pass_cycle_n_moves;
+  s->turn_number = gr->turn_number;
+}
+
+static void eb_meta_restore(GameRunner *gr, const EbMetaSave *s) {
+  gr->eb_n_snaps = s->n_snaps;
+  gr->eb_actions_p0_off = s->actions_p0_off;
+  gr->eb_actions_p1_off = s->actions_p1_off;
+  memcpy(gr->eb_actions_p0, s->actions_p0, sizeof(s->actions_p0));
+  memcpy(gr->eb_actions_p1, s->actions_p1, sizeof(s->actions_p1));
+  gr->pass_cycle_abandoned = s->pass_cycle_abandoned;
+  gr->pass_cycle_n_moves = s->pass_cycle_n_moves;
+  gr->turn_number = s->turn_number;
+}
+
+// Enumerate K=3 actions for the current decision into fixed slots:
+//   eb_action_buf[0] = pass
+//   eb_action_buf[1] = best-equity exchange (only present if any exch legal)
+//   eb_action_buf[2] = best-equity tile placement (only present if any legal)
+// Returns a 3-bit mask: bit i set iff slot i is populated.
+static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
+  const int p_idx = game_get_player_on_turn_index(gr->game);
+  MoveList *ml = w->move_lists[p_idx];
+
+  move_set_as_pass(gr->eb_action_buf[0]);
+  int mask = 0x1;  // pass always present
+
+  const MoveGenArgs gen_args = {
+      .game = gr->game,
+      .move_list = ml,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_EQUITY,
+      .override_kwg = NULL,
+      .thread_index = w->worker_index,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+      .tiles_played_bv = NULL,
+      .initial_tiles_bv = 0};
+  generate_moves(&gen_args);
+  const int n_moves = move_list_get_count(ml);
+  for (int m = 0; m < n_moves && (mask != 0x7); m++) {
+    Move *cand = move_list_get_move(ml, m);
+    const game_event_t mt = move_get_type(cand);
+    if (!(mask & 0x2) && mt == GAME_EVENT_EXCHANGE) {
+      move_copy(gr->eb_action_buf[1], cand);
+      mask |= 0x2;
+    } else if (!(mask & 0x4) && mt == GAME_EVENT_TILE_PLACEMENT_MOVE) {
+      move_copy(gr->eb_action_buf[2], cand);
+      mask |= 0x4;
+    }
+  }
+  return mask;
+}
+
+// Emit captured eb_snaps for this leaf branch with its eventual_outcome.
+static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, int branch_id) {
+  EmptyBoardRecorder *ebr = w->shared_data->empty_board_recorder;
+  if (!ebr || gr->eb_n_snaps == 0) return;
+  const int s0 =
+      equity_to_int(player_get_score(game_get_player(gr->game, 0)));
+  const int s1 =
+      equity_to_int(player_get_score(game_get_player(gr->game, 1)));
+  for (int i = 0; i < gr->eb_n_snaps; i++) {
+    const int p = gr->eb_snaps[i].player_on_turn;
+    const int my = (p == 0) ? s0 : s1;
+    const int opp = (p == 0) ? s1 : s0;
+    const int outcome = my > opp ? 2 : (my == opp ? 1 : 0);
+    empty_board_recorder_write(
+        ebr, gr->game_number, branch_id,
+        gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
+        gr->eb_snaps[i].bag_counts, gr->eb_snaps[i].opp_history,
+        gr->eb_snaps[i].action_kind, gr->eb_snaps[i].action_repr,
+        gr->eb_snaps[i].action_size, outcome, my - opp);
+  }
+}
+
+// Recursive DFS. Plays moves until a fork point or game-end. At a fork
+// point, enumerates K actions, recursively explores each, then returns.
+// At game-end, emits the leaf branch's records.
+static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr, int branch_id) {
+  while (!game_runner_is_game_over(gr)) {
+    // Fork condition: cycle-alive empty-board turn, slot < 6, bot's current
+    // rack is is_pass=1, and turn-on-empty-board ∈ {3,4,5} (slice 2a).
+    const bool cycle_alive =
+        gr->eb_active && gr->eb_n_snaps < 6 &&
+        board_get_tiles_played(game_get_board(gr->game)) == 0;
+    bool branchable = false;
+    if (cycle_alive) {
+      const int turn = gr->eb_n_snaps + 1;
+      if (turn >= 3 && turn <= 5) {
+        const int p_idx = game_get_player_on_turn_index(gr->game);
+        char canon[RACK_SIZE + 2] = {0};
+        eb_canonical_rack(gr->game, p_idx, canon);
+        const int isp = pass_cycle_lookup_is_pass(
+            w->shared_data->pass_cycle_table, canon);
+        branchable = (isp == 1);
+      }
+    }
+
+    if (!branchable) {
+      // Play one move using normal selection (eb_forced_move stays NULL).
+      game_runner_play_move(w, gr);
+      continue;
+    }
+
+    // Fork point: enumerate actions, save state, recurse for each populated
+    // slot. Slot 0=pass, 1=exch, 2=play; encoded as (i+1) into branch_id so
+    // the action at each fork-depth is unambiguously recoverable.
+    const int mask = eb_enumerate_actions(w, gr);
+    EbMetaSave saved_meta;
+    eb_meta_save(gr, &saved_meta);
+    game_copy(gr->eb_save_game, gr->game);
+
+    for (int i = 0; i < 3; i++) {
+      if (!(mask & (1 << i))) continue;
+      gr->eb_forced_move = gr->eb_action_buf[i];
+      game_runner_play_move(w, gr);
+      gr->eb_forced_move = NULL;
+      play_eb_dfs(w, gr, (branch_id << 4) | (i + 1));
+      // Restore parent state for the next fork choice.
+      game_copy(gr->game, gr->eb_save_game);
+      eb_meta_restore(gr, &saved_meta);
+    }
+    return;
+  }
+  // Leaf: game is over. Emit this branch's captured records.
+  eb_emit_leaf(w, gr, branch_id);
+}
+
 void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
                                      GameRunner *game_runner1,
                                      GameRunner *game_runner2,
                                      const AutoplayIterOutput *iter_output) {
   const int starting_player_index = (int)(iter_output->iter_count % 2);
+
+  // Slice 2 dispatch: K-way fork DFS over the empty-board cycle subtree.
+  // Single-runner mode — game_runner2 is unused. Each pair_id explores its
+  // own fork tree, emitting per-leaf records.
+  if (autoplay_worker->shared_data->eb_branch_active &&
+      autoplay_worker->shared_data->pass_cycle_table != NULL) {
+    game_runner_start(autoplay_worker, game_runner1, iter_output,
+                      starting_player_index, 0);
+    play_eb_dfs(autoplay_worker, game_runner1, 0);
+    autoplay_add_game(autoplay_worker, game_runner1, false);
+    return;
+  }
+
   // Opening-pass paired mode: both runners use the SAME starting player so
   // the forced rack and force-pass logic apply to the same player slot in
   // both games. The branch (pass vs play) differentiates them via
