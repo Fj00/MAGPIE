@@ -47,14 +47,14 @@ void empty_board_recorder_destroy(EmptyBoardRecorder *r) {
 }
 
 void empty_board_recorder_write(
-    EmptyBoardRecorder *r, uint64_t pair_id, int branch_id,
+    EmptyBoardRecorder *r, uint64_t pair_id, uint64_t branch_id,
     int turn_on_empty_board, const char *rack, const uint8_t bag_counts[27],
     const char *opp_action_history, int action_kind, const char *action_repr,
     int action_size, int eventual_outcome, int eventual_margin) {
   if (!r) return;
   pthread_mutex_lock(&r->mutex);
-  fprintf(r->out_file, "%llu,%d,%d,%s", (unsigned long long)pair_id, branch_id,
-          turn_on_empty_board, rack ? rack : "");
+  fprintf(r->out_file, "%llu,%llu,%d,%s", (unsigned long long)pair_id,
+          (unsigned long long)branch_id, turn_on_empty_board, rack ? rack : "");
   for (int i = 0; i < EB_TILE_TYPES; i++) {
     fprintf(r->out_file, ",%u", (unsigned)bag_counts[i]);
   }

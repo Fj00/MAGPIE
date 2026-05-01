@@ -25,9 +25,16 @@ void empty_board_recorder_destroy(EmptyBoardRecorder *r);
 //
 // pair_id, branch_id              identify the (pair, fork) the row belongs to.
 //                                 Slice 1: branch_id mirrors the binary
-//                                 pass_cycle_branch (0 = P1 force-pass, 1 =
-//                                 P1 plays normally). Slice 2 will encode
-//                                 K-way fork paths.
+//                                 pass_cycle_branch (0 / 1).
+//                                 Slice 2: branch_id is a packed fork-path
+//                                 encoding (uint64). Each fork left-shifts by
+//                                 8 and OR's in (slot_index + 1); 0 bytes
+//                                 mark fork-depth not reached. Slot 0 is
+//                                 always pass; slots 1..N depend on mode
+//                                 (K=3 mode → 1=best-exch, 2=best-play;
+//                                 subset-fan-out mode → 1..N=exchange subsets
+//                                 in equity order, last slot=best-play if
+//                                 turn 6).
 // turn_on_empty_board ∈ {1..6}    cycle position of this decision.
 // rack                             canonical rack of player on turn (e.g.
 //                                 "AEINRST"; blanks last as "?").
@@ -47,7 +54,7 @@ void empty_board_recorder_destroy(EmptyBoardRecorder *r);
 //                                 perspective.
 // eventual_margin                  signed final score diff (this player - opp).
 void empty_board_recorder_write(
-    EmptyBoardRecorder *r, uint64_t pair_id, int branch_id,
+    EmptyBoardRecorder *r, uint64_t pair_id, uint64_t branch_id,
     int turn_on_empty_board, const char *rack, const uint8_t bag_counts[27],
     const char *opp_action_history, int action_kind, const char *action_repr,
     int action_size, int eventual_outcome, int eventual_margin);
