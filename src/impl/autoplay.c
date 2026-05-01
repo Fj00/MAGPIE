@@ -19,6 +19,7 @@
 #include "../ent/equity.h"
 #include "../ent/force_table.h"
 #include "../ent/game.h"
+#include "../ent/empty_board.h"
 #include "../ent/opening_pass.h"
 #include "../ent/pass_cycle.h"
 #include "../ent/inference_args.h"
@@ -81,6 +82,7 @@ typedef struct AutoplaySharedData {
   OpeningPassTable *opening_pass_table;
   bool stop_on_opening_pass_complete;
   PassCycleTable *pass_cycle_table;
+  EmptyBoardRecorder *empty_board_recorder;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -459,6 +461,12 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
     shared_data->pass_cycle_table =
         pass_cycle_table_create(pc_racks, pc_out);
   }
+
+  shared_data->empty_board_recorder = NULL;
+  const char *eb_out = getenv("MAGPIE_EMPTY_BOARD_OUT");
+  if (eb_out && eb_out[0] != '\0') {
+    shared_data->empty_board_recorder = empty_board_recorder_create(eb_out);
+  }
   return shared_data;
 }
 
@@ -503,6 +511,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   }
   opening_pass_table_destroy(shared_data->opening_pass_table);
   pass_cycle_table_destroy(shared_data->pass_cycle_table);
+  empty_board_recorder_destroy(shared_data->empty_board_recorder);
   free(shared_data);
 }
 
@@ -551,6 +560,30 @@ typedef struct GameRunner {
   // Set true once we know this game cannot be a recorded 6-pass-cycle game
   // (e.g. a tile was placed). Causes game_runner_is_game_over to short-circuit.
   bool pass_cycle_abandoned;
+
+  // Empty-board / pass-cycle value sub-model recorder state (slice 1).
+  // One snapshot per cycle-alive empty-board turn the player on turn faced;
+  // emitted at game-end with eventual_outcome filled in.
+  struct {
+    int player_on_turn;       // 0 or 1
+    int turn_on_empty_board;  // 1..6
+    char rack[RACK_SIZE + 2];
+    uint8_t bag_counts[27];
+    char opp_history[96];
+    int action_kind;          // 0=pass, 1=exch, 2=play
+    char action_repr[16];
+    int action_size;
+  } eb_snaps[6];
+  int eb_n_snaps;
+  // Per-player action history accumulated this cycle (pipe-joined). Used as
+  // opp_action_history when capturing the OTHER player's snapshot.
+  char eb_actions_p0[96];
+  int eb_actions_p0_off;
+  char eb_actions_p1[96];
+  int eb_actions_p1_off;
+  // Slice 1: piggybacks on pass_cycle binary mode. True iff recorder is set
+  // AND this game has pass_cycle_active.
+  bool eb_active;
 } GameRunner;
 
 GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
@@ -653,6 +686,17 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   if (!used_forced_rack) {
     draw_starting_racks(game);
   }
+
+  // Empty-board recorder state (slice 1): active iff recorder configured AND
+  // cycle entry happened via pass_cycle.
+  game_runner->eb_n_snaps = 0;
+  game_runner->eb_actions_p0[0] = '\0';
+  game_runner->eb_actions_p0_off = 0;
+  game_runner->eb_actions_p1[0] = '\0';
+  game_runner->eb_actions_p1_off = 0;
+  game_runner->eb_active =
+      game_runner->shared_data->empty_board_recorder != NULL &&
+      game_runner->pass_cycle_active;
 
   if (game_runner->game_one_move_behind) {
     Game *game_one_move_behind = game_runner->game_one_move_behind;
@@ -1199,6 +1243,99 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     game_runner->pass_cycle_n_moves++;
   }
 
+  // Empty-board recorder snapshot (slice 1): one row per cycle-alive
+  // empty-board decision faced by the player on turn. eventual_outcome and
+  // eventual_margin are filled in at game-end and rows emitted there.
+  // Cycle-alive = no tile placed yet (board still empty before this move).
+  if (game_runner->eb_active && game_runner->eb_n_snaps < 6 &&
+      board_get_tiles_played(game_get_board(game)) == 0) {
+    const int slot = game_runner->eb_n_snaps;
+    game_runner->eb_snaps[slot].turn_on_empty_board = slot + 1;
+    game_runner->eb_snaps[slot].player_on_turn = player_on_turn_index;
+
+    // Canonical rack: A..Z then blanks.
+    char *rb = game_runner->eb_snaps[slot].rack;
+    int rn = 0;
+    const LetterDistribution *ld_eb = game_get_ld(game);
+    const uint16_t ds_eb = rack_get_dist_size(player_rack);
+    for (uint16_t i = 1; i < ds_eb && rn < RACK_SIZE; i++) {
+      const int c = rack_get_letter(player_rack, i);
+      for (int k = 0; k < c && rn < RACK_SIZE; k++) {
+        rb[rn++] = ld_eb->ld_ml_to_hl[i][0];
+      }
+    }
+    const int nblanks_eb = rack_get_letter(player_rack, 0);
+    for (int k = 0; k < nblanks_eb && rn < RACK_SIZE; k++) {
+      rb[rn++] = '?';
+    }
+    rb[rn] = '\0';
+
+    // Bag counts from this player's view = total_distribution - my_rack.
+    // ML 0 = blank, 1..26 = A..Z.
+    uint8_t *bc = game_runner->eb_snaps[slot].bag_counts;
+    for (int i = 0; i < 27; i++) {
+      const int total = (i < ds_eb) ? ld_get_dist(ld_eb, (MachineLetter)i) : 0;
+      const int mine =
+          (i < ds_eb) ? rack_get_letter(player_rack, (MachineLetter)i) : 0;
+      bc[i] = (uint8_t)(total - mine);
+    }
+
+    // opp_history = other player's actions accumulated so far this cycle.
+    const char *oh = (player_on_turn_index == 0)
+                         ? game_runner->eb_actions_p1
+                         : game_runner->eb_actions_p0;
+    snprintf(game_runner->eb_snaps[slot].opp_history,
+             sizeof(game_runner->eb_snaps[slot].opp_history), "%s", oh);
+
+    // Action kind/repr/size from the chosen move.
+    const game_event_t mt_eb = move_get_type(move);
+    if (mt_eb == GAME_EVENT_PASS) {
+      game_runner->eb_snaps[slot].action_kind = 0;
+      game_runner->eb_snaps[slot].action_repr[0] = '\0';
+      game_runner->eb_snaps[slot].action_size = 0;
+    } else if (mt_eb == GAME_EVENT_EXCHANGE) {
+      game_runner->eb_snaps[slot].action_kind = 1;
+      char *ar = game_runner->eb_snaps[slot].action_repr;
+      const int nt = move_get_tiles_played(move);
+      int an = 0;
+      const int cap = (int)sizeof(game_runner->eb_snaps[slot].action_repr) - 1;
+      for (int i = 0; i < nt && an < cap; i++) {
+        const MachineLetter ml = move_get_tile(move, i);
+        ar[an++] = ld_eb->ld_ml_to_hl[ml][0];
+      }
+      ar[an] = '\0';
+      game_runner->eb_snaps[slot].action_size = nt;
+    } else {
+      // Tile placement: cycle-break decision. action_repr left empty for
+      // slice 1 (action_kind+size+post-state suffice for the sub-model).
+      game_runner->eb_snaps[slot].action_kind = 2;
+      game_runner->eb_snaps[slot].action_repr[0] = '\0';
+      game_runner->eb_snaps[slot].action_size = move_get_tiles_played(move);
+    }
+    game_runner->eb_n_snaps++;
+
+    // Append this action to player_on_turn's per-cycle action history.
+    char *hist = (player_on_turn_index == 0) ? game_runner->eb_actions_p0
+                                             : game_runner->eb_actions_p1;
+    int *off = (player_on_turn_index == 0) ? &game_runner->eb_actions_p0_off
+                                           : &game_runner->eb_actions_p1_off;
+    const char *prefix = (*off == 0) ? "" : "|";
+    const int rem = 96 - *off;
+    if (rem > 0) {
+      int wrote = 0;
+      if (mt_eb == GAME_EVENT_PASS) {
+        wrote = snprintf(hist + *off, (size_t)rem, "%sP", prefix);
+      } else if (mt_eb == GAME_EVENT_EXCHANGE) {
+        wrote = snprintf(hist + *off, (size_t)rem, "%sX%s", prefix,
+                         game_runner->eb_snaps[slot].action_repr);
+      } else {
+        wrote = snprintf(hist + *off, (size_t)rem, "%sT%d", prefix,
+                         game_runner->eb_snaps[slot].action_size);
+      }
+      if (wrote > 0 && wrote < rem) *off += wrote;
+    }
+  }
+
   // Pass-cycle early-exit: once a tile is placed, the game can no longer
   // qualify for 6-pass-cycle recording (which requires tiles_played==0).
   // Same once we've seen 6 zero-score turns without the engine ending the
@@ -1486,6 +1623,36 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
                           p1_final2, p2_final2,
                           game_runner2->pass_cycle_branch, outcome2,
                           game_runner2->turn_number, hist2);
+      }
+    }
+  }
+
+  // Empty-board recorder (slice 1): emit one row per captured snapshot with
+  // eventual_outcome from that snap's player_on_turn perspective. Records are
+  // emitted regardless of how the game ended — the value-function dataset
+  // wants every (state, action, outcome) triple, not just cycle-end games.
+  EmptyBoardRecorder *ebr = autoplay_worker->shared_data->empty_board_recorder;
+  if (ebr) {
+    GameRunner *runners[2] = {game_runner1, game_runner2};
+    for (int gi = 0; gi < 2; gi++) {
+      GameRunner *gr = runners[gi];
+      if (!gr || !gr->eb_active || gr->eb_n_snaps == 0) continue;
+      const int s0 = equity_to_int(
+          player_get_score(game_get_player(gr->game, 0)));
+      const int s1 = equity_to_int(
+          player_get_score(game_get_player(gr->game, 1)));
+      for (int i = 0; i < gr->eb_n_snaps; i++) {
+        const int p = gr->eb_snaps[i].player_on_turn;
+        const int my = (p == 0) ? s0 : s1;
+        const int opp = (p == 0) ? s1 : s0;
+        const int outcome = my > opp ? 2 : (my == opp ? 1 : 0);
+        const int margin = my - opp;
+        empty_board_recorder_write(
+            ebr, gr->game_number, gr->pass_cycle_branch,
+            gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
+            gr->eb_snaps[i].bag_counts, gr->eb_snaps[i].opp_history,
+            gr->eb_snaps[i].action_kind, gr->eb_snaps[i].action_repr,
+            gr->eb_snaps[i].action_size, outcome, margin);
       }
     }
   }
