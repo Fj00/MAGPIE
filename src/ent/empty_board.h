@@ -38,9 +38,9 @@ void empty_board_recorder_destroy(EmptyBoardRecorder *r);
 // turn_on_empty_board ∈ {1..6}    cycle position of this decision.
 // rack                             canonical rack of player on turn (e.g.
 //                                 "AEINRST"; blanks last as "?").
-// bag_counts[27]                   unseen tile counts from this player's view
-//                                 (ML index 0=blank, 1..26=A..Z). Equals
-//                                 total_distribution - my_rack.
+//                                 (Bag counts are not recorded — they are
+//                                 recoverable as total_distribution - rack
+//                                 since the board is always empty here.)
 // opp_action_history               pipe-joined opp action codes so far in
 //                                 cycle ("" if turn 1; tokens "P", "X<tiles>",
 //                                 "T<tiles>"). Slice 1 captures whatever the
@@ -50,6 +50,9 @@ void empty_board_recorder_destroy(EmptyBoardRecorder *r);
 //                                 played tiles for play.
 // action_size                      0 for pass, N for exch, tiles_played for
 //                                 play.
+// leave                            post-action rack (canonical sorted, blanks
+//                                 last). For pass, equals rack. For exch and
+//                                 play, equals rack minus action tiles.
 // eventual_outcome                 0=loss, 1=tie, 2=win, from this player's
 //                                 perspective. (No margin field — for the
 //                                 value sub-model only the W/L/T outcome
@@ -68,9 +71,9 @@ void empty_board_recorder_destroy(EmptyBoardRecorder *r);
 //                                 sibling at a fork is the natural choice.
 void empty_board_recorder_write(
     EmptyBoardRecorder *r, uint64_t pair_id, uint64_t branch_id,
-    int turn_on_empty_board, const char *rack, const uint8_t bag_counts[27],
+    int turn_on_empty_board, const char *rack,
     const char *opp_action_history, int action_kind, const char *action_repr,
-    int action_size, int eventual_outcome, int p2_rack_source,
-    int natural_slot);
+    int action_size, const char *leave, int eventual_outcome,
+    int p2_rack_source, int natural_slot);
 
 #endif

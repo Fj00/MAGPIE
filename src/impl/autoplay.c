@@ -603,11 +603,16 @@ typedef struct GameRunner {
     int player_on_turn;       // 0 or 1
     int turn_on_empty_board;  // 1..6
     char rack[RACK_SIZE + 2];
-    uint8_t bag_counts[27];
     char opp_history[96];
     int action_kind;          // 0=pass, 1=exch, 2=play
-    char action_repr[16];
+    char action_repr[16];     // exch: tiles given back; play: tiles placed
     int action_size;
+    char leave[RACK_SIZE + 2];  // post-action rack (canonical sorted, blanks
+                                // last). Pass: leave == rack. Exch/play: rack
+                                // minus action tiles, recovered via
+                                // get_leave_for_move so the play case (where
+                                // action_repr can't easily encode boardplay
+                                // tiles like blank-as-letter) is reliable.
     int natural_slot;         // slot HastyBot/force-pass would have chosen
                               // at this fork (-1 if not a fork point)
   } eb_snaps[6];
@@ -1375,15 +1380,33 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     }
     rb[rn] = '\0';
 
-    // Bag counts from this player's view = total_distribution - my_rack.
-    // ML 0 = blank, 1..26 = A..Z.
-    uint8_t *bc = game_runner->eb_snaps[slot].bag_counts;
-    for (int i = 0; i < 27; i++) {
-      const int total = (i < ds_eb) ? ld_get_dist(ld_eb, (MachineLetter)i) : 0;
-      const int mine =
-          (i < ds_eb) ? rack_get_letter(player_rack, (MachineLetter)i) : 0;
-      bc[i] = (uint8_t)(total - mine);
+    // Leave (post-action rack) — derived per kind:
+    //   pass: leave = rack (no change)
+    //   exch: leave = rack minus exchanged tiles
+    //   play: leave = rack minus played tiles (computed via
+    //         get_leave_for_move so blank-as-letter / play-through tiles
+    //         are handled correctly)
+    Rack tmp_leave;
+    rack_set_dist_size(&tmp_leave, ds_eb);
+    rack_reset(&tmp_leave);
+    if (move_get_type(move) == GAME_EVENT_PASS) {
+      rack_copy(&tmp_leave, player_rack);
+    } else {
+      get_leave_for_move(move, game, &tmp_leave);
     }
+    char *lb = game_runner->eb_snaps[slot].leave;
+    int ln = 0;
+    for (uint16_t i = 1; i < ds_eb && ln < RACK_SIZE; i++) {
+      const int c = rack_get_letter(&tmp_leave, i);
+      for (int k = 0; k < c && ln < RACK_SIZE; k++) {
+        lb[ln++] = ld_eb->ld_ml_to_hl[i][0];
+      }
+    }
+    const int leave_blanks = rack_get_letter(&tmp_leave, 0);
+    for (int k = 0; k < leave_blanks && ln < RACK_SIZE; k++) {
+      lb[ln++] = '?';
+    }
+    lb[ln] = '\0';
 
     // opp_history = other player's actions accumulated so far this cycle.
     const char *oh = (player_on_turn_index == 0)
@@ -1833,9 +1856,9 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
     empty_board_recorder_write(
         ebr, gr->game_number, branch_id,
         gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
-        gr->eb_snaps[i].bag_counts, gr->eb_snaps[i].opp_history,
-        gr->eb_snaps[i].action_kind, gr->eb_snaps[i].action_repr,
-        gr->eb_snaps[i].action_size, outcome, gr->eb_p2_random,
+        gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
+        gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
+        gr->eb_snaps[i].leave, outcome, gr->eb_p2_random,
         gr->eb_snaps[i].natural_slot);
   }
 }
@@ -2136,9 +2159,9 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
         empty_board_recorder_write(
             ebr, gr->game_number, (uint64_t)gr->pass_cycle_branch,
             gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
-            gr->eb_snaps[i].bag_counts, gr->eb_snaps[i].opp_history,
-            gr->eb_snaps[i].action_kind, gr->eb_snaps[i].action_repr,
-            gr->eb_snaps[i].action_size, outcome, 0, -1);
+            gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
+            gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
+            gr->eb_snaps[i].leave, outcome, 0, -1);
       }
     }
   }
