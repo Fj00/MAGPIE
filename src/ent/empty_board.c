@@ -26,7 +26,7 @@ EmptyBoardRecorder *empty_board_recorder_create(const char *out_path) {
   }
   fprintf(out,
           ",opp_action_history,action_kind,action_repr,action_size,"
-          "eventual_outcome,eventual_margin\n");
+          "eventual_outcome,eventual_margin,p2_rack_source\n");
   fflush(out);
 
   EmptyBoardRecorder *r = malloc_or_die(sizeof(EmptyBoardRecorder));
@@ -50,7 +50,8 @@ void empty_board_recorder_write(
     EmptyBoardRecorder *r, uint64_t pair_id, uint64_t branch_id,
     int turn_on_empty_board, const char *rack, const uint8_t bag_counts[27],
     const char *opp_action_history, int action_kind, const char *action_repr,
-    int action_size, int eventual_outcome, int eventual_margin) {
+    int action_size, int eventual_outcome, int eventual_margin,
+    int p2_rack_source) {
   if (!r) return;
   pthread_mutex_lock(&r->mutex);
   fprintf(r->out_file, "%llu,%llu,%d,%s", (unsigned long long)pair_id,
@@ -58,9 +59,9 @@ void empty_board_recorder_write(
   for (int i = 0; i < EB_TILE_TYPES; i++) {
     fprintf(r->out_file, ",%u", (unsigned)bag_counts[i]);
   }
-  fprintf(r->out_file, ",%s,%d,%s,%d,%d,%d\n",
+  fprintf(r->out_file, ",%s,%d,%s,%d,%d,%d,%d\n",
           opp_action_history ? opp_action_history : "", action_kind,
           action_repr ? action_repr : "", action_size, eventual_outcome,
-          eventual_margin);
+          eventual_margin, p2_rack_source);
   pthread_mutex_unlock(&r->mutex);
 }

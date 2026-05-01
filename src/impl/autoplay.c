@@ -87,6 +87,11 @@ typedef struct AutoplaySharedData {
   // by MAGPIE_EMPTY_BOARD_BRANCH=1. When set, play_autoplay_game_or_game_pair
   // dispatches a single-runner DFS that explores forks at branchable turns.
   bool eb_branch_active;
+  // Slice 2c: 50/50 mix between pool-sampled P2 (current default; cycle
+  // favorable, deep-cycle data) and bag-random P2 (realistic-opp half;
+  // turn 2 branched explicitly to capture pass/exch/play V at turn 2).
+  // Activated by MAGPIE_EMPTY_BOARD_MIX_RANDOM=1; alternates per pair_id.
+  bool eb_mix_random;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -489,6 +494,14 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
             "empty_board: K-way fork branching ENABLED (turns 3-5 if "
             "is_pass rack)\n");
   }
+  shared_data->eb_mix_random = false;
+  const char *eb_mix = getenv("MAGPIE_EMPTY_BOARD_MIX_RANDOM");
+  if (eb_mix && eb_mix[0] != '\0' && eb_mix[0] != '0') {
+    shared_data->eb_mix_random = true;
+    fprintf(stderr,
+            "empty_board: mix-random ENABLED — alternating pool / "
+            "bag-random P2 per pair, turn 2 branched on bag-random half\n");
+  }
   return shared_data;
 }
 
@@ -617,6 +630,11 @@ typedef struct GameRunner {
   //                 (pass / best-exch / best-play). Capacity matches K=3.
   Game *eb_save_game;
   Move *eb_forced_move;
+  // Slice 2c mix-random: 0 = pool-sampled P2 (default); 1 = bag-random P2.
+  // Set by play_autoplay_game_or_game_pair before game_runner_start; consumed
+  // by the rack-draw branch in game_runner_start, by the turn-2 branchability
+  // check in eb_enumerate_actions, and emitted in every record.
+  int eb_p2_random;
   // Slot 0=pass; slots 1..N=enumerated actions in stable order.
   // Capacity covers worst case: pass + 127 distinct exch subsets of a 7-tile
   // rack + 1 best-play + slack.
@@ -638,6 +656,7 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
       0; // Will be set in game_runner_start if using pairs
   game_runner->eb_save_game = NULL;
   game_runner->eb_forced_move = NULL;
+  game_runner->eb_p2_random = 0;
   game_runner->eb_n_action_buf = 0;
   for (int i = 0; i < EB_MAX_ACTIONS; i++) {
     game_runner->eb_action_buf[i] = NULL;
@@ -717,14 +736,29 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
     PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
     const char *p1_rack = NULL;
     const char *p2_rack = NULL;
-    if (pass_cycle_sample_racks(pct, iter_output->iter_count, &p1_rack,
-                                &p2_rack)) {
+    bool sampled = false;
+    if (game_runner->eb_p2_random) {
+      // Mix-random half: P1 from pool (force-pass via is_pass lookup at
+      // turn 1), P2 drawn naturally from the bag after P1's tiles removed.
+      pass_cycle_sample_p1(pct, iter_output->iter_count, &p1_rack);
+      sampled = (p1_rack != NULL);
+    } else if (pass_cycle_sample_racks(pct, iter_output->iter_count, &p1_rack,
+                                       &p2_rack)) {
+      sampled = true;
+    }
+    if (sampled) {
       // P1 is the starting player (the one who passes in branch 0).
       const int p1 = starting_player_index;
       const int p2 = 1 - starting_player_index;
       const int n1 = draw_rack_string_from_bag(game, p1, p1_rack);
       if (n1 > 0) {
-        const int n2 = draw_rack_string_from_bag(game, p2, p2_rack);
+        int n2 = 1;
+        if (game_runner->eb_p2_random) {
+          // P2 random: just refill from remaining bag.
+          draw_to_full_rack(game, p2);
+        } else {
+          n2 = draw_rack_string_from_bag(game, p2, p2_rack);
+        }
         if (n2 <= 0) {
           // Should not happen given pass_cycle_sample_racks filtering,
           // but fall back to random draw just in case.
@@ -1591,7 +1625,11 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   if (!gr->eb_active || gr->eb_n_snaps >= 6) return 0;
   if (board_get_tiles_played(game_get_board(gr->game)) > 0) return 0;
   const int turn = gr->eb_n_snaps + 1;
-  if (turn < 3) return 0;
+  // Turn 1 never branched (P1's action determined by pool's is_pass class).
+  // Turn 2 branched only on bag-random P2 half (mix_random mode), since the
+  // pool half is by construction representative of natural P2 behavior.
+  if (turn == 1) return 0;
+  if (turn == 2 && !gr->eb_p2_random) return 0;
 
   // Turns 3/4 require is_pass; turn 5 and 6 always branched.
   const int p_idx = game_get_player_on_turn_index(gr->game);
@@ -1699,7 +1737,7 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
         gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
         gr->eb_snaps[i].bag_counts, gr->eb_snaps[i].opp_history,
         gr->eb_snaps[i].action_kind, gr->eb_snaps[i].action_repr,
-        gr->eb_snaps[i].action_size, outcome, my - opp);
+        gr->eb_snaps[i].action_size, outcome, my - opp, gr->eb_p2_random);
   }
 }
 
@@ -1754,8 +1792,16 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
   // own fork tree, emitting per-leaf records.
   if (autoplay_worker->shared_data->eb_branch_active &&
       autoplay_worker->shared_data->pass_cycle_table != NULL) {
-    game_runner_start(autoplay_worker, game_runner1, iter_output,
-                      starting_player_index, 0);
+    int starter = starting_player_index;
+    int p2_random = 0;
+    if (autoplay_worker->shared_data->eb_mix_random) {
+      // Decorrelate p2_rack_source from starting_player_index: bit 0 picks
+      // pool vs random, bit 1 picks starter.
+      p2_random = (int)(iter_output->iter_count & 1ULL);
+      starter = (int)((iter_output->iter_count >> 1) & 1ULL);
+    }
+    game_runner1->eb_p2_random = p2_random;
+    game_runner_start(autoplay_worker, game_runner1, iter_output, starter, 0);
     play_eb_dfs(autoplay_worker, game_runner1, 0);
     autoplay_add_game(autoplay_worker, game_runner1, false);
     return;
@@ -1970,11 +2016,11 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
         const int outcome = my > opp ? 2 : (my == opp ? 1 : 0);
         const int margin = my - opp;
         empty_board_recorder_write(
-            ebr, gr->game_number, gr->pass_cycle_branch,
+            ebr, gr->game_number, (uint64_t)gr->pass_cycle_branch,
             gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
             gr->eb_snaps[i].bag_counts, gr->eb_snaps[i].opp_history,
             gr->eb_snaps[i].action_kind, gr->eb_snaps[i].action_repr,
-            gr->eb_snaps[i].action_size, outcome, margin);
+            gr->eb_snaps[i].action_size, outcome, margin, 0);
       }
     }
   }

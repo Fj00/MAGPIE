@@ -53,10 +53,16 @@ void empty_board_recorder_destroy(EmptyBoardRecorder *r);
 // eventual_outcome                 0=loss, 1=tie, 2=win, from this player's
 //                                 perspective.
 // eventual_margin                  signed final score diff (this player - opp).
+// p2_rack_source                   0=pool (P2 drawn from is_pass pool, current
+//                                 default), 1=random (P2 drawn from regular
+//                                 bag; mix-random mode only). Identifies the
+//                                 distribution shift between cycle-favorable
+//                                 and realistic-opp halves of a mixed run.
 void empty_board_recorder_write(
     EmptyBoardRecorder *r, uint64_t pair_id, uint64_t branch_id,
     int turn_on_empty_board, const char *rack, const uint8_t bag_counts[27],
     const char *opp_action_history, int action_kind, const char *action_repr,
-    int action_size, int eventual_outcome, int eventual_margin);
+    int action_size, int eventual_outcome, int eventual_margin,
+    int p2_rack_source);
 
 #endif

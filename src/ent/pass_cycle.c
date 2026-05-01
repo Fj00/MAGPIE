@@ -217,6 +217,13 @@ static int sample_by_weight(const PassCycleTable *table, double u) {
   return lo;
 }
 
+void pass_cycle_sample_p1(const PassCycleTable *table, uint64_t pair_id,
+                          const char **p1_rack_out) {
+  const uint64_t h1 = mix64(pair_id * 2ULL + 1ULL);
+  const int p1_idx = sample_by_weight(table, uniform01(h1));
+  *p1_rack_out = table->racks[p1_idx];
+}
+
 bool pass_cycle_sample_racks(const PassCycleTable *table, uint64_t pair_id,
                              const char **p1_rack_out,
                              const char **p2_rack_out) {

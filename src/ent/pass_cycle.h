@@ -29,6 +29,12 @@ bool pass_cycle_sample_racks(const PassCycleTable *table, uint64_t pair_id,
                              const char **p1_rack_out,
                              const char **p2_rack_out);
 
+// Sample only P1's rack from the weighted pool (used by mix-random mode
+// where P2 is drawn naturally from the bag rather than the pool). Returns
+// the rack string by pointer (do not free).
+void pass_cycle_sample_p1(const PassCycleTable *table, uint64_t pair_id,
+                          const char **p1_rack_out);
+
 // Look up a canonical rack string (sorted A-Z, blanks LAST, e.g. "ENOTUV?")
 // in the pool. Returns 1 if pass-favorable, 0 if exchange-only, -1 if not in
 // pool. Used during play to decide whether the current player's rack
