@@ -1767,17 +1767,44 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   }
 
   // Determine the natural slot — what HastyBot/force-pass would have
-  // chosen at this position without DFS forcing.
+  // chosen from OUR ENUMERATED SET. Scan movegen output in equity order;
+  // the first move whose action matches an enumerated slot is natural.
+  // For exchanges that's a multiset comparison of exchanged tiles; for
+  // tile placements any play matches our single best-play slot (since
+  // movegen emits in equity order and our play_slot holds the best).
+  // is_pass racks bypass equity entirely — pass_cycle force-pass would
+  // dominate regardless.
   if (max_slot >= 0) {
     if (is_pass_rack) {
-      gr->eb_natural_slot = 0;  // pass_cycle force-pass dominates
-    } else if (n_moves > 0) {
-      Move *top = move_list_get_move(ml, 0);  // top-equity move overall
-      const game_event_t mt_top = move_get_type(top);
-      if (mt_top == GAME_EVENT_EXCHANGE) {
-        gr->eb_natural_slot = 1;  // best-exch always at slot 1
-      } else if (mt_top == GAME_EVENT_TILE_PLACEMENT_MOVE) {
-        gr->eb_natural_slot = play_slot;  // -1 if no play populated
+      gr->eb_natural_slot = 0;
+    } else {
+      for (int m = 0; m < n_moves && gr->eb_natural_slot < 0; m++) {
+        Move *cand = move_list_get_move(ml, m);
+        const game_event_t mt = move_get_type(cand);
+        if (mt == GAME_EVENT_TILE_PLACEMENT_MOVE) {
+          if (play_slot >= 0) gr->eb_natural_slot = play_slot;
+          break;
+        }
+        if (mt == GAME_EVENT_EXCHANGE) {
+          const int nt_cand = move_get_tiles_played(cand);
+          for (int s = 1; s <= max_slot; s++) {
+            if (!gr->eb_action_present[s]) continue;
+            Move *slot_mv = gr->eb_action_buf[s];
+            if (move_get_type(slot_mv) != GAME_EVENT_EXCHANGE) continue;
+            if (move_get_tiles_played(slot_mv) != nt_cand) continue;
+            // Multiset equality on machine-letter tile lists.
+            uint8_t cnt_a[MAX_ALPHABET_SIZE] = {0};
+            uint8_t cnt_b[MAX_ALPHABET_SIZE] = {0};
+            for (int i = 0; i < nt_cand; i++) {
+              cnt_a[move_get_tile(cand, i)]++;
+              cnt_b[move_get_tile(slot_mv, i)]++;
+            }
+            if (memcmp(cnt_a, cnt_b, sizeof(cnt_a)) == 0) {
+              gr->eb_natural_slot = s;
+              break;
+            }
+          }
+        }
       }
     }
   }
