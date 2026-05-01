@@ -1686,8 +1686,11 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
     }
   }
 
-  const bool subset_mode = (turn == 6) || (turn == 5 && !has_play);
-  const bool include_play_in_subset = (turn == 6) && has_play;
+  // T5 and T6 both use subset-mode exchange fan-out (skipping the blank
+  // at T5, plus 1-pointers at T6 — see filter below). T2-T4 stay K=3
+  // (one best-equity exchange counterfactual).
+  const bool subset_mode = (turn >= 5);
+  const bool include_play_in_subset = subset_mode && has_play;
   int max_slot = -1;
   int play_slot = -1;  // populated slot index of the best-play action
 
