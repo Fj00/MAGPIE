@@ -60,10 +60,17 @@ void empty_board_recorder_destroy(EmptyBoardRecorder *r);
 //                                 bag; mix-random mode only). Identifies the
 //                                 distribution shift between cycle-favorable
 //                                 and realistic-opp halves of a mixed run.
+// natural_slot                     Slot index that HastyBot or pass_cycle's
+//                                 force-pass would have chosen at this fork
+//                                 without the DFS forcing. -1 if not a fork
+//                                 point (no enumerate_actions ran for this
+//                                 capture). Lets downstream tools mark which
+//                                 sibling at a fork is the natural choice.
 void empty_board_recorder_write(
     EmptyBoardRecorder *r, uint64_t pair_id, uint64_t branch_id,
     int turn_on_empty_board, const char *rack, const uint8_t bag_counts[27],
     const char *opp_action_history, int action_kind, const char *action_repr,
-    int action_size, int eventual_outcome, int p2_rack_source);
+    int action_size, int eventual_outcome, int p2_rack_source,
+    int natural_slot);
 
 #endif

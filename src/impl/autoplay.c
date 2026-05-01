@@ -608,6 +608,8 @@ typedef struct GameRunner {
     int action_kind;          // 0=pass, 1=exch, 2=play
     char action_repr[16];
     int action_size;
+    int natural_slot;         // slot HastyBot/force-pass would have chosen
+                              // at this fork (-1 if not a fork point)
   } eb_snaps[6];
   int eb_n_snaps;
   // Per-player action history accumulated this cycle (pipe-joined). Used as
@@ -634,6 +636,10 @@ typedef struct GameRunner {
   // by the rack-draw branch in game_runner_start, by the turn-2 branchability
   // check in eb_enumerate_actions, and emitted in every record.
   int eb_p2_random;
+  // Natural slot at the most recent enumerate_actions call: which slot
+  // index HastyBot or force-pass would have chosen without DFS forcing.
+  // -1 = no fork at this turn (or pass-cycle / opp-pass / etc. — non-fork).
+  int eb_natural_slot;
   // Slot 0=pass; slots 1..N=enumerated actions in stable order.
   // Capacity covers worst case: pass + 127 distinct exch subsets of a 7-tile
   // rack + 1 best-play + slack. eb_action_present[i] is true iff slot i is
@@ -657,6 +663,7 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
       0; // Will be set in game_runner_start if using pairs
   game_runner->eb_forced_move = NULL;
   game_runner->eb_p2_random = 0;
+  game_runner->eb_natural_slot = -1;
   game_runner->eb_n_action_buf = 0;
   for (int i = 0; i < EB_MAX_ACTIONS; i++) {
     game_runner->eb_action_buf[i] = NULL;
@@ -1410,6 +1417,7 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
       game_runner->eb_snaps[slot].action_repr[0] = '\0';
       game_runner->eb_snaps[slot].action_size = move_get_tiles_played(move);
     }
+    game_runner->eb_snaps[slot].natural_slot = game_runner->eb_natural_slot;
     game_runner->eb_n_snaps++;
 
     // Append this action to player_on_turn's per-cycle action history.
@@ -1625,6 +1633,7 @@ static void eb_meta_restore(GameRunner *gr, const EbMetaSave *s) {
 static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   // Clear presence flags first so any early return leaves a sane state.
   for (int i = 0; i < EB_MAX_ACTIONS; i++) gr->eb_action_present[i] = false;
+  gr->eb_natural_slot = -1;
 
   if (!gr->eb_active || gr->eb_n_snaps >= 6) return 0;
   if (board_get_tiles_played(game_get_board(gr->game)) > 0) return 0;
@@ -1642,16 +1651,14 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   //   T3, T4: pass only if rack is is_pass=1 — otherwise pass is never
   //           strategically correct at these early-cycle decisions.
   //   T2 (random mode): same as T3/T4 — only for is_pass racks.
-  bool include_pass;
-  if (turn >= 5) {
-    include_pass = true;
-  } else {
-    char canon[RACK_SIZE + 2] = {0};
-    eb_canonical_rack(gr->game, p_idx, canon);
-    include_pass =
-        pass_cycle_lookup_is_pass(w->shared_data->pass_cycle_table, canon) ==
-        1;
-  }
+  // is_pass status is also used downstream to decide the natural slot:
+  // is_pass racks force-pass via pass_cycle, so natural=slot 0 regardless
+  // of equity; non-is_pass racks fall through to HastyBot equity.
+  char canon[RACK_SIZE + 2] = {0};
+  eb_canonical_rack(gr->game, p_idx, canon);
+  const bool is_pass_rack =
+      pass_cycle_lookup_is_pass(w->shared_data->pass_cycle_table, canon) == 1;
+  const bool include_pass = is_pass_rack || turn >= 5;
 
   MoveList *ml = w->eb_move_list;
   const MoveGenArgs gen_args = {
@@ -1682,6 +1689,7 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   const bool subset_mode = (turn == 6) || (turn == 5 && !has_play);
   const bool include_play_in_subset = (turn == 6) && has_play;
   int max_slot = -1;
+  int play_slot = -1;  // populated slot index of the best-play action
 
   // Slot 0 always reserved for pass; populate only if rack is_pass.
   if (include_pass) {
@@ -1707,6 +1715,7 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
         if (move_get_type(cand) == GAME_EVENT_TILE_PLACEMENT_MOVE) {
           move_copy(gr->eb_action_buf[slot], cand);
           gr->eb_action_present[slot] = true;
+          play_slot = slot;
           if (slot > max_slot) max_slot = slot;
           break;
         }
@@ -1731,7 +1740,24 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
     if (best_play) {
       move_copy(gr->eb_action_buf[2], best_play);
       gr->eb_action_present[2] = true;
+      play_slot = 2;
       if (2 > max_slot) max_slot = 2;
+    }
+  }
+
+  // Determine the natural slot — what HastyBot/force-pass would have
+  // chosen at this position without DFS forcing.
+  if (max_slot >= 0) {
+    if (is_pass_rack) {
+      gr->eb_natural_slot = 0;  // pass_cycle force-pass dominates
+    } else if (n_moves > 0) {
+      Move *top = move_list_get_move(ml, 0);  // top-equity move overall
+      const game_event_t mt_top = move_get_type(top);
+      if (mt_top == GAME_EVENT_EXCHANGE) {
+        gr->eb_natural_slot = 1;  // best-exch always at slot 1
+      } else if (mt_top == GAME_EVENT_TILE_PLACEMENT_MOVE) {
+        gr->eb_natural_slot = play_slot;  // -1 if no play populated
+      }
     }
   }
 
@@ -1761,7 +1787,8 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
         gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
         gr->eb_snaps[i].bag_counts, gr->eb_snaps[i].opp_history,
         gr->eb_snaps[i].action_kind, gr->eb_snaps[i].action_repr,
-        gr->eb_snaps[i].action_size, outcome, gr->eb_p2_random);
+        gr->eb_snaps[i].action_size, outcome, gr->eb_p2_random,
+        gr->eb_snaps[i].natural_slot);
   }
 }
 
@@ -1793,6 +1820,11 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
         move_copy(&local_actions[s], gr->eb_action_buf[s]);
       }
     }
+    // Snapshot natural_slot too — inner recursive enumerate calls overwrite
+    // gr->eb_natural_slot, and the capture in each sibling iteration's
+    // play_move needs THIS fork's natural slot (not whatever the inner
+    // recursion left behind).
+    const int fork_natural_slot = gr->eb_natural_slot;
     EbMetaSave saved_meta;
     eb_meta_save(gr, &saved_meta);
     // Per-recursion-level game checkpoint. A single shared per-runner buffer
@@ -1804,6 +1836,7 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     for (int s = 0; s < n_actions; s++) {
       if (!local_present[s]) continue;
       gr->eb_forced_move = &local_actions[s];
+      gr->eb_natural_slot = fork_natural_slot;
       game_runner_play_move(w, gr);
       gr->eb_forced_move = NULL;
       // Encode the SLOT INDEX (not iteration index) so the action at each
@@ -2057,7 +2090,7 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
             gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
             gr->eb_snaps[i].bag_counts, gr->eb_snaps[i].opp_history,
             gr->eb_snaps[i].action_kind, gr->eb_snaps[i].action_repr,
-            gr->eb_snaps[i].action_size, outcome, 0);
+            gr->eb_snaps[i].action_size, outcome, 0, -1);
       }
     }
   }
