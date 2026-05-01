@@ -621,14 +621,13 @@ typedef struct GameRunner {
   bool eb_active;
 
   // Slice 2 K-way fork DFS state.
-  // eb_save_game: scratch Game used to checkpoint state at fork points.
-  //               Allocated only when shared_data->eb_branch_active.
   // eb_forced_move: when non-NULL, game_runner_play_move uses this exact move
   //                 instead of the normal selection logic. The DFS sets it
   //                 right before each branch's play_move call.
-  // eb_action_buf:  pre-allocated Move slots for enumerate_eb_actions
-  //                 (pass / best-exch / best-play). Capacity matches K=3.
-  Game *eb_save_game;
+  // eb_action_buf:  pre-allocated Move slots for enumerate_eb_actions.
+  // (Per-recursion-level game checkpoints are allocated dynamically via
+  // game_duplicate inside play_eb_dfs — a shared buffer would be overwritten
+  // by inner forks.)
   Move *eb_forced_move;
   // Slice 2c mix-random: 0 = pool-sampled P2 (default); 1 = bag-random P2.
   // Set by play_autoplay_game_or_game_pair before game_runner_start; consumed
@@ -654,7 +653,6 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
   }
   game_runner->pair_game_number =
       0; // Will be set in game_runner_start if using pairs
-  game_runner->eb_save_game = NULL;
   game_runner->eb_forced_move = NULL;
   game_runner->eb_p2_random = 0;
   game_runner->eb_n_action_buf = 0;
@@ -662,7 +660,6 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
     game_runner->eb_action_buf[i] = NULL;
   }
   if (autoplay_worker->shared_data->eb_branch_active) {
-    game_runner->eb_save_game = game_create(args->game_args);
     game_runner->eb_n_action_buf = EB_MAX_ACTIONS;
     for (int i = 0; i < EB_MAX_ACTIONS; i++) {
       game_runner->eb_action_buf[i] = move_create();
@@ -677,7 +674,6 @@ void game_runner_destroy(GameRunner *game_runner) {
   }
   game_destroy(game_runner->game);
   game_destroy(game_runner->game_one_move_behind);
-  game_destroy(game_runner->eb_save_game);
   for (int i = 0; i < game_runner->eb_n_action_buf; i++) {
     free(game_runner->eb_action_buf[i]);
   }
@@ -1737,7 +1733,7 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
         gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
         gr->eb_snaps[i].bag_counts, gr->eb_snaps[i].opp_history,
         gr->eb_snaps[i].action_kind, gr->eb_snaps[i].action_repr,
-        gr->eb_snaps[i].action_size, outcome, my - opp, gr->eb_p2_random);
+        gr->eb_snaps[i].action_size, outcome, gr->eb_p2_random);
   }
 }
 
@@ -1766,16 +1762,21 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     }
     EbMetaSave saved_meta;
     eb_meta_save(gr, &saved_meta);
-    game_copy(gr->eb_save_game, gr->game);
+    // Per-recursion-level game checkpoint. A single shared per-runner buffer
+    // would be overwritten by inner forks' game_copy and corrupt the outer
+    // fork's restore, leaving the game in a foreign player's mid-iteration
+    // state.
+    Game *saved_game = game_duplicate(gr->game);
 
     for (int i = 0; i < n_actions; i++) {
       gr->eb_forced_move = &local_actions[i];
       game_runner_play_move(w, gr);
       gr->eb_forced_move = NULL;
       play_eb_dfs(w, gr, (branch_id << 8) | (uint64_t)(i + 1));
-      game_copy(gr->game, gr->eb_save_game);
+      game_copy(gr->game, saved_game);
       eb_meta_restore(gr, &saved_meta);
     }
+    game_destroy(saved_game);
     return;
   }
   eb_emit_leaf(w, gr, branch_id);
@@ -2014,13 +2015,12 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
         const int my = (p == 0) ? s0 : s1;
         const int opp = (p == 0) ? s1 : s0;
         const int outcome = my > opp ? 2 : (my == opp ? 1 : 0);
-        const int margin = my - opp;
         empty_board_recorder_write(
             ebr, gr->game_number, (uint64_t)gr->pass_cycle_branch,
             gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
             gr->eb_snaps[i].bag_counts, gr->eb_snaps[i].opp_history,
             gr->eb_snaps[i].action_kind, gr->eb_snaps[i].action_repr,
-            gr->eb_snaps[i].action_size, outcome, margin, 0);
+            gr->eb_snaps[i].action_size, outcome, 0);
       }
     }
   }
