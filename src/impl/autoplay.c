@@ -20,6 +20,7 @@
 #include "../ent/force_table.h"
 #include "../ent/game.h"
 #include "../ent/empty_board.h"
+#include "../ent/empty_board_strata.h"
 #include "../ent/opening_pass.h"
 #include "../ent/pass_cycle.h"
 #include "../ent/inference_args.h"
@@ -83,6 +84,7 @@ typedef struct AutoplaySharedData {
   bool stop_on_opening_pass_complete;
   PassCycleTable *pass_cycle_table;
   EmptyBoardRecorder *empty_board_recorder;
+  EmptyBoardStrataRecorder *empty_board_strata_recorder;
   // Slice 2: K-way fork branching at empty-board cycle-alive turns. Activated
   // by MAGPIE_EMPTY_BOARD_BRANCH=1. When set, play_autoplay_game_or_game_pair
   // dispatches a single-runner DFS that explores forks at branchable turns.
@@ -486,6 +488,12 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   if (eb_out && eb_out[0] != '\0') {
     shared_data->empty_board_recorder = empty_board_recorder_create(eb_out);
   }
+  shared_data->empty_board_strata_recorder = NULL;
+  const char *eb_strata = getenv("MAGPIE_EMPTY_BOARD_STRATA");
+  if (eb_strata && eb_strata[0] != '\0') {
+    shared_data->empty_board_strata_recorder =
+        empty_board_strata_create(eb_strata);
+  }
   shared_data->eb_branch_active = false;
   const char *eb_branch = getenv("MAGPIE_EMPTY_BOARD_BRANCH");
   if (eb_branch && eb_branch[0] != '\0' && eb_branch[0] != '0') {
@@ -547,6 +555,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   opening_pass_table_destroy(shared_data->opening_pass_table);
   pass_cycle_table_destroy(shared_data->pass_cycle_table);
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
+  empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
   free(shared_data);
 }
 
@@ -795,7 +804,8 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   game_runner->eb_actions_p1[0] = '\0';
   game_runner->eb_actions_p1_off = 0;
   game_runner->eb_active =
-      game_runner->shared_data->empty_board_recorder != NULL &&
+      (game_runner->shared_data->empty_board_recorder != NULL ||
+       game_runner->shared_data->empty_board_strata_recorder != NULL) &&
       game_runner->pass_cycle_active;
   game_runner->eb_forced_move = NULL;
 
@@ -1843,7 +1853,8 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
 // Emit captured eb_snaps for this leaf branch with its eventual_outcome.
 static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) {
   EmptyBoardRecorder *ebr = w->shared_data->empty_board_recorder;
-  if (!ebr || gr->eb_n_snaps == 0) return;
+  EmptyBoardStrataRecorder *ebs = w->shared_data->empty_board_strata_recorder;
+  if ((!ebr && !ebs) || gr->eb_n_snaps == 0) return;
   const int s0 =
       equity_to_int(player_get_score(game_get_player(gr->game, 0)));
   const int s1 =
@@ -1856,6 +1867,13 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
     empty_board_recorder_write(
         ebr, gr->game_number, branch_id,
         gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
+        gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
+        gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
+        gr->eb_snaps[i].leave, outcome, gr->eb_p2_random,
+        gr->eb_snaps[i].natural_slot);
+    empty_board_strata_write(
+        w->shared_data->empty_board_strata_recorder, gr->game_number,
+        branch_id, gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
         gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
         gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
         gr->eb_snaps[i].leave, outcome, gr->eb_p2_random,
@@ -2158,6 +2176,13 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
         const int outcome = my > opp ? 2 : (my == opp ? 1 : 0);
         empty_board_recorder_write(
             ebr, gr->game_number, (uint64_t)gr->pass_cycle_branch,
+            gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
+            gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
+            gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
+            gr->eb_snaps[i].leave, outcome, 0, -1);
+        empty_board_strata_write(
+            autoplay_worker->shared_data->empty_board_strata_recorder,
+            gr->game_number, (uint64_t)gr->pass_cycle_branch,
             gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
             gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
             gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
