@@ -1629,8 +1629,11 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   if (!gr->eb_active || gr->eb_n_snaps >= 6) return 0;
   if (board_get_tiles_played(game_get_board(gr->game)) > 0) return 0;
   const int turn = gr->eb_n_snaps + 1;
+  // T1 never branched (the cycle anchor — starter's force-pass on is_pass
+  // rack is the experimental design that opens the cycle subtree).
+  // T2-T6 always branched for full V-function coverage of action
+  // counterfactuals at every cycle-alive empty-board decision.
   if (turn == 1) return 0;
-  if (turn == 2 && !gr->eb_p2_random) return 0;
 
   const int p_idx = game_get_player_on_turn_index(gr->game);
   // Pass slot inclusion (per spec):
