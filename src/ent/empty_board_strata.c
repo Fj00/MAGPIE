@@ -125,7 +125,7 @@ static FILE *ebs_get_file(EmptyBoardStrataRecorder *r, int T, int K, int L,
     ebs_mkdir_or_die(dir2);
     snprintf(dir3, sizeof(dir3), "%s/L%d", dir2, L);
     ebs_mkdir_or_die(dir3);
-    snprintf(path, sizeof(path), "%s/type=%s.csv", dir3, EBS_TYPE_NAMES[ty]);
+    snprintf(path, sizeof(path), "%s/%s.csv", dir3, EBS_TYPE_NAMES[ty]);
     FILE *fh = fopen(path, "w");
     if (!fh) {
       log_fatal("empty_board_strata: cannot open %s (%s)", path,
