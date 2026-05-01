@@ -636,9 +636,11 @@ typedef struct GameRunner {
   int eb_p2_random;
   // Slot 0=pass; slots 1..N=enumerated actions in stable order.
   // Capacity covers worst case: pass + 127 distinct exch subsets of a 7-tile
-  // rack + 1 best-play + slack.
+  // rack + 1 best-play + slack. eb_action_present[i] is true iff slot i is
+  // populated this enumeration; the DFS skips false slots.
 #define EB_MAX_ACTIONS 132
   Move *eb_action_buf[EB_MAX_ACTIONS];
+  bool eb_action_present[EB_MAX_ACTIONS];
   int eb_n_action_buf;
 } GameRunner;
 
@@ -1595,51 +1597,59 @@ static void eb_meta_restore(GameRunner *gr, const EbMetaSave *s) {
 }
 
 // Enumerate the action set for the current decision into gr->eb_action_buf.
-// Returns the count of populated slots (>=2 if branchable, 0 otherwise).
+// Populated slots are flagged in gr->eb_action_present; returns the highest
+// populated slot index + 1 (so callers iterate 0..N-1 and check the flag),
+// or 0 if not branchable.
 //
 // Modes:
-//  - turn 1, 2: never branched (return 0)
-//  - turn 3, 4: branched only if rack is_pass=1; K=3 {pass, best-exch,
-//               best-play}
-//  - turn 5: always branched. Subset fan-out if no legal plays exist
-//            ({pass, every distinct exch subset}); otherwise K=3 (same as
-//            turns 3-4).
-//  - turn 6: always branched, full subset fan-out + best-play
-//            ({pass, every distinct exch subset, best-play}).
+//  - turn 1: never branched
+//  - turn 2: branched only on bag-random P2 half (mix_random mode)
+//  - turn 3-5: always branched
+//  - turn 5 (no legal plays): subset fan-out — pass (if is_pass) +
+//            every distinct exch subset
+//  - turn 6: always branched, full subset fan-out — pass (if is_pass) +
+//            every distinct exch subset + best-play
 //
-// In K=3 mode the slot layout is fixed (0=pass, 1=best-exch, 2=best-play)
-// even if a category has no legal move (in which case that slot is omitted
-// from the iteration; downstream callers must skip absent slots — handled
-// here by returning the count of populated slots and ignoring gaps).
+// Pass is included only when the current player's rack is is_pass=1; for
+// non-pass racks pass is never a meaningful action and gets omitted to
+// halve compute. Best-exch and best-play (K=3 mode) or all exch subsets
+// (subset mode) are always included.
 //
-// In subset-fan-out mode the slot layout follows the order moves are
-// emitted by movegen at this position (equity-sorted): pass at slot 0,
-// then exch subsets in order, then best-play (turn 6 only) at the last
-// populated slot. movegen is deterministic so the slot-to-action mapping
-// is reproducible across reruns.
+// Slot layout is STABLE across runs and across is_pass/non-is_pass racks:
+//   K=3 mode:    slot 0 = pass, slot 1 = best-exch, slot 2 = best-play
+//   subset mode: slot 0 = pass, slots 1..N = exch subsets in equity order,
+//                slot N+1 = best-play (turn 6 only)
+// Empty slots (pass omitted, or no legal play, etc.) keep their index and
+// the iterator skips them via the present-flag — branch_id encoding stays
+// reproducible regardless of which actions a particular position offers.
 static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
+  // Clear presence flags first so any early return leaves a sane state.
+  for (int i = 0; i < EB_MAX_ACTIONS; i++) gr->eb_action_present[i] = false;
+
   if (!gr->eb_active || gr->eb_n_snaps >= 6) return 0;
   if (board_get_tiles_played(game_get_board(gr->game)) > 0) return 0;
   const int turn = gr->eb_n_snaps + 1;
-  // Turn 1 never branched (P1's action determined by pool's is_pass class).
-  // Turn 2 branched only on bag-random P2 half (mix_random mode), since the
-  // pool half is by construction representative of natural P2 behavior.
   if (turn == 1) return 0;
   if (turn == 2 && !gr->eb_p2_random) return 0;
 
-  // Turns 3/4 require is_pass; turn 5 and 6 always branched.
   const int p_idx = game_get_player_on_turn_index(gr->game);
-  if (turn == 3 || turn == 4) {
+  // Pass slot inclusion (per spec):
+  //   T5, T6: pass always included — opp_history accumulated by then makes
+  //           pass a meaningful counterfactual even for natural racks.
+  //   T3, T4: pass only if rack is is_pass=1 — otherwise pass is never
+  //           strategically correct at these early-cycle decisions.
+  //   T2 (random mode): same as T3/T4 — only for is_pass racks.
+  bool include_pass;
+  if (turn >= 5) {
+    include_pass = true;
+  } else {
     char canon[RACK_SIZE + 2] = {0};
     eb_canonical_rack(gr->game, p_idx, canon);
-    if (pass_cycle_lookup_is_pass(w->shared_data->pass_cycle_table, canon) !=
-        1) {
-      return 0;
-    }
+    include_pass =
+        pass_cycle_lookup_is_pass(w->shared_data->pass_cycle_table, canon) ==
+        1;
   }
 
-  // Use the dedicated large-capacity move list — per-player move_lists are
-  // sized to num_plays which prunes to top-1 in MOVE_RECORD_ALL.
   MoveList *ml = w->eb_move_list;
   const MoveGenArgs gen_args = {
       .game = gr->game,
@@ -1655,8 +1665,6 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
       .initial_tiles_bv = 0};
   generate_moves(&gen_args);
   const int n_moves = move_list_get_count(ml);
-  // ALL-mode + EQUITY sort returns moves in heap order (min-heap by equity).
-  // Sort descending so slot 1 is the top-equity action of its category.
   move_list_sort_moves(ml);
 
   bool has_play = false;
@@ -1668,33 +1676,41 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
     }
   }
 
-  // Determine mode.
   const bool subset_mode = (turn == 6) || (turn == 5 && !has_play);
   const bool include_play_in_subset = (turn == 6) && has_play;
+  int max_slot = -1;
 
-  int n = 0;
-  // Slot 0: pass
-  move_set_as_pass(gr->eb_action_buf[n++]);
+  // Slot 0 always reserved for pass; populate only if rack is_pass.
+  if (include_pass) {
+    move_set_as_pass(gr->eb_action_buf[0]);
+    gr->eb_action_present[0] = true;
+    max_slot = 0;
+  }
 
   if (subset_mode) {
-    for (int m = 0; m < n_moves && n < EB_MAX_ACTIONS; m++) {
+    int slot = 1;
+    for (int m = 0; m < n_moves && slot < EB_MAX_ACTIONS; m++) {
       Move *cand = move_list_get_move(ml, m);
       if (move_get_type(cand) == GAME_EVENT_EXCHANGE) {
-        move_copy(gr->eb_action_buf[n++], cand);
+        move_copy(gr->eb_action_buf[slot], cand);
+        gr->eb_action_present[slot] = true;
+        if (slot > max_slot) max_slot = slot;
+        slot++;
       }
     }
-    if (include_play_in_subset && n < EB_MAX_ACTIONS) {
+    if (include_play_in_subset && slot < EB_MAX_ACTIONS) {
       for (int m = 0; m < n_moves; m++) {
         Move *cand = move_list_get_move(ml, m);
         if (move_get_type(cand) == GAME_EVENT_TILE_PLACEMENT_MOVE) {
-          move_copy(gr->eb_action_buf[n++], cand);
+          move_copy(gr->eb_action_buf[slot], cand);
+          gr->eb_action_present[slot] = true;
+          if (slot > max_slot) max_slot = slot;
           break;
         }
       }
     }
   } else {
-    // K=3 mode: best-exch (slot 1), best-play (slot 2). Skip a slot if a
-    // category has no legal move so downstream still iterates correctly.
+    // K=3 mode: slot 1 = best-exch, slot 2 = best-play.
     Move *best_exch = NULL;
     Move *best_play = NULL;
     for (int m = 0; m < n_moves && (!best_exch || !best_play); m++) {
@@ -1705,14 +1721,23 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
         best_play = cand;
     }
     if (best_exch) {
-      move_copy(gr->eb_action_buf[n++], best_exch);
+      move_copy(gr->eb_action_buf[1], best_exch);
+      gr->eb_action_present[1] = true;
+      if (1 > max_slot) max_slot = 1;
     }
     if (best_play) {
-      move_copy(gr->eb_action_buf[n++], best_play);
+      move_copy(gr->eb_action_buf[2], best_play);
+      gr->eb_action_present[2] = true;
+      if (2 > max_slot) max_slot = 2;
     }
   }
 
-  return n >= 2 ? n : 0;
+  // Need at least 2 populated slots for the fork to be meaningful.
+  int populated = 0;
+  for (int i = 0; i <= max_slot; i++) {
+    if (gr->eb_action_present[i]) populated++;
+  }
+  return populated >= 2 ? max_slot + 1 : 0;
 }
 
 // Emit captured eb_snaps for this leaf branch with its eventual_outcome.
@@ -1756,9 +1781,14 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
 
     // Snapshot enumerated actions to stack BEFORE recursing — eb_action_buf
     // is per-runner and inner forks during recursion will overwrite it.
+    // n_actions is max_slot+1; iterate stable slot indices and skip absent.
     Move local_actions[EB_MAX_ACTIONS];
-    for (int i = 0; i < n_actions; i++) {
-      move_copy(&local_actions[i], gr->eb_action_buf[i]);
+    bool local_present[EB_MAX_ACTIONS];
+    for (int s = 0; s < n_actions; s++) {
+      local_present[s] = gr->eb_action_present[s];
+      if (local_present[s]) {
+        move_copy(&local_actions[s], gr->eb_action_buf[s]);
+      }
     }
     EbMetaSave saved_meta;
     eb_meta_save(gr, &saved_meta);
@@ -1768,11 +1798,15 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     // state.
     Game *saved_game = game_duplicate(gr->game);
 
-    for (int i = 0; i < n_actions; i++) {
-      gr->eb_forced_move = &local_actions[i];
+    for (int s = 0; s < n_actions; s++) {
+      if (!local_present[s]) continue;
+      gr->eb_forced_move = &local_actions[s];
       game_runner_play_move(w, gr);
       gr->eb_forced_move = NULL;
-      play_eb_dfs(w, gr, (branch_id << 8) | (uint64_t)(i + 1));
+      // Encode the SLOT INDEX (not iteration index) so the action at each
+      // fork-depth is recoverable regardless of which slots happened to be
+      // populated for that position.
+      play_eb_dfs(w, gr, (branch_id << 8) | (uint64_t)(s + 1));
       game_copy(gr->game, saved_game);
       eb_meta_restore(gr, &saved_meta);
     }
