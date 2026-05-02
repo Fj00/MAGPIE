@@ -1471,7 +1471,10 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
         (mt_eb == GAME_EVENT_TILE_PLACEMENT_MOVE)
             ? equity_to_int(move_get_score(move))
             : 0;
-    game_runner->eb_snaps[slot].chain_natural = game_runner->eb_chain_natural;
+    // chain_natural is filled in at eb_emit_leaf (uses the LEAF's value,
+    // not the per-snap value — early snaps would otherwise be marked
+    // natural even on a non-natural-chain leaf).
+    game_runner->eb_snaps[slot].chain_natural = false;
     game_runner->eb_n_snaps++;
 
     // Append this action to player_on_turn's per-cycle action history.
@@ -1902,7 +1905,7 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
         gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
         gr->eb_snaps[i].leave, outcome, gr->eb_p2_random,
         gr->eb_snaps[i].natural_slot, gr->eb_snaps[i].move_score,
-        gr->eb_snaps[i].chain_natural ? 1 : 0);
+        gr->eb_chain_natural ? 1 : 0);
   }
 }
 
