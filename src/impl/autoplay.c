@@ -624,6 +624,7 @@ typedef struct GameRunner {
                                 // tiles like blank-as-letter) is reliable.
     int natural_slot;         // slot HastyBot/force-pass would have chosen
                               // at this fork (-1 if not a fork point)
+    int move_score;           // points scored on this turn (0 for pass/exch)
   } eb_snaps[6];
   int eb_n_snaps;
   // Per-player action history accumulated this cycle (pipe-joined). Used as
@@ -1451,6 +1452,10 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
       game_runner->eb_snaps[slot].action_size = move_get_tiles_played(move);
     }
     game_runner->eb_snaps[slot].natural_slot = game_runner->eb_natural_slot;
+    game_runner->eb_snaps[slot].move_score =
+        (mt_eb == GAME_EVENT_TILE_PLACEMENT_MOVE)
+            ? equity_to_int(move_get_score(move))
+            : 0;
     game_runner->eb_n_snaps++;
 
     // Append this action to player_on_turn's per-cycle action history.
@@ -1877,7 +1882,7 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
         gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
         gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
         gr->eb_snaps[i].leave, outcome, gr->eb_p2_random,
-        gr->eb_snaps[i].natural_slot);
+        gr->eb_snaps[i].natural_slot, gr->eb_snaps[i].move_score);
   }
 }
 
@@ -2186,7 +2191,8 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
             gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
             gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
             gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
-            gr->eb_snaps[i].leave, outcome, 0, -1);
+            gr->eb_snaps[i].leave, outcome, 0, -1,
+            gr->eb_snaps[i].move_score);
       }
     }
   }

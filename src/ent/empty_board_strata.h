@@ -18,7 +18,13 @@
 // Per-row schema (turn / kind / leave_len / TYPE implicit from path):
 //
 //   pair_id, branch_id, rack, opp_action_history, action_repr,
-//   action_size, leave, eventual_outcome, p2_rack_source, natural_slot
+//   action_size, leave, eventual_outcome, p2_rack_source, natural_slot,
+//   move_score
+//
+// move_score is the score the player earned on this turn: 0 for pass and
+// exchange, the actual play score for K=2. With both players at 0 score
+// across the cycle, move_score equals the score differential after the
+// move.
 //
 // Files lazy-opened on first write. Mutex per file. Compatible with
 // running ALONGSIDE the flat MAGPIE_EMPTY_BOARD_OUT recorder (both can
@@ -36,6 +42,6 @@ void empty_board_strata_write(
     int turn_on_empty_board, const char *rack,
     const char *opp_action_history, int action_kind, const char *action_repr,
     int action_size, const char *leave, int eventual_outcome,
-    int p2_rack_source, int natural_slot);
+    int p2_rack_source, int natural_slot, int move_score);
 
 #endif
