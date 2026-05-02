@@ -1897,13 +1897,30 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
       equity_to_int(player_get_score(game_get_player(gr->game, 0)));
   const int s1 =
       equity_to_int(player_get_score(game_get_player(gr->game, 1)));
+  // T6 fan-out dedup: T2-T5 snaps are emitted ONCE per anchor chain
+  // (from the natural-T6 sub-branch leaf). Other T6 sub-branches of the
+  // same chain emit only their T6 row — that's the unique data they
+  // contribute to the lookup. Find the T6 snap (if any) and check
+  // whether THIS leaf took the natural T6 sub-branch.
+  bool t6_is_natural = true;  // default: no T6 snap → no T6 fan-out
+  int t6_snap_idx = -1;
   for (int i = 0; i < gr->eb_n_snaps; i++) {
-    // Skip pre-divergence snaps — they're identical to the natural-chain
-    // snaps emitted by the pure-natural leaf, so re-emitting them just
-    // duplicates rows. Pure natural (divergence_turn == -1) emits all
-    // snaps; an anchor=k leaf only emits its Tk..T6 rows.
+    if (gr->eb_snaps[i].turn_on_empty_board == 6) {
+      t6_snap_idx = i;
+      // Last 8 bits of branch_id encode T6 sub-branch slot+1.
+      const int chosen_t6_slot = (int)(branch_id & 0xFF) - 1;
+      t6_is_natural = (chosen_t6_slot == gr->eb_snaps[i].natural_slot);
+      break;
+    }
+  }
+  for (int i = 0; i < gr->eb_n_snaps; i++) {
+    // Skip pre-divergence snaps — duplicates of the pure-natural chain.
     if (gr->eb_divergence_turn != -1 &&
         gr->eb_snaps[i].turn_on_empty_board < gr->eb_divergence_turn) {
+      continue;
+    }
+    // T6 fan-out dedup: non-natural T6 sub-branches only emit their T6 row.
+    if (!t6_is_natural && gr->eb_snaps[i].turn_on_empty_board != 6) {
       continue;
     }
     const int p = gr->eb_snaps[i].player_on_turn;
