@@ -625,9 +625,6 @@ typedef struct GameRunner {
     int natural_slot;         // slot HastyBot/force-pass would have chosen
                               // at this fork (-1 if not a fork point)
     int move_score;           // points scored on this turn (0 for pass/exch)
-    bool chain_natural;       // true iff every prior fork in this branch's
-                              // ancestry chose its natural slot (i.e. this
-                              // is what natural play would actually produce)
   } eb_snaps[6];
   int eb_n_snaps;
   // Per-player action history accumulated this cycle (pipe-joined). Used as
@@ -658,10 +655,18 @@ typedef struct GameRunner {
   // index HastyBot or force-pass would have chosen without DFS forcing.
   // -1 = no fork at this turn (or pass-cycle / opp-pass / etc. — non-fork).
   int eb_natural_slot;
-  // Tracks whether every fork in this DFS branch chose its natural_slot.
-  // Reset to true at game start; flipped to false the first time a sibling
-  // branch is entered. Saved/restored by eb_meta_save/restore.
-  bool eb_chain_natural;
+  // Tracks "anchor" semantics — the leaf's first divergence from natural,
+  // and whether every subsequent fork chose natural.
+  //   eb_divergence_turn: -1 = chain has never diverged (pure natural);
+  //     1..6 = the turn at which the chain FIRST chose a non-natural slot.
+  //   eb_n_divergences: count of non-natural sibling choices in this
+  //     branch's ancestry. A leaf is useful for analysis iff this is <=1
+  //     (one or zero divergences = pure natural OR anchored-at-T_k); a
+  //     leaf with >=2 divergences is in counterfactual-of-counterfactual
+  //     territory and should be skipped.
+  // Both are saved/restored across sibling iterations by eb_meta_save.
+  int eb_divergence_turn;
+  int eb_n_divergences;
   // Slot 0=pass; slots 1..N=enumerated actions in stable order.
   // Capacity covers worst case: pass + 127 distinct exch subsets of a 7-tile
   // rack + 1 best-play + slack. eb_action_present[i] is true iff slot i is
@@ -686,7 +691,8 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
   game_runner->eb_forced_move = NULL;
   game_runner->eb_p2_random = 0;
   game_runner->eb_natural_slot = -1;
-  game_runner->eb_chain_natural = true;
+  game_runner->eb_divergence_turn = -1;
+  game_runner->eb_n_divergences = 0;
   game_runner->eb_n_action_buf = 0;
   for (int i = 0; i < EB_MAX_ACTIONS; i++) {
     game_runner->eb_action_buf[i] = NULL;
@@ -1471,10 +1477,6 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
         (mt_eb == GAME_EVENT_TILE_PLACEMENT_MOVE)
             ? equity_to_int(move_get_score(move))
             : 0;
-    // chain_natural is filled in at eb_emit_leaf (uses the LEAF's value,
-    // not the per-snap value — early snaps would otherwise be marked
-    // natural even on a non-natural-chain leaf).
-    game_runner->eb_snaps[slot].chain_natural = false;
     game_runner->eb_n_snaps++;
 
     // Append this action to player_on_turn's per-cycle action history.
@@ -1637,7 +1639,8 @@ typedef struct EbMetaSave {
   bool pass_cycle_abandoned;
   int pass_cycle_n_moves;
   int turn_number;
-  bool chain_natural;
+  int divergence_turn;
+  int n_divergences;
 } EbMetaSave;
 
 static void eb_meta_save(const GameRunner *gr, EbMetaSave *s) {
@@ -1649,7 +1652,8 @@ static void eb_meta_save(const GameRunner *gr, EbMetaSave *s) {
   s->pass_cycle_abandoned = gr->pass_cycle_abandoned;
   s->pass_cycle_n_moves = gr->pass_cycle_n_moves;
   s->turn_number = gr->turn_number;
-  s->chain_natural = gr->eb_chain_natural;
+  s->divergence_turn = gr->eb_divergence_turn;
+  s->n_divergences = gr->eb_n_divergences;
 }
 
 static void eb_meta_restore(GameRunner *gr, const EbMetaSave *s) {
@@ -1661,7 +1665,8 @@ static void eb_meta_restore(GameRunner *gr, const EbMetaSave *s) {
   gr->pass_cycle_abandoned = s->pass_cycle_abandoned;
   gr->pass_cycle_n_moves = s->pass_cycle_n_moves;
   gr->turn_number = s->turn_number;
-  gr->eb_chain_natural = s->chain_natural;
+  gr->eb_divergence_turn = s->divergence_turn;
+  gr->eb_n_divergences = s->n_divergences;
 }
 
 // Enumerate the action set for the current decision into gr->eb_action_buf.
@@ -1882,6 +1887,9 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
   EmptyBoardRecorder *ebr = w->shared_data->empty_board_recorder;
   EmptyBoardStrataRecorder *ebs = w->shared_data->empty_board_strata_recorder;
   if ((!ebr && !ebs) || gr->eb_n_snaps == 0) return;
+  // Skip multi-divergence leaves (counterfactual-of-counterfactual data).
+  // Pure natural (n_div=0) and single-anchor (n_div=1) leaves are kept.
+  if (gr->eb_n_divergences > 1) return;
   const int s0 =
       equity_to_int(player_get_score(game_get_player(gr->game, 0)));
   const int s1 =
@@ -1905,7 +1913,7 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
         gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
         gr->eb_snaps[i].leave, outcome, gr->eb_p2_random,
         gr->eb_snaps[i].natural_slot, gr->eb_snaps[i].move_score,
-        gr->eb_chain_natural ? 1 : 0);
+        gr->eb_divergence_turn);
   }
 }
 
@@ -1950,15 +1958,22 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     // state.
     Game *saved_game = game_duplicate(gr->game);
 
-    const bool parent_chain_natural = saved_meta.chain_natural;
+    const int fork_turn = saved_meta.n_snaps + 1;  // turn about to be played
     for (int s = 0; s < n_actions; s++) {
       if (!local_present[s]) continue;
       gr->eb_forced_move = &local_actions[s];
       gr->eb_natural_slot = fork_natural_slot;
-      // chain_natural propagates: stays true only if every ancestor fork
-      // chose its natural slot AND this sibling is the natural one.
-      gr->eb_chain_natural =
-          parent_chain_natural && (s == fork_natural_slot);
+      // Anchor tracking: a non-natural sibling counts as a divergence.
+      // First divergence stamps eb_divergence_turn; subsequent divergences
+      // bump eb_n_divergences (used to skip multi-divergence leaves).
+      gr->eb_divergence_turn = saved_meta.divergence_turn;
+      gr->eb_n_divergences = saved_meta.n_divergences;
+      if (s != fork_natural_slot) {
+        if (gr->eb_divergence_turn == -1) {
+          gr->eb_divergence_turn = fork_turn;
+        }
+        gr->eb_n_divergences++;
+      }
       game_runner_play_move(w, gr);
       gr->eb_forced_move = NULL;
       // Encode the SLOT INDEX (not iteration index) so the action at each
@@ -2220,8 +2235,7 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
             gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
             gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
             gr->eb_snaps[i].leave, outcome, 0, -1,
-            gr->eb_snaps[i].move_score,
-            gr->eb_snaps[i].chain_natural ? 1 : 0);
+            gr->eb_snaps[i].move_score, -1);
       }
     }
   }

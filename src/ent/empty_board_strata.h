@@ -19,19 +19,22 @@
 //
 //   pair_id, branch_id, rack, opp_action_history, action_repr,
 //   action_size, leave, eventual_outcome, p2_rack_source, natural_slot,
-//   move_score, chain_natural
+//   move_score, divergence_turn
 //
 // move_score is the score the player earned on this turn: 0 for pass and
 // exchange, the actual play score for K=2. With both players at 0 score
 // across the cycle, move_score equals the score differential after the
 // move.
 //
-// chain_natural is 1 iff every fork in this DFS branch's ancestry chose
-// its natural slot — i.e. this row's full action chain is what natural
-// HastyBot/force-pass policy would actually have produced. Filter to
-// chain_natural=1 to evaluate the lookup against real-game distributions
-// (counterfactual DFS branches still write rows for full lookup-cell
-// coverage, just with chain_natural=0).
+// divergence_turn is the "anchor turn" of this leaf:
+//   -1: pure natural — no fork in this branch's ancestry chose a
+//       non-natural slot; what real HastyBot/force-pass play produces.
+//   k (1..6): the chain followed natural through T1..T(k-1) and then
+//       chose a non-natural slot at Tk; from Tk+1 onward the chain again
+//       followed natural. Useful for "natural-from-Tk-anchor" subsets.
+// Multi-divergence leaves (>=2 non-natural choices) are NOT emitted —
+// they're counterfactual-of-counterfactual data with no clean
+// interpretation. Lookup cells are populated by all (-1, 1..6) leaves.
 //
 // Files lazy-opened on first write. Mutex per file. Compatible with
 // running ALONGSIDE the flat MAGPIE_EMPTY_BOARD_OUT recorder (both can
@@ -50,6 +53,6 @@ void empty_board_strata_write(
     const char *opp_action_history, int action_kind, const char *action_repr,
     int action_size, const char *leave, int eventual_outcome,
     int p2_rack_source, int natural_slot, int move_score,
-    int chain_natural);
+    int divergence_turn);
 
 #endif
