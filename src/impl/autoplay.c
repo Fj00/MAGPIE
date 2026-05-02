@@ -781,16 +781,12 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   game_runner->pass_cycle_abandoned = false;
   if (!used_forced_rack && game_runner->shared_data->pass_cycle_table) {
     PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
-    const char *p1_rack = NULL;
-    const char *p2_rack = NULL;
-    bool sampled = false;
+    const int p1 = starting_player_index;
+    const int p2 = 1 - starting_player_index;
     if (game_runner->eb_p1_rack_source == 1) {
-      // Non-pool P1: skip pool sampling entirely. Both players draw
-      // naturally from the bag. T1 forcing kind is set from
-      // eb_p1_force_kind (the iter_count bit) and applied below in
-      // the move-selection branch.
-      const int p1 = starting_player_index;
-      const int p2 = 1 - starting_player_index;
+      // Non-pool P1: both players draw naturally from the bag. T1+T2
+      // are force-pass/exch per eb_p1_force_kind (set by iter_count
+      // bit) in the move-selection code below.
       draw_to_full_rack(game, p1);
       draw_to_full_rack(game, p2);
       game_runner->pass_cycle_active = true;
@@ -799,50 +795,32 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
       game_runner->pass_cycle_bot_rack_str = NULL;
       game_runner->pass_cycle_opp_rack_str = NULL;
       used_forced_rack = true;
-    } else if (game_runner->eb_p2_random) {
-      // Mix-random half: P1 from pool (force-pass via is_pass lookup at
-      // turn 1), P2 drawn naturally from the bag after P1's tiles removed.
-      // Rejection-sample to match force_kind so the 4 groups (pool×kind)
-      // are balanced 25%/25% within the pool half.
+    } else {
+      // Pool P1: rejection-sample P1 to match eb_p1_force_kind so the
+      // 4 groups (rack_source × force_kind) are balanced 25/25/25/25.
+      // P2 is drawn from the bag (decoupled from P1 sampling — keeps
+      // the rack-source dimension clean independently of P2 source).
       const int target_is_pass =
           (game_runner->eb_p1_force_kind == 0) ? 1 : 0;
+      const char *p1_rack = NULL;
       pass_cycle_sample_p1_target_is_pass(
           pct, iter_output->iter_count, target_is_pass, &p1_rack);
-      sampled = (p1_rack != NULL);
-    } else if (pass_cycle_sample_racks(pct, iter_output->iter_count, &p1_rack,
-                                       &p2_rack)) {
-      sampled = true;
-    }
-    if (sampled) {
-      // P1 is the starting player (the one who passes in branch 0).
-      const int p1 = starting_player_index;
-      const int p2 = 1 - starting_player_index;
-      const int n1 = draw_rack_string_from_bag(game, p1, p1_rack);
-      if (n1 > 0) {
-        int n2 = 1;
-        if (game_runner->eb_p2_random) {
-          // P2 random: just refill from remaining bag.
+      if (p1_rack != NULL) {
+        const int n1 = draw_rack_string_from_bag(game, p1, p1_rack);
+        if (n1 > 0) {
           draw_to_full_rack(game, p2);
-        } else {
-          n2 = draw_rack_string_from_bag(game, p2, p2_rack);
+          game_runner->pass_cycle_active = true;
+          game_runner->pass_cycle_branch = (pair_game_number == 2) ? 1 : 0;
+          game_runner->pass_cycle_bot_player = p1;
+          game_runner->pass_cycle_bot_rack_str = p1_rack;
+          game_runner->pass_cycle_opp_rack_str = NULL;
+          used_forced_rack = true;
+          // Override force_kind from rack's actual is_pass — guarantees
+          // consistency with downstream pass_cycle_lookup_is_pass behavior
+          // even when rejection fell back to an unfiltered sample.
+          const int is_pass = pass_cycle_lookup_is_pass(pct, p1_rack);
+          game_runner->eb_p1_force_kind = (is_pass == 1) ? 0 : 1;
         }
-        if (n2 <= 0) {
-          // Should not happen given pass_cycle_sample_racks filtering,
-          // but fall back to random draw just in case.
-          draw_to_full_rack(game, p2);
-        }
-        game_runner->pass_cycle_active = true;
-        game_runner->pass_cycle_branch = (pair_game_number == 2) ? 1 : 0;
-        game_runner->pass_cycle_bot_player = p1;
-        game_runner->pass_cycle_bot_rack_str = p1_rack;
-        game_runner->pass_cycle_opp_rack_str = p2_rack;
-        used_forced_rack = true;
-        // Pool P1: set force_kind from rack's is_pass bit. Override the
-        // iter_count default since pool racks have their forcing
-        // determined by their pool classification, not by the bit.
-        const int is_pass =
-            pass_cycle_lookup_is_pass(pct, p1_rack);
-        game_runner->eb_p1_force_kind = (is_pass == 1) ? 0 : 1;
       }
     }
   }
