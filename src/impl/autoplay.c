@@ -646,22 +646,24 @@ typedef struct GameRunner {
   // game_duplicate inside play_eb_dfs — a shared buffer would be overwritten
   // by inner forks.)
   Move *eb_forced_move;
-  // Slice 2c mix-random: 0 = pool-sampled P2 (default); 1 = bag-random P2.
-  // Set by play_autoplay_game_or_game_pair before game_runner_start; consumed
-  // by the rack-draw branch in game_runner_start, by the turn-2 branchability
-  // check in eb_enumerate_actions, and emitted in every record.
-  int eb_p2_random;
-  // P1 rack source / forcing tag — decorrelates rack-pool membership from
-  // T1 forcing kind so analyses can study each dimension independently.
-  //   eb_p1_rack_source: 0 = pool (sampled from pass_cycle_racks.csv),
-  //                      1 = non-pool (sampled uniformly from bag).
-  //   eb_p1_force_kind:  0 = T1 force-pass,
-  //                      1 = T1 force-exchange.
-  // For pool racks, force_kind is determined by the rack's is_pass bit
-  // (is_pass=1 → pass, is_pass=0 → exch). For non-pool racks, force_kind
-  // is set per-pair from the iter_count bit.
+  // P1 rack source / forcing tag.
+  //   eb_p1_rack_source: pinned to 0 in the new mode (P1 is always sampled
+  //                      from the pool). Kept in the schema for downstream
+  //                      analyses that group by rack source.
+  //   eb_p1_force_kind:  0 = T1 force-pass (P1 rack is is_pass=1),
+  //                      1 = T1 force-exchange (P1 rack is is_pass=0).
+  //                      Drives pool rejection sampling AND the T1 force.
+  // P2 rack source / forcing tag (new in the T2-balanced mode).
+  //   eb_p2_rack_source: 0 = pool (rejection-sampled to match force_kind),
+  //                      1 = bag (uniform draw — play-prone P2 racks for
+  //                              the "best play is +4, exchange better?"
+  //                              counterfactual).
+  //   eb_p2_force_kind:  0 = T2 force-pass,
+  //                      1 = T2 force-exchange.
   int eb_p1_rack_source;
   int eb_p1_force_kind;
+  int eb_p2_rack_source;
+  int eb_p2_force_kind;
   // Natural slot at the most recent enumerate_actions call: which slot
   // index HastyBot or force-pass would have chosen without DFS forcing.
   // -1 = no fork at this turn (or pass-cycle / opp-pass / etc. — non-fork).
@@ -700,9 +702,10 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
   game_runner->pair_game_number =
       0; // Will be set in game_runner_start if using pairs
   game_runner->eb_forced_move = NULL;
-  game_runner->eb_p2_random = 0;
   game_runner->eb_p1_rack_source = 0;
   game_runner->eb_p1_force_kind = 0;
+  game_runner->eb_p2_rack_source = 0;
+  game_runner->eb_p2_force_kind = 0;
   game_runner->eb_natural_slot = -1;
   game_runner->eb_divergence_turn = -1;
   game_runner->eb_n_divergences = 0;
@@ -783,44 +786,52 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
     PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
     const int p1 = starting_player_index;
     const int p2 = 1 - starting_player_index;
-    if (game_runner->eb_p1_rack_source == 1) {
-      // Non-pool P1: both players draw naturally from the bag. T1+T2
-      // are force-pass/exch per eb_p1_force_kind (set by iter_count
-      // bit) in the move-selection code below.
-      draw_to_full_rack(game, p1);
-      draw_to_full_rack(game, p2);
-      game_runner->pass_cycle_active = true;
-      game_runner->pass_cycle_branch = (pair_game_number == 2) ? 1 : 0;
-      game_runner->pass_cycle_bot_player = p1;
-      game_runner->pass_cycle_bot_rack_str = NULL;
-      game_runner->pass_cycle_opp_rack_str = NULL;
-      used_forced_rack = true;
-    } else {
-      // Pool P1: rejection-sample P1 to match eb_p1_force_kind so the
-      // 4 groups (rack_source × force_kind) are balanced 25/25/25/25.
-      // P2 is drawn from the bag (decoupled from P1 sampling — keeps
-      // the rack-source dimension clean independently of P2 source).
-      const int target_is_pass =
-          (game_runner->eb_p1_force_kind == 0) ? 1 : 0;
-      const char *p1_rack = NULL;
-      pass_cycle_sample_p1_target_is_pass(
-          pct, iter_output->iter_count, target_is_pass, &p1_rack);
-      if (p1_rack != NULL) {
-        const int n1 = draw_rack_string_from_bag(game, p1, p1_rack);
-        if (n1 > 0) {
-          draw_to_full_rack(game, p2);
-          game_runner->pass_cycle_active = true;
-          game_runner->pass_cycle_branch = (pair_game_number == 2) ? 1 : 0;
-          game_runner->pass_cycle_bot_player = p1;
-          game_runner->pass_cycle_bot_rack_str = p1_rack;
-          game_runner->pass_cycle_opp_rack_str = NULL;
-          used_forced_rack = true;
-          // Override force_kind from rack's actual is_pass — guarantees
-          // consistency with downstream pass_cycle_lookup_is_pass behavior
-          // even when rejection fell back to an unfiltered sample.
-          const int is_pass = pass_cycle_lookup_is_pass(pct, p1_rack);
-          game_runner->eb_p1_force_kind = (is_pass == 1) ? 0 : 1;
+    // P1: always pool-sampled. Rejection-sample to match eb_p1_force_kind
+    // so each (is_pass=1, is_pass=0) class is equally represented despite
+    // the pool's natural skew.
+    const int p1_target_is_pass =
+        (game_runner->eb_p1_force_kind == 0) ? 1 : 0;
+    const char *p1_rack = NULL;
+    pass_cycle_sample_p1_target_is_pass(
+        pct, iter_output->iter_count, p1_target_is_pass, &p1_rack);
+    if (p1_rack != NULL) {
+      const int n1 = draw_rack_string_from_bag(game, p1, p1_rack);
+      if (n1 > 0) {
+        // Override force_kind from the actual sampled rack's is_pass —
+        // rejection sampling can fall back to an unfiltered sample.
+        const int is_pass = pass_cycle_lookup_is_pass(pct, p1_rack);
+        game_runner->eb_p1_force_kind = (is_pass == 1) ? 0 : 1;
+
+        // P2 rack: pool (rejection-sampled by eb_p2_force_kind) or
+        // bag-random per eb_p2_rack_source. Pool variant gives clean
+        // is_pass/is_pass=0 P2 racks; bag variant exposes play-prone
+        // P2 racks to the T2 force-pass/exch counterfactual.
+        bool p2_drawn = false;
+        if (game_runner->eb_p2_rack_source == 0) {
+          const int p2_target_is_pass =
+              (game_runner->eb_p2_force_kind == 0) ? 1 : 0;
+          const char *p2_rack = NULL;
+          // Perturb the seed so P1 and P2 sample independently.
+          pass_cycle_sample_p1_target_is_pass(
+              pct, iter_output->iter_count ^ 0xa5a5a5a5a5a5a5a5ULL,
+              p2_target_is_pass, &p2_rack);
+          if (p2_rack != NULL) {
+            const int n2 = draw_rack_string_from_bag(game, p2, p2_rack);
+            if (n2 > 0) {
+              game_runner->pass_cycle_opp_rack_str = p2_rack;
+              p2_drawn = true;
+            }
+          }
         }
+        if (!p2_drawn) {
+          // Bag-random P2 (or pool sample failed → fall back to bag).
+          draw_to_full_rack(game, p2);
+        }
+        game_runner->pass_cycle_active = true;
+        game_runner->pass_cycle_branch = (pair_game_number == 2) ? 1 : 0;
+        game_runner->pass_cycle_bot_player = p1;
+        game_runner->pass_cycle_bot_rack_str = p1_rack;
+        used_forced_rack = true;
       }
     }
   }
@@ -1303,19 +1314,23 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
       move = spare;
     }
   }
-  // Non-pool first-2-turns forcing: pool isn't the rack source (so the
-  // is_pass lookup above wouldn't fire). At T1 (P1's first turn) AND
-  // T2 (P2's first turn), force pass or exchange per eb_p1_force_kind
-  // so the cycle starts symmetrically for both players. Subsequent
-  // turns fall through to natural HastyBot play (the cycle either
-  // continues or breaks based on what HastyBot picks for the new rack).
+  // T1+T2 explicit forcing: T1 forces P1 per eb_p1_force_kind (derived
+  // from P1 rack's is_pass), T2 forces P2 per eb_p2_force_kind (set
+  // from iter_count bit 3). This guarantees the cycle starts even for
+  // is_pass=0 P1 racks (which the auto-pass above doesn't catch) AND
+  // gives balanced T2 data across (rack_source × force_kind) for P2
+  // including play-prone bag-random racks.
+  // pass_cycle_n_moves==0 → about to play T1; ==1 → T2.
   if (!move && game_runner->pass_cycle_active &&
-      game_runner->eb_p1_rack_source == 1 &&
       game_runner->pass_cycle_n_moves < 2 &&
       board_get_tiles_played(game_get_board(game)) == 0) {
+    const int force_kind =
+        (game_runner->pass_cycle_n_moves == 0)
+            ? game_runner->eb_p1_force_kind
+            : game_runner->eb_p2_force_kind;
     Move *spare = move_list_get_spare_move(
         autoplay_worker->move_lists[player_on_turn_index]);
-    if (game_runner->eb_p1_force_kind == 0) {
+    if (force_kind == 0) {
       move_set_as_pass(spare);
       move = spare;
     } else {
@@ -1980,17 +1995,17 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
         gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
         gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
         gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
-        gr->eb_snaps[i].leave, outcome, gr->eb_p2_random,
+        gr->eb_snaps[i].leave, outcome, gr->eb_p2_rack_source,
         gr->eb_snaps[i].natural_slot);
     empty_board_strata_write(
         w->shared_data->empty_board_strata_recorder, gr->game_number,
         branch_id, gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
         gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
         gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
-        gr->eb_snaps[i].leave, outcome, gr->eb_p2_random,
+        gr->eb_snaps[i].leave, outcome, gr->eb_p2_rack_source,
         gr->eb_snaps[i].natural_slot, gr->eb_snaps[i].move_score,
         gr->eb_divergence_turn, gr->eb_p1_rack_source,
-        gr->eb_p1_force_kind);
+        gr->eb_p1_force_kind, gr->eb_p2_force_kind);
   }
 }
 
@@ -2082,25 +2097,25 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
   if (autoplay_worker->shared_data->eb_branch_active &&
       autoplay_worker->shared_data->pass_cycle_table != NULL) {
     int starter = starting_player_index;
-    int p2_random = 0;
-    int p1_rack_source = 0;  // 0 = pool, 1 = non-pool (bag-random)
-    int p1_force_kind = 0;   // 0 = pass, 1 = exch
+    int p1_force_kind = 0;   // 0 = pass (is_pass=1 rack), 1 = exch
+    int p2_rack_source = 0;  // 0 = pool, 1 = bag-random
+    int p2_force_kind = 0;   // 0 = pass, 1 = exch
     if (autoplay_worker->shared_data->eb_mix_random) {
-      // iter_count bit allocation:
-      //   bit 0: P2 pool/random (existing)
-      //   bit 1: starter (existing)
-      //   bit 2: P1 rack source (0 = pool, 1 = non-pool)
-      //   bit 3: P1 T1 force kind (0 = pass, 1 = exch) — used only when
-      //          P1 is non-pool; for pool P1 the force is determined by
-      //          the rack's is_pass bit.
-      p2_random = (int)(iter_output->iter_count & 1ULL);
+      // iter_count bit allocation (T1-pool, T2-balanced mode):
+      //   bit 0: P1 force kind (drives pool rejection sampling 50/50
+      //          between is_pass=1 and is_pass=0 racks)
+      //   bit 1: starter
+      //   bit 2: P2 rack source (0 = pool, 1 = bag-random)
+      //   bit 3: P2 force kind at T2 (0 = pass, 1 = exch)
+      p1_force_kind = (int)(iter_output->iter_count & 1ULL);
       starter = (int)((iter_output->iter_count >> 1) & 1ULL);
-      p1_rack_source = (int)((iter_output->iter_count >> 2) & 1ULL);
-      p1_force_kind = (int)((iter_output->iter_count >> 3) & 1ULL);
+      p2_rack_source = (int)((iter_output->iter_count >> 2) & 1ULL);
+      p2_force_kind = (int)((iter_output->iter_count >> 3) & 1ULL);
     }
-    game_runner1->eb_p2_random = p2_random;
-    game_runner1->eb_p1_rack_source = p1_rack_source;
+    game_runner1->eb_p1_rack_source = 0;
     game_runner1->eb_p1_force_kind = p1_force_kind;
+    game_runner1->eb_p2_rack_source = p2_rack_source;
+    game_runner1->eb_p2_force_kind = p2_force_kind;
     game_runner_start(autoplay_worker, game_runner1, iter_output, starter, 0);
     play_eb_dfs(autoplay_worker, game_runner1, 0);
     autoplay_add_game(autoplay_worker, game_runner1, false);
@@ -2327,7 +2342,7 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
             gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
             gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
             gr->eb_snaps[i].leave, outcome, 0, -1,
-            gr->eb_snaps[i].move_score, -1, 0, 0);
+            gr->eb_snaps[i].move_score, -1, 0, 0, 0);
       }
     }
   }

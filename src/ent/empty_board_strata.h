@@ -19,35 +19,24 @@
 //
 //   pair_id, branch_id, rack, opp_action_history, action_repr,
 //   action_size, leave, eventual_outcome, p2_rack_source, natural_slot,
-//   move_score, divergence_turn, p1_rack_source, p1_force_kind
+//   move_score, divergence_turn, p1_rack_source, p1_force_kind,
+//   p2_force_kind
 //
 // move_score is the score the player earned on this turn: 0 for pass and
-// exchange, the actual play score for K=2. With both players at 0 score
-// across the cycle, move_score equals the score differential after the
-// move.
+// exchange, the actual play score for K=2.
 //
-// divergence_turn is the "anchor turn" of this leaf:
-//   -1: pure natural — no fork in this branch's ancestry chose a
-//       non-natural slot; what real HastyBot/force-pass play produces.
-//   k (1..6): the chain followed natural through T1..T(k-1) and then
-//       chose a non-natural slot at Tk; from Tk+1 onward the chain again
-//       followed natural. Useful for "natural-from-Tk-anchor" subsets.
-// Multi-divergence leaves (>=2 non-natural choices) are NOT emitted —
-// they're counterfactual-of-counterfactual data with no clean
-// interpretation. Lookup cells are populated by all (-1, 1..6) leaves.
+// divergence_turn is the "anchor turn" of this leaf (see autoplay.c).
 //
-// p1_rack_source: where P1's starting rack came from.
-//   0: pool (sampled weighted from pass_cycle_racks.csv)
-//   1: non-pool (sampled uniformly from bag — racks that wouldn't
-//      naturally cycle, force-cycled here for diagnostic data)
-//
-// p1_force_kind: how T1 was forced for P1.
-//   0: T1 force-pass
-//   1: T1 force-exchange
-// For pool racks, force_kind is determined by the rack's is_pass bit
-// (is_pass=1 → pass, is_pass=0 → exch). For non-pool racks, force_kind
-// is set per-pair from an iter_count bit, giving 4 distinct groups
-// across (rack_source, force_kind) for cross-comparison.
+// p1_rack_source: pinned to 0 in the new mode (P1 always pool-sampled);
+//                 retained in the schema for older-data compatibility.
+// p1_force_kind:  derived from P1 rack's is_pass classification.
+//                 0 = T1 force-pass (is_pass=1 rack), 1 = T1 force-exch.
+// p2_rack_source: 0 = pool (rejection-sampled by force_kind),
+//                 1 = bag-random (play-prone P2, exposes the
+//                                 "best play +4 vs exchange" tradeoff).
+// p2_force_kind:  0 = T2 force-pass, 1 = T2 force-exch.
+// (P2 force is set per-pair from an iter_count bit, giving balanced
+//  (rack_source × force_kind) groups for T2 analysis.)
 //
 // Files lazy-opened on first write. Mutex per file. Compatible with
 // running ALONGSIDE the flat MAGPIE_EMPTY_BOARD_OUT recorder (both can
@@ -66,6 +55,7 @@ void empty_board_strata_write(
     const char *opp_action_history, int action_kind, const char *action_repr,
     int action_size, const char *leave, int eventual_outcome,
     int p2_rack_source, int natural_slot, int move_score,
-    int divergence_turn, int p1_rack_source, int p1_force_kind);
+    int divergence_turn, int p1_rack_source, int p1_force_kind,
+    int p2_force_kind);
 
 #endif
