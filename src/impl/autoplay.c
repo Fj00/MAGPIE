@@ -1887,9 +1887,12 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
   EmptyBoardRecorder *ebr = w->shared_data->empty_board_recorder;
   EmptyBoardStrataRecorder *ebs = w->shared_data->empty_board_strata_recorder;
   if ((!ebr && !ebs) || gr->eb_n_snaps == 0) return;
-  // Skip multi-divergence leaves (counterfactual-of-counterfactual data).
-  // Pure natural (n_div=0) and single-anchor (n_div=1) leaves are kept.
-  if (gr->eb_n_divergences > 1) return;
+  // Every DFS leaf is emitted (multi-divergence included). The
+  // snap-emission loop below skips pre-first-divergence rows so each
+  // leaf contributes only Tk..T6 where k = divergence_turn (or T1..T6
+  // for pure natural). Pre-div rows are identical to the pure-natural
+  // chain's snaps and would just duplicate; per-anchor saved chains
+  // form the Cartesian product of all DFS sub-branches × turns.
   const int s0 =
       equity_to_int(player_get_score(game_get_player(gr->game, 0)));
   const int s1 =
