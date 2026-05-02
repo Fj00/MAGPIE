@@ -839,10 +839,17 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
 }
 
 bool game_runner_is_game_over(GameRunner *game_runner) {
+  // pass_cycle_abandoned is a fast-fail for games that can't satisfy the
+  // 6-pass-cycle output recorder. But the EB strata recorder needs the
+  // full game to play out so K=2 (play) branches get a meaningful
+  // eventual_outcome — otherwise plays terminate the moment a tile lands
+  // and trivially win 100% of the time.
+  const bool eb_strata_active =
+      game_runner->shared_data->empty_board_strata_recorder != NULL;
   return game_over(game_runner->game) ||
          (game_runner->shared_data->leavegen_shared_data &&
           bag_get_letters(game_get_bag(game_runner->game)) < (RACK_SIZE)) ||
-         game_runner->pass_cycle_abandoned;
+         (game_runner->pass_cycle_abandoned && !eb_strata_active);
 }
 
 const Move *game_runner_get_top_simming_move(AutoplayWorker *autoplay_worker,
