@@ -1895,6 +1895,14 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
   const int s1 =
       equity_to_int(player_get_score(game_get_player(gr->game, 1)));
   for (int i = 0; i < gr->eb_n_snaps; i++) {
+    // Skip pre-divergence snaps — they're identical to the natural-chain
+    // snaps emitted by the pure-natural leaf, so re-emitting them just
+    // duplicates rows. Pure natural (divergence_turn == -1) emits all
+    // snaps; an anchor=k leaf only emits its Tk..T6 rows.
+    if (gr->eb_divergence_turn != -1 &&
+        gr->eb_snaps[i].turn_on_empty_board < gr->eb_divergence_turn) {
+      continue;
+    }
     const int p = gr->eb_snaps[i].player_on_turn;
     const int my = (p == 0) ? s0 : s1;
     const int opp = (p == 0) ? s1 : s0;
@@ -1959,22 +1967,17 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     Game *saved_game = game_duplicate(gr->game);
 
     const int fork_turn = saved_meta.n_snaps + 1;  // turn about to be played
-    // T6 is the cycle terminus — every T6 fan-out subset is a valid
-    // study-variable data point, not a counterfactual. Skip divergence
-    // accounting at T6 so a leaf with anchor=k in {-1, 2..5} can take
-    // any T6 action and remain a useful single-anchor leaf.
-    const bool fork_counts_as_divergence = (fork_turn != 6);
     for (int s = 0; s < n_actions; s++) {
       if (!local_present[s]) continue;
       gr->eb_forced_move = &local_actions[s];
       gr->eb_natural_slot = fork_natural_slot;
-      // Anchor tracking: a non-natural sibling at T2-T5 counts as a
-      // divergence. First divergence stamps eb_divergence_turn;
+      // Anchor tracking: a non-natural sibling at any T2-T6 fork counts
+      // as a divergence. First divergence stamps eb_divergence_turn;
       // subsequent divergences bump eb_n_divergences (used to skip
       // multi-divergence leaves).
       gr->eb_divergence_turn = saved_meta.divergence_turn;
       gr->eb_n_divergences = saved_meta.n_divergences;
-      if (fork_counts_as_divergence && s != fork_natural_slot) {
+      if (s != fork_natural_slot) {
         if (gr->eb_divergence_turn == -1) {
           gr->eb_divergence_turn = fork_turn;
         }
