@@ -1887,12 +1887,12 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
   EmptyBoardRecorder *ebr = w->shared_data->empty_board_recorder;
   EmptyBoardStrataRecorder *ebs = w->shared_data->empty_board_strata_recorder;
   if ((!ebr && !ebs) || gr->eb_n_snaps == 0) return;
-  // Every DFS leaf is emitted (multi-divergence included). The
-  // snap-emission loop below skips pre-first-divergence rows so each
-  // leaf contributes only Tk..T6 where k = divergence_turn (or T1..T6
-  // for pure natural). Pre-div rows are identical to the pure-natural
-  // chain's snaps and would just duplicate; per-anchor saved chains
-  // form the Cartesian product of all DFS sub-branches × turns.
+  // Skip multi-divergence leaves (more than one non-natural choice in
+  // T2-T5). T6 doesn't count as a divergence — every T6 fan-out is a
+  // valid data point for the lookup table. So a leaf is kept iff its
+  // T2-T5 chain is either pure natural OR has exactly one divergence
+  // followed by natural; from there every T6 sub-branch is recorded.
+  if (gr->eb_n_divergences > 1) return;
   const int s0 =
       equity_to_int(player_get_score(game_get_player(gr->game, 0)));
   const int s1 =
@@ -1970,17 +1970,18 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     Game *saved_game = game_duplicate(gr->game);
 
     const int fork_turn = saved_meta.n_snaps + 1;  // turn about to be played
+    // T6 forks don't count toward divergence — every T6 sub-branch is a
+    // valid data point in the lookup. n_divergences only counts non-
+    // natural choices at T2-T5; eb_emit_leaf drops leaves where this
+    // exceeds 1.
+    const bool fork_counts_as_divergence = (fork_turn != 6);
     for (int s = 0; s < n_actions; s++) {
       if (!local_present[s]) continue;
       gr->eb_forced_move = &local_actions[s];
       gr->eb_natural_slot = fork_natural_slot;
-      // Anchor tracking: a non-natural sibling at any T2-T6 fork counts
-      // as a divergence. First divergence stamps eb_divergence_turn;
-      // subsequent divergences bump eb_n_divergences (used to skip
-      // multi-divergence leaves).
       gr->eb_divergence_turn = saved_meta.divergence_turn;
       gr->eb_n_divergences = saved_meta.n_divergences;
-      if (s != fork_natural_slot) {
+      if (fork_counts_as_divergence && s != fork_natural_slot) {
         if (gr->eb_divergence_turn == -1) {
           gr->eb_divergence_turn = fork_turn;
         }
