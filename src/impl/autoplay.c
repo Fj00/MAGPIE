@@ -679,6 +679,7 @@ typedef struct GameRunner {
   //     territory and should be skipped.
   // Both are saved/restored across sibling iterations by eb_meta_save.
   int eb_divergence_turn;
+  int eb_last_divergence_turn;  // turn of the LAST non-natural choice (-1 if none)
   int eb_n_divergences;
   // Slot 0=pass; slots 1..N=enumerated actions in stable order.
   // Capacity covers worst case: pass + 127 distinct exch subsets of a 7-tile
@@ -708,6 +709,7 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
   game_runner->eb_p2_force_kind = 0;
   game_runner->eb_natural_slot = -1;
   game_runner->eb_divergence_turn = -1;
+  game_runner->eb_last_divergence_turn = -1;
   game_runner->eb_n_divergences = 0;
   game_runner->eb_n_action_buf = 0;
   for (int i = 0; i < EB_MAX_ACTIONS; i++) {
@@ -1723,6 +1725,7 @@ typedef struct EbMetaSave {
   int pass_cycle_n_moves;
   int turn_number;
   int divergence_turn;
+  int last_divergence_turn;
   int n_divergences;
 } EbMetaSave;
 
@@ -1736,6 +1739,7 @@ static void eb_meta_save(const GameRunner *gr, EbMetaSave *s) {
   s->pass_cycle_n_moves = gr->pass_cycle_n_moves;
   s->turn_number = gr->turn_number;
   s->divergence_turn = gr->eb_divergence_turn;
+  s->last_divergence_turn = gr->eb_last_divergence_turn;
   s->n_divergences = gr->eb_n_divergences;
 }
 
@@ -1749,6 +1753,7 @@ static void eb_meta_restore(GameRunner *gr, const EbMetaSave *s) {
   gr->pass_cycle_n_moves = s->pass_cycle_n_moves;
   gr->turn_number = s->turn_number;
   gr->eb_divergence_turn = s->divergence_turn;
+  gr->eb_last_divergence_turn = s->last_divergence_turn;
   gr->eb_n_divergences = s->n_divergences;
 }
 
@@ -1970,20 +1975,18 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
   EmptyBoardRecorder *ebr = w->shared_data->empty_board_recorder;
   EmptyBoardStrataRecorder *ebs = w->shared_data->empty_board_strata_recorder;
   if ((!ebr && !ebs) || gr->eb_n_snaps == 0) return;
-  // DFS plays every branch (multi-divergence chains play all the way
-  // through). Per-snap filter: only emit a snap at turn t if t >=
-  // eb_divergence_turn (or the chain is pure natural, divergence_turn
-  // == -1, in which case every snap qualifies). eb_divergence_turn is
-  // the FIRST non-natural turn in the chain — pre-first-div snaps
-  // would be identical to the pure-natural leaf's snaps and would
-  // just duplicate, so we skip them.
+  // Natural-post-Tk filter: emit snap at turn Tk only if no divergence
+  // occurred AFTER Tk. eb_last_divergence_turn is the last non-natural
+  // fork in this leaf's ancestry (-1 = pure natural, all snaps qualify).
+  // Condition: last_divergence_turn <= snap_turn (equiv: not > snap_turn).
+  // This ensures each (Tk, action) row appears in exactly one leaf — the
+  // one where every subsequent fork chose the natural slot.
   const int s0 =
       equity_to_int(player_get_score(game_get_player(gr->game, 0)));
   const int s1 =
       equity_to_int(player_get_score(game_get_player(gr->game, 1)));
   for (int i = 0; i < gr->eb_n_snaps; i++) {
-    if (gr->eb_divergence_turn != -1 &&
-        gr->eb_snaps[i].turn_on_empty_board < gr->eb_divergence_turn) {
+    if (gr->eb_last_divergence_turn > gr->eb_snaps[i].turn_on_empty_board) {
       continue;
     }
     const int p = gr->eb_snaps[i].player_on_turn;
@@ -2055,19 +2058,19 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
       if (!local_present[s]) continue;
       gr->eb_forced_move = &local_actions[s];
       gr->eb_natural_slot = fork_natural_slot;
-      // eb_divergence_turn = FIRST non-natural turn in the chain (or -1
-      // if pure natural). The eb_emit_leaf snap-emit filter skips snaps
-      // strictly before this turn — those are duplicates of the
-      // pure-natural chain's snaps and would just multiply the rows.
-      // T6 forks count too: a T6-only-divergent leaf has divergence_turn
-      // = 6 and emits only its T6 row (the other T1..T5 snaps are
-      // identical to the pure-natural leaf's snaps).
+      // eb_divergence_turn: FIRST non-natural turn (-1 if pure natural).
+      // eb_last_divergence_turn: LAST non-natural turn (-1 if pure natural).
+      // eb_emit_leaf uses last_divergence_turn to filter: emit snap at Tk
+      // only if last_divergence_turn <= Tk (no divergence after Tk), i.e.
+      // the post-Tk playout was fully natural.
       gr->eb_divergence_turn = saved_meta.divergence_turn;
+      gr->eb_last_divergence_turn = saved_meta.last_divergence_turn;
       gr->eb_n_divergences = saved_meta.n_divergences;
       if (s != fork_natural_slot) {
         if (gr->eb_divergence_turn == -1) {
           gr->eb_divergence_turn = fork_turn;
         }
+        gr->eb_last_divergence_turn = fork_turn;
         gr->eb_n_divergences++;
       }
       game_runner_play_move(w, gr);
