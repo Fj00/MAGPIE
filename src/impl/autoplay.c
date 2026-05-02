@@ -1675,6 +1675,64 @@ static void eb_meta_restore(GameRunner *gr, const EbMetaSave *s) {
 // Empty slots (pass omitted, or no legal play, etc.) keep their index and
 // the iterator skips them via the present-flag — branch_id encoding stays
 // reproducible regardless of which actions a particular position offers.
+// V3 closed-form T6 exchange rule. Returns total tiles to exchange and
+// fills v3_by_value[v] with the per-face-value count to drop. Empirical
+// validation (bots/winpct/scripts/validate_t6_algo.py) showed this matches
+// the lookup-table oracle within 0.0001 win % on probability-weighted T6
+// rack distributions, so the T6 strata recorder no longer needs to fan
+// out every exchange subset — a single V3 pick is sufficient.
+//
+// V3:
+//   step 1: exchange every tile worth 3+ pts (let s1 = count exchanged)
+//   step 2: ALSO exchange every 2-pt tile if any of:
+//             a) s1 >= 2
+//             b) s1 == 1 and rack has >= 2 of the 2-pt tiles
+//             c) s1 == 0 and total rack pts >= 10
+//   else: pass
+static int eb_v3_pick_t6(const Rack *rack, const LetterDistribution *ld,
+                         int v3_by_value[16]) {
+  int cnt_by_value[16] = {0};
+  int rack_pts = 0;
+  const uint16_t ds = rack_get_dist_size(rack);
+  for (uint16_t i = 1; i < ds; i++) {  // skip blank (i==0, value 0)
+    const int n = rack_get_letter(rack, i);
+    if (n == 0) continue;
+    const int v = equity_to_int(ld_get_score(ld, i));
+    if (v >= 0 && v < 16) {
+      cnt_by_value[v] += n;
+      rack_pts += v * n;
+    }
+  }
+  int s1 = 0;
+  for (int v = 3; v < 16; v++) s1 += cnt_by_value[v];
+  const int n2 = cnt_by_value[2];
+  const bool fire_2pt = (s1 >= 2) || (s1 == 1 && n2 >= 2)
+                        || (s1 == 0 && rack_pts >= 10);
+  for (int v = 0; v < 16; v++) v3_by_value[v] = 0;
+  for (int v = 3; v < 16; v++) v3_by_value[v] = cnt_by_value[v];
+  if (fire_2pt) v3_by_value[2] = n2;
+  int total = 0;
+  for (int v = 0; v < 16; v++) total += v3_by_value[v];
+  return total;
+}
+
+// True iff the exchange Move's tiles match the V3 target value-multiset.
+static bool eb_move_matches_v3(const Move *mv, const LetterDistribution *ld,
+                               const int v3_by_value[16]) {
+  const int nt = move_get_tiles_played(mv);
+  int seen[16] = {0};
+  for (int i = 0; i < nt; i++) {
+    const MachineLetter tml = move_get_tile(mv, i);
+    const int v = equity_to_int(ld_get_score(ld, tml));
+    if (v < 0 || v >= 16) return false;
+    seen[v]++;
+  }
+  for (int v = 0; v < 16; v++) {
+    if (seen[v] != v3_by_value[v]) return false;
+  }
+  return true;
+}
+
 static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   // Clear presence flags first so any early return leaves a sane state.
   for (int i = 0; i < EB_MAX_ACTIONS; i++) gr->eb_action_present[i] = false;
@@ -1731,10 +1789,13 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
     }
   }
 
-  // T5 and T6 both use subset-mode exchange fan-out (skipping the blank
-  // at T5, plus 1-pointers at T6 — see filter below). T2-T4 stay K=3
-  // (one best-equity exchange counterfactual).
-  const bool subset_mode = (turn >= 5);
+  // T5 uses subset-mode exchange fan-out (the recorder needs all subset
+  // outcomes since T5 isn't terminal — opp's T6 response varies).
+  // T6 uses K=3-style with the V3 closed-form rule picking the single
+  // exchange action (validated to within 0.0001 of oracle in
+  // bots/winpct/scripts/validate_t6_algo.py). T2-T4 stay K=3 with
+  // HastyBot's best-equity exchange.
+  const bool subset_mode = (turn == 5);
   const bool include_play_in_subset = subset_mode && has_play;
   int max_slot = -1;
   int play_slot = -1;  // populated slot index of the best-play action
@@ -1747,15 +1808,11 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   }
 
   if (subset_mode) {
-    // Filter subset-mode exchanges to drop strictly-dominated subsets:
-    //   T6 (cycle terminus): drop any exchange containing blank or
-    //     1-point tiles — exchanging cheap tiles when the game ends
-    //     immediately can never be right.
-    //   T5 (no legal plays): drop any exchange containing the blank only.
-    //     Exchanging 1-pointers can still be correct here if the opponent
-    //     plays after, so we keep those subsets.
+    // T5 subset filter: drop any exchange containing the blank.
+    // Exchanging 1-pointers can still be correct here if the opponent
+    // plays after, so we keep those subsets.
     const LetterDistribution *ld_filt = game_get_ld(gr->game);
-    const int min_score = (turn == 6) ? 2 : 1;
+    const int min_score = 1;
     int slot = 1;
     for (int m = 0; m < n_moves && slot < EB_MAX_ACTIONS; m++) {
       Move *cand = move_list_get_move(ml, m);
@@ -1789,12 +1846,31 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
     }
   } else {
     // K=3 mode: slot 1 = best-exch, slot 2 = best-play.
+    // At turn 6 the exchange is picked by the V3 closed-form rule (single
+    // empirically-near-optimal action); at T2-T4 it's HastyBot's best-equity
+    // exchange.
     Move *best_exch = NULL;
     Move *best_play = NULL;
+    int v3_target[16] = {0};
+    int v3_total = 0;
+    if (turn == 6) {
+      const Rack *r =
+          player_get_rack(game_get_player(gr->game, p_idx));
+      const LetterDistribution *ld_v3 = game_get_ld(gr->game);
+      v3_total = eb_v3_pick_t6(r, ld_v3, v3_target);
+    }
+    const LetterDistribution *ld_match = game_get_ld(gr->game);
     for (int m = 0; m < n_moves && (!best_exch || !best_play); m++) {
       Move *cand = move_list_get_move(ml, m);
       const game_event_t mt = move_get_type(cand);
-      if (!best_exch && mt == GAME_EVENT_EXCHANGE) best_exch = cand;
+      if (!best_exch && mt == GAME_EVENT_EXCHANGE) {
+        if (turn == 6) {
+          if (v3_total == 0) continue;  // V3 says don't exchange
+          if (move_get_tiles_played(cand) != v3_total) continue;
+          if (!eb_move_matches_v3(cand, ld_match, v3_target)) continue;
+        }
+        best_exch = cand;
+      }
       else if (!best_play && mt == GAME_EVENT_TILE_PLACEMENT_MOVE)
         best_play = cand;
     }
