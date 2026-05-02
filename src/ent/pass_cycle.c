@@ -224,6 +224,25 @@ void pass_cycle_sample_p1(const PassCycleTable *table, uint64_t pair_id,
   *p1_rack_out = table->racks[p1_idx];
 }
 
+// Sample P1 from the pool, restricted to racks with the target is_pass
+// classification. Uses up to max_attempts hash perturbations; falls
+// back to the unfiltered sample if no match found within the budget.
+void pass_cycle_sample_p1_target_is_pass(const PassCycleTable *table,
+                                         uint64_t pair_id, int target_is_pass,
+                                         const char **p1_rack_out) {
+  for (int attempt = 0; attempt < 64; attempt++) {
+    const uint64_t h = mix64(pair_id * 137ULL + (uint64_t)attempt * 7919ULL
+                             + 1ULL);
+    const int idx = sample_by_weight(table, uniform01(h));
+    if ((int)table->is_pass[idx] == target_is_pass) {
+      *p1_rack_out = table->racks[idx];
+      return;
+    }
+  }
+  // Budget exhausted — fall back to unfiltered sample.
+  pass_cycle_sample_p1(table, pair_id, p1_rack_out);
+}
+
 bool pass_cycle_sample_racks(const PassCycleTable *table, uint64_t pair_id,
                              const char **p1_rack_out,
                              const char **p2_rack_out) {

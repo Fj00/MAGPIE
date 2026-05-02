@@ -35,6 +35,15 @@ bool pass_cycle_sample_racks(const PassCycleTable *table, uint64_t pair_id,
 void pass_cycle_sample_p1(const PassCycleTable *table, uint64_t pair_id,
                           const char **p1_rack_out);
 
+// Same as pass_cycle_sample_p1 but rejects samples whose is_pass status
+// doesn't match target_is_pass. Used to balance the pool sampling so
+// is_pass=1 and is_pass=0 racks are produced in equal proportions per
+// per-pair flag (rather than the pool's natural skew). Falls back to
+// the unfiltered sample after 64 attempts.
+void pass_cycle_sample_p1_target_is_pass(const PassCycleTable *table,
+                                         uint64_t pair_id, int target_is_pass,
+                                         const char **p1_rack_out);
+
 // Look up a canonical rack string (sorted A-Z, blanks LAST, e.g. "ENOTUV?")
 // in the pool. Returns 1 if pass-favorable, 0 if exchange-only, -1 if not in
 // pool. Used during play to decide whether the current player's rack

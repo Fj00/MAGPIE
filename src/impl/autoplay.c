@@ -802,7 +802,12 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
     } else if (game_runner->eb_p2_random) {
       // Mix-random half: P1 from pool (force-pass via is_pass lookup at
       // turn 1), P2 drawn naturally from the bag after P1's tiles removed.
-      pass_cycle_sample_p1(pct, iter_output->iter_count, &p1_rack);
+      // Rejection-sample to match force_kind so the 4 groups (pool×kind)
+      // are balanced 25%/25% within the pool half.
+      const int target_is_pass =
+          (game_runner->eb_p1_force_kind == 0) ? 1 : 0;
+      pass_cycle_sample_p1_target_is_pass(
+          pct, iter_output->iter_count, target_is_pass, &p1_rack);
       sampled = (p1_rack != NULL);
     } else if (pass_cycle_sample_racks(pct, iter_output->iter_count, &p1_rack,
                                        &p2_rack)) {
