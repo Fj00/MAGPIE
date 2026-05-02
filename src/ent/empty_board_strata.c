@@ -134,7 +134,7 @@ static FILE *ebs_get_file(EmptyBoardStrataRecorder *r, int T, int K, int L,
     fprintf(fh,
             "pair_id,branch_id,rack,opp_action_history,action_repr,"
             "action_size,leave,eventual_outcome,p2_rack_source,"
-            "natural_slot,move_score\n");
+            "natural_slot,move_score,chain_natural\n");
     fflush(fh);
     r->fhs[T][K][L][ty] = fh;
   }
@@ -147,7 +147,8 @@ void empty_board_strata_write(
     int turn_on_empty_board, const char *rack,
     const char *opp_action_history, int action_kind, const char *action_repr,
     int action_size, const char *leave, int eventual_outcome,
-    int p2_rack_source, int natural_slot, int move_score) {
+    int p2_rack_source, int natural_slot, int move_score,
+    int chain_natural) {
   if (!r) return;
   if (turn_on_empty_board < 1 || turn_on_empty_board >= EBS_NUM_TURNS) return;
   if (action_kind < 0 || action_kind >= EBS_NUM_KINDS) return;
@@ -159,13 +160,13 @@ void empty_board_strata_write(
   if (!fh) return;
   pthread_mutex_lock(&r->mutexes[turn_on_empty_board][action_kind][leave_len]
                                 [type_idx]);
-  fprintf(fh, "%llu,%llu,%s,%s,%s,%d,%s,%d,%d,%d,%d\n",
+  fprintf(fh, "%llu,%llu,%s,%s,%s,%d,%s,%d,%d,%d,%d,%d\n",
           (unsigned long long)pair_id, (unsigned long long)branch_id,
           rack ? rack : "",
           opp_action_history ? opp_action_history : "",
           action_repr ? action_repr : "", action_size,
           leave ? leave : "", eventual_outcome, p2_rack_source, natural_slot,
-          move_score);
+          move_score, chain_natural);
   pthread_mutex_unlock(&r->mutexes[turn_on_empty_board][action_kind]
                                   [leave_len][type_idx]);
 }

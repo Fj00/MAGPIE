@@ -625,6 +625,9 @@ typedef struct GameRunner {
     int natural_slot;         // slot HastyBot/force-pass would have chosen
                               // at this fork (-1 if not a fork point)
     int move_score;           // points scored on this turn (0 for pass/exch)
+    bool chain_natural;       // true iff every prior fork in this branch's
+                              // ancestry chose its natural slot (i.e. this
+                              // is what natural play would actually produce)
   } eb_snaps[6];
   int eb_n_snaps;
   // Per-player action history accumulated this cycle (pipe-joined). Used as
@@ -655,6 +658,10 @@ typedef struct GameRunner {
   // index HastyBot or force-pass would have chosen without DFS forcing.
   // -1 = no fork at this turn (or pass-cycle / opp-pass / etc. — non-fork).
   int eb_natural_slot;
+  // Tracks whether every fork in this DFS branch chose its natural_slot.
+  // Reset to true at game start; flipped to false the first time a sibling
+  // branch is entered. Saved/restored by eb_meta_save/restore.
+  bool eb_chain_natural;
   // Slot 0=pass; slots 1..N=enumerated actions in stable order.
   // Capacity covers worst case: pass + 127 distinct exch subsets of a 7-tile
   // rack + 1 best-play + slack. eb_action_present[i] is true iff slot i is
@@ -679,6 +686,7 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
   game_runner->eb_forced_move = NULL;
   game_runner->eb_p2_random = 0;
   game_runner->eb_natural_slot = -1;
+  game_runner->eb_chain_natural = true;
   game_runner->eb_n_action_buf = 0;
   for (int i = 0; i < EB_MAX_ACTIONS; i++) {
     game_runner->eb_action_buf[i] = NULL;
@@ -1463,6 +1471,7 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
         (mt_eb == GAME_EVENT_TILE_PLACEMENT_MOVE)
             ? equity_to_int(move_get_score(move))
             : 0;
+    game_runner->eb_snaps[slot].chain_natural = game_runner->eb_chain_natural;
     game_runner->eb_n_snaps++;
 
     // Append this action to player_on_turn's per-cycle action history.
@@ -1625,6 +1634,7 @@ typedef struct EbMetaSave {
   bool pass_cycle_abandoned;
   int pass_cycle_n_moves;
   int turn_number;
+  bool chain_natural;
 } EbMetaSave;
 
 static void eb_meta_save(const GameRunner *gr, EbMetaSave *s) {
@@ -1636,6 +1646,7 @@ static void eb_meta_save(const GameRunner *gr, EbMetaSave *s) {
   s->pass_cycle_abandoned = gr->pass_cycle_abandoned;
   s->pass_cycle_n_moves = gr->pass_cycle_n_moves;
   s->turn_number = gr->turn_number;
+  s->chain_natural = gr->eb_chain_natural;
 }
 
 static void eb_meta_restore(GameRunner *gr, const EbMetaSave *s) {
@@ -1647,6 +1658,7 @@ static void eb_meta_restore(GameRunner *gr, const EbMetaSave *s) {
   gr->pass_cycle_abandoned = s->pass_cycle_abandoned;
   gr->pass_cycle_n_moves = s->pass_cycle_n_moves;
   gr->turn_number = s->turn_number;
+  gr->eb_chain_natural = s->chain_natural;
 }
 
 // Enumerate the action set for the current decision into gr->eb_action_buf.
@@ -1889,7 +1901,8 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
         gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
         gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
         gr->eb_snaps[i].leave, outcome, gr->eb_p2_random,
-        gr->eb_snaps[i].natural_slot, gr->eb_snaps[i].move_score);
+        gr->eb_snaps[i].natural_slot, gr->eb_snaps[i].move_score,
+        gr->eb_snaps[i].chain_natural ? 1 : 0);
   }
 }
 
@@ -1934,10 +1947,15 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     // state.
     Game *saved_game = game_duplicate(gr->game);
 
+    const bool parent_chain_natural = saved_meta.chain_natural;
     for (int s = 0; s < n_actions; s++) {
       if (!local_present[s]) continue;
       gr->eb_forced_move = &local_actions[s];
       gr->eb_natural_slot = fork_natural_slot;
+      // chain_natural propagates: stays true only if every ancestor fork
+      // chose its natural slot AND this sibling is the natural one.
+      gr->eb_chain_natural =
+          parent_chain_natural && (s == fork_natural_slot);
       game_runner_play_move(w, gr);
       gr->eb_forced_move = NULL;
       // Encode the SLOT INDEX (not iteration index) so the action at each
@@ -2199,7 +2217,8 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
             gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
             gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
             gr->eb_snaps[i].leave, outcome, 0, -1,
-            gr->eb_snaps[i].move_score);
+            gr->eb_snaps[i].move_score,
+            gr->eb_snaps[i].chain_natural ? 1 : 0);
       }
     }
   }
