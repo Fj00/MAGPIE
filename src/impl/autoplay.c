@@ -94,6 +94,11 @@ typedef struct AutoplaySharedData {
   // turn 2 branched explicitly to capture pass/exch/play V at turn 2).
   // Activated by MAGPIE_EMPTY_BOARD_MIX_RANDOM=1; alternates per pair_id.
   bool eb_mix_random;
+  // Bitmask of empty-board cycle turns at which to consult the force_table
+  // and add matching forced moves as additional DFS slots (scope-B forcing).
+  // Bit N set = active at turn N. Set by MAGPIE_EB_FORCE_TURNS env var
+  // (comma-separated turn list, e.g. "6" or "5,6"). Requires force_table.
+  int eb_force_turns_mask;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -510,6 +515,20 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
             "empty_board: mix-random ENABLED — alternating pool / "
             "bag-random P2 per pair, turn 2 branched on bag-random half\n");
   }
+  shared_data->eb_force_turns_mask = 0;
+  const char *eb_force = getenv("MAGPIE_EB_FORCE_TURNS");
+  if (eb_force && eb_force[0] != '\0') {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s", eb_force);
+    char *tok = strtok(buf, ",");
+    while (tok != NULL) {
+      const int t = atoi(tok);
+      if (t >= 2 && t <= 6) shared_data->eb_force_turns_mask |= (1 << t);
+      tok = strtok(NULL, ",");
+    }
+    fprintf(stderr, "empty_board: force-table ACTIVE at turns mask 0x%x "
+            "(input: %s)\n", shared_data->eb_force_turns_mask, eb_force);
+  }
   return shared_data;
 }
 
@@ -689,6 +708,14 @@ typedef struct GameRunner {
   Move *eb_action_buf[EB_MAX_ACTIONS];
   bool eb_action_present[EB_MAX_ACTIONS];
   int eb_n_action_buf;
+  // Force-table target attached to each enumerated slot (NULL if natural).
+  // Set by eb_append_force_target_slots; consumed in play_eb_dfs which
+  // copies the chosen slot's target into eb_snap_force_target[turn].
+  ForceTarget *eb_force_target_for_slot[EB_MAX_ACTIONS];
+  // Per-snap force-target (indexed by snap turn 1..6). Set when DFS
+  // descends into a forced slot; eb_emit_leaf reads to credit the deficit
+  // per emitted snap. Saved/restored across sibling forks via EbMetaSave.
+  ForceTarget *eb_snap_force_target[7];
 } GameRunner;
 
 GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
@@ -714,7 +741,9 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
   game_runner->eb_n_action_buf = 0;
   for (int i = 0; i < EB_MAX_ACTIONS; i++) {
     game_runner->eb_action_buf[i] = NULL;
+    game_runner->eb_force_target_for_slot[i] = NULL;
   }
+  for (int i = 0; i < 7; i++) game_runner->eb_snap_force_target[i] = NULL;
   if (autoplay_worker->shared_data->eb_branch_active) {
     game_runner->eb_n_action_buf = EB_MAX_ACTIONS;
     for (int i = 0; i < EB_MAX_ACTIONS; i++) {
@@ -1646,8 +1675,11 @@ void autoplay_add_game(AutoplayWorker *autoplay_worker,
   // Credit the force table for this game's final outcome. For stratum-kind
   // targets this is the moment the deficit actually decrements (and only
   // when the outcome bumps min(wins, losses) at the force-turn diff).
+  // Skip if EB-cycle force-table mode is active: per-emit credit in
+  // eb_emit_leaf already handled deficits for forced T2-T6 slots.
   ForceTable *ft = autoplay_worker->shared_data->force_table;
-  if (ft != NULL && game_runner->pending_force_target != NULL) {
+  if (ft != NULL && game_runner->pending_force_target != NULL &&
+      autoplay_worker->shared_data->eb_force_turns_mask == 0) {
     const Game *game = game_runner->game;
     const int p_idx = game_runner->pending_force_player_index;
     const int my_final =
@@ -1757,6 +1789,112 @@ static void eb_meta_restore(GameRunner *gr, const EbMetaSave *s) {
   gr->eb_n_divergences = s->n_divergences;
 }
 
+// After natural slots are populated, query the force_table for active
+// targets and append matching moves as ADDITIONAL DFS slots. Each appended
+// slot has its eb_force_target_for_slot[] set so the per-emit decrement
+// in eb_emit_leaf can credit the target's deficit.
+//
+// Per move we attach AT MOST ONE target (first match by priority); each
+// game's DFS thus contributes one credit per chosen forced slot. Multiple
+// active targets may match the same move — only one is credited (and the
+// other targets must wait for a different game). This avoids over-counting.
+//
+// The per-emit credit only fires for snaps EMITTED by the natural-post-Tk
+// filter; forced slots at turn k always emit their k-row (last_div=k <= k),
+// so each forced slot in a leaf's path produces exactly one credit.
+static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
+                                         MoveList *ml, int n_moves,
+                                         int max_slot) {
+  ForceTable *ft = w->shared_data->force_table;
+  if (!ft || !w->force_leaves || n_moves == 0) return max_slot;
+  Game *game = gr->game;
+  const int bag_count = bag_get_letters(game_get_bag(game)) + (RACK_SIZE);
+  int target_count = 0;
+  ForceTarget **targets = force_table_lookup(ft, bag_count, &target_count);
+  if (target_count == 0) return max_slot;
+  bool any_active = false;
+  for (int i = 0; i < target_count; i++) {
+    if (targets[i]->deficit > 0) { any_active = true; break; }
+  }
+  if (!any_active) return max_slot;
+  (void)targets;
+
+  // Compute leaves + bitmaps for every move (mirrors try_forced_move).
+  const LetterDistribution *ld = game_get_ld(game);
+  const uint16_t ld_size = ld_get_size(ld);
+  Rack *leaves = w->force_leaves;
+  if (n_moves > w->force_leaves_capacity) n_moves = w->force_leaves_capacity;
+  uint32_t leave_bitmaps[2048] = {0};
+  if (n_moves > 2048) n_moves = 2048;
+  for (int m = 0; m < n_moves; m++) {
+    rack_set_dist_size(&leaves[m], ld_size);
+    Move *move = move_list_get_move(ml, m);
+    get_leave_for_move(move, game, &leaves[m]);
+    uint32_t bm = 0;
+    for (uint16_t i = 0; i < leaves[m].dist_size && i < 32; i++) {
+      if (leaves[m].array[i] > 0) bm |= ((uint32_t)1) << i;
+    }
+    leave_bitmaps[m] = bm;
+  }
+
+  const int p_idx = game_get_player_on_turn_index(game);
+  const int my_score =
+      equity_to_int(player_get_score(game_get_player(game, p_idx)));
+  const int opp_score =
+      equity_to_int(player_get_score(game_get_player(game, 1 - p_idx)));
+  const int cur_diff = my_score - opp_score;
+
+  // For each move, find the FIRST matching active target by priority
+  // (PAIR > TILE > STRATUM). If found, append as a new DFS slot.
+  int slot = max_slot + 1;
+  for (int m = 0; m < n_moves && slot < EB_MAX_ACTIONS; m++) {
+    Move *move = move_list_get_move(ml, m);
+    const int score = equity_to_int(move_get_score(move));
+    const bool is_exch = (score == 0);
+    const int leave_len = (int)leaves[m].number_of_letters;
+    if (leave_len < 0 || leave_len >= 8) continue;
+    int bucket_count = 0;
+    ForceTargetSlot *bucket_slots = force_table_lookup_slots_by_shape(
+        ft, bag_count, leave_len, is_exch ? 1 : 0, &bucket_count);
+    uint32_t *bitmaps = force_table_lookup_bitmaps_by_shape(
+        ft, bag_count, leave_len, is_exch ? 1 : 0);
+    if (bucket_count == 0 || bitmaps == NULL) continue;
+    const uint32_t leave_bm = leave_bitmaps[m];
+    LeaveType move_type = LEAVE_TYPE_ALL;
+    bool move_type_known = false;
+    ForceTarget *matched = NULL;
+    for (int priority = FORCE_TARGET_PAIR;
+         priority >= FORCE_TARGET_STRATUM && matched == NULL; priority--) {
+      for (int t = 0; t < bucket_count; t++) {
+        const uint32_t req = bitmaps[t];
+        if ((leave_bm & req) != req) continue;
+        ForceTargetSlot *fs = &bucket_slots[t];
+        if (fs->deficit <= 0 || (int)fs->kind != priority) continue;
+        if (cur_diff < fs->diff_min || cur_diff > fs->diff_max) continue;
+        if (fs->subleave_count == 2 &&
+            fs->subleave_mls[0] == fs->subleave_mls[1] &&
+            leaves[m].array[fs->subleave_mls[0]] < 2) continue;
+        if (fs->exchange == 0 && fs->leave_length >= 3) {
+          if (!move_type_known) {
+            move_type = force_classify_leave(&leaves[m], ld);
+            move_type_known = true;
+          }
+          if (move_type != (LeaveType)fs->leave_type) continue;
+        }
+        matched = fs->cold;
+        break;
+      }
+    }
+    if (matched != NULL) {
+      move_copy(gr->eb_action_buf[slot], move);
+      gr->eb_action_present[slot] = true;
+      gr->eb_force_target_for_slot[slot] = matched;
+      slot++;
+    }
+  }
+  return slot - 1;
+}
+
 // Enumerate the action set for the current decision into gr->eb_action_buf.
 // Populated slots are flagged in gr->eb_action_present; returns the highest
 // populated slot index + 1 (so callers iterate 0..N-1 and check the flag),
@@ -1785,7 +1923,10 @@ static void eb_meta_restore(GameRunner *gr, const EbMetaSave *s) {
 // reproducible regardless of which actions a particular position offers.
 static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   // Clear presence flags first so any early return leaves a sane state.
-  for (int i = 0; i < EB_MAX_ACTIONS; i++) gr->eb_action_present[i] = false;
+  for (int i = 0; i < EB_MAX_ACTIONS; i++) {
+    gr->eb_action_present[i] = false;
+    gr->eb_force_target_for_slot[i] = NULL;
+  }
   gr->eb_natural_slot = -1;
 
   if (!gr->eb_active || gr->eb_n_snaps >= 6) return 0;
@@ -1962,6 +2103,15 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
     }
   }
 
+  // Force-table extension: append any active force-target slots so the DFS
+  // explores them too. Each appended slot's eb_force_target_for_slot[]
+  // points to the target; eb_emit_leaf credits the target's deficit when
+  // the snap is emitted.
+  if (w->shared_data->force_table != NULL &&
+      (w->shared_data->eb_force_turns_mask & (1 << turn))) {
+    max_slot = eb_append_force_target_slots(w, gr, ml, n_moves, max_slot);
+  }
+
   // Need at least 2 populated slots for the fork to be meaningful.
   int populated = 0;
   for (int i = 0; i <= max_slot; i++) {
@@ -2009,6 +2159,28 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
         gr->eb_snaps[i].natural_slot, gr->eb_snaps[i].move_score,
         gr->eb_divergence_turn, gr->eb_p1_rack_source,
         gr->eb_p1_force_kind, gr->eb_p2_force_kind);
+
+    // Force-target credit: if this snap's slot was force-table-driven,
+    // decrement the target's deficit using THIS leaf's outcome at the
+    // forced player's diff. (Forced slot diff = current cur_diff at the
+    // turn; for cycle turns with no plays before, cur_diff is always 0.)
+    const int snap_turn = gr->eb_snaps[i].turn_on_empty_board;
+    if (snap_turn >= 1 && snap_turn <= 6) {
+      ForceTarget *ft_target = gr->eb_snap_force_target[snap_turn];
+      if (ft_target != NULL && w->shared_data->force_table != NULL) {
+        const int p_idx = gr->eb_snaps[i].player_on_turn;
+        const int my_final =
+            equity_to_int(player_get_score(game_get_player(gr->game, p_idx)));
+        const int opp_final =
+            equity_to_int(
+                player_get_score(game_get_player(gr->game, 1 - p_idx)));
+        const bool is_tie = (my_final == opp_final);
+        const bool is_win = (my_final > opp_final);
+        // Diff at force-turn: 0 for cycle turns (no plays scored yet).
+        force_table_credit_game(w->shared_data->force_table, ft_target,
+                                0, is_win, is_tie);
+      }
+    }
   }
 }
 
@@ -2034,8 +2206,10 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     // n_actions is max_slot+1; iterate stable slot indices and skip absent.
     Move local_actions[EB_MAX_ACTIONS];
     bool local_present[EB_MAX_ACTIONS];
+    ForceTarget *local_force_target[EB_MAX_ACTIONS];
     for (int s = 0; s < n_actions; s++) {
       local_present[s] = gr->eb_action_present[s];
+      local_force_target[s] = gr->eb_force_target_for_slot[s];
       if (local_present[s]) {
         move_copy(&local_actions[s], gr->eb_action_buf[s]);
       }
@@ -2072,6 +2246,11 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
         }
         gr->eb_last_divergence_turn = fork_turn;
         gr->eb_n_divergences++;
+      }
+      // Track force-target attached to this slot at this turn (NULL if
+      // natural). eb_emit_leaf consults this per-snap to credit deficits.
+      if (fork_turn >= 1 && fork_turn <= 6) {
+        gr->eb_snap_force_target[fork_turn] = local_force_target[s];
       }
       game_runner_play_move(w, gr);
       gr->eb_forced_move = NULL;

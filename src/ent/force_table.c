@@ -650,6 +650,39 @@ ForceTable *force_table_create(const char *csv_path,
       t->by_shape_idx = idx;
     }
   }
+  // Sort each shape bucket by deficit DESCENDING (rarest cells first).
+  // Per-emit force matching iterates from front; rarer targets match
+  // preferentially. Unlike the prior deficit-asc sort (which caused
+  // quadratic-time depleted-entry scans), depleted entries get swapped to
+  // the back via the B5 active-count mechanism (see force_table_credit_*),
+  // so iteration only touches live entries.
+  // Sort ptrs first, then re-init slots and bitmaps from sorted ptrs.
+  for (int b = 0; b < FORCE_BAG_MAX; b++) {
+    for (int L = 0; L < FORCE_LEAVE_LEN_MAX; L++) {
+      for (int ex = 0; ex < FORCE_EXCHANGE_MAX; ex++) {
+        const int n = table->by_shape_count[b][L][ex];
+        if (n <= 1) continue;
+        ForceTarget **arr = table->by_shape_ptrs[b][L][ex];
+        // Insertion sort by deficit desc — bucket sizes are typically small.
+        for (int i = 1; i < n; i++) {
+          ForceTarget *key = arr[i];
+          int j = i - 1;
+          while (j >= 0 && arr[j]->deficit < key->deficit) {
+            arr[j + 1] = arr[j]; j--;
+          }
+          arr[j + 1] = key;
+        }
+        // Rebuild parallel slot/bitmap arrays in sorted order.
+        for (int i = 0; i < n; i++) {
+          ForceTarget *t = arr[i];
+          slot_init_from_target(&table->by_shape_slots[b][L][ex][i], t);
+          table->by_shape_bitmaps[b][L][ex][i] = required_bitmap_for_target(t);
+          t->by_shape_idx = i;
+        }
+      }
+    }
+  }
+
   // B5: initialize by_shape_active to full bucket size.
   for (int b = 0; b < FORCE_BAG_MAX; b++) {
     for (int L = 0; L < FORCE_LEAVE_LEN_MAX; L++) {
