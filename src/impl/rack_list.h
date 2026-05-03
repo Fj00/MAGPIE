@@ -5,6 +5,7 @@
 #include "../ent/klv.h"
 #include "../ent/rack.h"
 #include "../ent/xoshiro.h"
+#include "../util/io_util.h"
 
 typedef struct RackList RackList;
 
@@ -14,6 +15,9 @@ void rack_list_reset(RackList *rack_list, int target_rack_count);
 void rack_list_add_rack(RackList *rack_list, const Rack *rack, double equity);
 void rack_list_write_to_klv(RackList *rack_list, const LetterDistribution *ld,
                             KLV *klv);
+void rack_list_write_to_csv(const RackList *rack_list,
+                            const LetterDistribution *ld, const char *data_paths,
+                            const char *leaves_name, ErrorStack *error_stack);
 bool rack_list_get_rare_rack(RackList *rack_list, XoshiroPRNG *prng,
                              Rack *rack);
 int rack_list_get_target_rack_count(const RackList *rack_list);

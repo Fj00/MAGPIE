@@ -203,6 +203,24 @@ void postgen_prebroadcast_func(void *data) {
     log_fatal("leavegen failed to write klv to CSV");
   }
 
+  // Sibling export: per-7-tile-rack count/mean/combos table for offline
+  // consumption (e.g. rack-quality features in pass models). The KLV
+  // already-written above is derived from this same upstream data via
+  // conditional-probability weighting in rack_list_write_to_klv.
+  char *seven_tile_label =
+      get_formatted_string("_7tile_gen_%d", lg_shared_data->gens_completed);
+  char *seven_tile_csv_name =
+      insert_before_dot(lg_shared_data->klv->name, seven_tile_label);
+  rack_list_write_to_csv(lg_shared_data->rack_list, lg_shared_data->ld,
+                         lg_shared_data->data_paths, seven_tile_csv_name,
+                         error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    error_stack_print_and_reset(error_stack);
+    log_fatal("leavegen failed to write 7-tile rack CSV");
+  }
+  free(seven_tile_csv_name);
+  free(seven_tile_label);
+
   // Get total game data.
   autoplay_results_consolidate(lg_shared_data->autoplay_results_list,
                                shared_data->num_threads,

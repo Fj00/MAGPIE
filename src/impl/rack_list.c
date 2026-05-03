@@ -6,6 +6,7 @@
 #include "../def/kwg_defs.h"
 #include "../def/letter_distribution_defs.h"
 #include "../def/rack_defs.h"
+#include "../ent/data_filepaths.h"
 #include "../ent/dictionary_word.h"
 #include "../ent/encoded_rack.h"
 #include "../ent/equity.h"
@@ -14,8 +15,10 @@
 #include "../ent/letter_distribution.h"
 #include "../ent/rack.h"
 #include "../ent/xoshiro.h"
+#include "../str/rack_string.h"
 #include "../util/io_util.h"
 #include "../util/math_util.h"
+#include "../util/string_util.h"
 #include "kwg_maker.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -467,4 +470,35 @@ const EncodedRack *rack_list_get_encoded_rack(const RackList *rack_list,
 
 const KLV *rack_list_get_klv(const RackList *rack_list) {
   return rack_list->klv;
+}
+
+// Writes one CSV row per 7-tile rack composition tracked by the RackList.
+// Columns: rack,count,mean,total_combos. Order is the same as
+// racks_ordered_by_index (alphabetical 7-tile compositions).
+void rack_list_write_to_csv(const RackList *rack_list,
+                            const LetterDistribution *ld, const char *data_paths,
+                            const char *leaves_name,
+                            ErrorStack *error_stack) {
+  char *filename = data_filepaths_get_writable_filename(
+      data_paths, leaves_name, DATA_FILEPATH_TYPE_LEAVES, error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    return;
+  }
+
+  const int dist_size = ld_get_size(ld);
+  Rack rack;
+  rack_set_dist_size(&rack, dist_size);
+  StringBuilder *sb = string_builder_create();
+  for (int i = 0; i < rack_list->number_of_racks; i++) {
+    const RackListItem *rli = rack_list->racks_ordered_by_index[i];
+    rack_decode(&rli->encoded_rack, &rack);
+    string_builder_add_rack(sb, &rack, ld, true);
+    string_builder_add_formatted_string(sb, ",%lu,%f,%lu\n",
+                                        (unsigned long)rli->count, rli->mean,
+                                        (unsigned long)rli->total_combos);
+  }
+
+  write_string_to_file(filename, "w", string_builder_peek(sb), error_stack);
+  free(filename);
+  string_builder_destroy(sb);
 }
