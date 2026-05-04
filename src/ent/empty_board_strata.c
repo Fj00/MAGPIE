@@ -95,15 +95,17 @@ void empty_board_strata_destroy(EmptyBoardStrataRecorder *r) {
   free(r);
 }
 
-// cons/vowel/mixed for 3-6 tile leaves, else "all". Y as consonant; blank
-// (?) ignored in the count.
+// cons/vowel/mixed for 3-6 tile leaves, else "all". Y counted as a vowel
+// (matches force_table.c::force_classify_leave and the Python aggregator's
+// VOWELS = AEIOUY); blank (?) ignored in the count.
 static int ebs_classify_type(const char *leave, int leave_len) {
   if (leave_len < 3 || leave_len > 6) return 0;  // "all"
   int vc = 0, cc = 0;
   for (int i = 0; i < leave_len; i++) {
     char c = leave[i];
     if (c == '?') continue;
-    if (c == 'A' || c == 'E' || c == 'I' || c == 'O' || c == 'U') vc++;
+    if (c == 'A' || c == 'E' || c == 'I' || c == 'O' || c == 'U' ||
+        c == 'Y') vc++;
     else cc++;
   }
   if (vc == 0) return 1;   // cons
