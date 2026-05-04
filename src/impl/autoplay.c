@@ -313,6 +313,7 @@ typedef struct AutoplayWorker {
   // before the target-matching loop. Avoids 46M get_leave_for_move calls/turn
   // in the worst case (B1 optimization).
   Rack *force_leaves;
+  uint32_t *force_leave_bitmaps;
   int force_leaves_capacity;
 } AutoplayWorker;
 
@@ -349,16 +350,30 @@ AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
       move_list_create(ap_args->p2_sim_args.num_plays);
   autoplay_worker->force_move_list = NULL;
   autoplay_worker->force_leaves = NULL;
+  autoplay_worker->force_leave_bitmaps = NULL;
   autoplay_worker->force_leaves_capacity = 0;
   if (shared_data->force_table) {
-    autoplay_worker->force_move_list = move_list_create(2000);
-    autoplay_worker->force_leaves_capacity = 2000;
+    int cap = 32768;
+    const char *cap_env = getenv("MAGPIE_FORCE_MOVE_SCAN_CAP");
+    if (cap_env != NULL) {
+      int v = atoi(cap_env);
+      if (v >= 100 && v <= 1000000) cap = v;
+    }
+    autoplay_worker->force_move_list = move_list_create(cap);
+    autoplay_worker->force_leaves_capacity = cap;
     autoplay_worker->force_leaves =
-        malloc_or_die(sizeof(Rack) * (size_t)autoplay_worker->force_leaves_capacity);
+        malloc_or_die(sizeof(Rack) * (size_t)cap);
+    autoplay_worker->force_leave_bitmaps =
+        malloc_or_die(sizeof(uint32_t) * (size_t)cap);
   }
   autoplay_worker->eb_move_list = NULL;
   if (shared_data->eb_branch_active) {
-    autoplay_worker->eb_move_list = move_list_create(2000);
+    // Sized to match force_leaves_capacity when force-table is active so the
+    // T6 force-target append can consider plays past the top-2000 by equity
+    // (rare-leave plays often sit much deeper in the equity-sorted list).
+    int eb_cap =
+        autoplay_worker->force_leaves_capacity > 0 ? autoplay_worker->force_leaves_capacity : 2000;
+    autoplay_worker->eb_move_list = move_list_create(eb_cap);
   }
 
   autoplay_worker->sim_results = NULL;
@@ -397,6 +412,7 @@ void autoplay_worker_destroy(AutoplayWorker *autoplay_worker) {
   move_list_destroy(autoplay_worker->force_move_list);
   move_list_destroy(autoplay_worker->eb_move_list);
   free(autoplay_worker->force_leaves);
+  free(autoplay_worker->force_leave_bitmaps);
   free(autoplay_worker);
 }
 
@@ -1158,7 +1174,7 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
   // B1: pre-compute leaves for every move once. Also compute each leave's
   // tile bitmap for the per-target bitmap pre-filter.
   Rack *leaves = autoplay_worker->force_leaves;
-  uint32_t leave_bitmaps[2048] = {0};
+  uint32_t *leave_bitmaps = autoplay_worker->force_leave_bitmaps;
   for (int m = 0; m < n_moves; m++) {
     rack_set_dist_size(&leaves[m], ld_size);
     Move *move = move_list_get_move(ml, m);
@@ -1205,7 +1221,11 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
         if (slot->deficit <= 0 || (int)slot->kind != priority) {
           continue;
         }
-        if (cur_diff < slot->diff_min || cur_diff > slot->diff_max) {
+        // Aggregator stores diff = pre_action_diff + move_score (post-action,
+        // from the perspective of the player on turn). Match against same.
+        // For exchanges/passes score==0 so eff_diff == cur_diff.
+        const int eff_diff = cur_diff + score;
+        if (eff_diff < slot->diff_min || eff_diff > slot->diff_max) {
           continue;
         }
         if (slot->subleave_count == 2 &&
@@ -1819,13 +1839,41 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
   if (!any_active) return max_slot;
   (void)targets;
 
+  // Rack-level early reject: compute the player's rack bitmap once and
+  // check whether ANY active target's required-leave bitmap is a subset
+  // of the rack. If no target is reachable from this rack, the per-move
+  // get_leave_for_move scan is pure waste.
+  const int p_idx_pre =
+      game_get_player_on_turn_index(game);
+  const Rack *p_rack =
+      player_get_rack(game_get_player(game, p_idx_pre));
+  uint32_t rack_bm = 0;
+  for (uint16_t i = 0; i < p_rack->dist_size && i < 32; i++) {
+    if (p_rack->array[i] > 0) rack_bm |= ((uint32_t)1) << i;
+  }
+  bool any_reachable = false;
+  for (int b_len = 0; b_len < 8 && !any_reachable; b_len++) {
+    for (int b_ex = 0; b_ex < 2 && !any_reachable; b_ex++) {
+      int bc = 0;
+      ForceTargetSlot *bsl = force_table_lookup_slots_by_shape(
+          ft, bag_count, b_len, b_ex, &bc);
+      uint32_t *bbm = force_table_lookup_bitmaps_by_shape(
+          ft, bag_count, b_len, b_ex);
+      if (!bsl || !bbm) continue;
+      for (int t = 0; t < bc; t++) {
+        if (bsl[t].deficit <= 0) continue;
+        if ((rack_bm & bbm[t]) == bbm[t]) { any_reachable = true; break; }
+      }
+    }
+  }
+  if (!any_reachable) return max_slot;
+
   // Compute leaves + bitmaps for every move (mirrors try_forced_move).
   const LetterDistribution *ld = game_get_ld(game);
   const uint16_t ld_size = ld_get_size(ld);
   Rack *leaves = w->force_leaves;
   if (n_moves > w->force_leaves_capacity) n_moves = w->force_leaves_capacity;
-  uint32_t leave_bitmaps[2048] = {0};
-  if (n_moves > 2048) n_moves = 2048;
+  uint32_t *leave_bitmaps = w->force_leave_bitmaps;
   for (int m = 0; m < n_moves; m++) {
     rack_set_dist_size(&leaves[m], ld_size);
     Move *move = move_list_get_move(ml, m);
@@ -1870,7 +1918,11 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
         if ((leave_bm & req) != req) continue;
         ForceTargetSlot *fs = &bucket_slots[t];
         if (fs->deficit <= 0 || (int)fs->kind != priority) continue;
-        if (cur_diff < fs->diff_min || cur_diff > fs->diff_max) continue;
+        // Aggregator stores diff = pre_action_diff + move_score (post-action,
+        // from the perspective of the player on turn). Match against same.
+        // For exchanges/passes score==0 so eff_diff == cur_diff.
+        const int eff_diff = cur_diff + score;
+        if (eff_diff < fs->diff_min || eff_diff > fs->diff_max) continue;
         if (fs->subleave_count == 2 &&
             fs->subleave_mls[0] == fs->subleave_mls[1] &&
             leaves[m].array[fs->subleave_mls[0]] < 2) continue;
@@ -2176,9 +2228,11 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
                 player_get_score(game_get_player(gr->game, 1 - p_idx)));
         const bool is_tie = (my_final == opp_final);
         const bool is_win = (my_final > opp_final);
-        // Diff at force-turn: 0 for cycle turns (no plays scored yet).
+        // Credit at the post-action diff = pre_action_diff (0 in cycle) +
+        // this snap's move_score. Matches the aggregator and bucketing
+        // convention so credits land in the correct diff bucket.
         force_table_credit_game(w->shared_data->force_table, ft_target,
-                                0, is_win, is_tie);
+                                gr->eb_snaps[i].move_score, is_win, is_tie);
       }
     }
   }
