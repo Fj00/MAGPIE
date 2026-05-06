@@ -473,8 +473,11 @@ const KLV *rack_list_get_klv(const RackList *rack_list) {
 }
 
 // Writes one CSV row per 7-tile rack composition tracked by the RackList.
-// Columns: rack,count,mean,total_combos. Order is the same as
-// racks_ordered_by_index (alphabetical 7-tile compositions).
+// Columns: rack,count,mean,total_combos. The mean is centered by subtracting
+// the combinatorically-weighted average across all 7-tile racks (same baseline
+// rack_list_write_to_klv applies to the 1-6 leaves), so values are comparable
+// to the existing KLV leaves CSV. Order matches racks_ordered_by_index
+// (alphabetical 7-tile compositions).
 void rack_list_write_to_csv(const RackList *rack_list,
                             const LetterDistribution *ld, const char *data_paths,
                             const char *leaves_name,
@@ -485,6 +488,14 @@ void rack_list_write_to_csv(const RackList *rack_list,
     return;
   }
 
+  double weighted_sum = 0.0;
+  for (int i = 0; i < rack_list->number_of_racks; i++) {
+    const RackListItem *rli = rack_list->racks_ordered_by_index[i];
+    weighted_sum += rli->mean * (double)rli->total_combos;
+  }
+  const double average_equity =
+      weighted_sum / (double)rack_list->total_combos_sum;
+
   const int dist_size = ld_get_size(ld);
   Rack rack;
   rack_set_dist_size(&rack, dist_size);
@@ -494,7 +505,8 @@ void rack_list_write_to_csv(const RackList *rack_list,
     rack_decode(&rli->encoded_rack, &rack);
     string_builder_add_rack(sb, &rack, ld, true);
     string_builder_add_formatted_string(sb, ",%lu,%f,%lu\n",
-                                        (unsigned long)rli->count, rli->mean,
+                                        (unsigned long)rli->count,
+                                        rli->mean - average_equity,
                                         (unsigned long)rli->total_combos);
   }
 
