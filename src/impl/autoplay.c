@@ -18,7 +18,6 @@
 #include "../ent/data_filepaths.h"
 #include "../ent/equity.h"
 #include "../ent/force_table.h"
-#include "../ent/opener_lookup.h"
 #include "../ent/game.h"
 #include "../ent/empty_board.h"
 #include "../ent/empty_board_strata.h"
@@ -100,14 +99,6 @@ typedef struct AutoplaySharedData {
   // Bit N set = active at turn N. Set by MAGPIE_EB_FORCE_TURNS env var
   // (comma-separated turn list, e.g. "6" or "5,6"). Requires force_table.
   int eb_force_turns_mask;
-  // Slice 2d: precomputed opener movegen lookup. When loaded (via env var
-  // MAGPIE_OPENER_LOOKUP), eb_enumerate_actions skips per-turn movegen and
-  // populates the move list from the mmap'd binary table. The K-way branching
-  // and force-target slot allocation downstream consume the lookup-populated
-  // list identically. Defensive fallback: NULL or rack-not-found → fall back
-  // to generate_moves(). All EB cycle turns (T2-T6) are guaranteed empty
-  // board, so one table covers the whole cycle.
-  OpenerLookup *opener_lookup;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -490,16 +481,6 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
       shared_data->force_table != NULL &&
       getenv("MAGPIE_FORCE_STOP_ON_EXHAUST") != NULL;
 
-  // Slice 2d: precomputed opener movegen table (mmap). Loaded once, shared
-  // across all threads. Failure → NULL → eb_enumerate_actions falls back to
-  // per-turn movegen. Skip silently if env var not set.
-  shared_data->opener_lookup = NULL;
-  const char *ol_path = getenv("MAGPIE_OPENER_LOOKUP");
-  if (ol_path && ol_path[0] != '\0') {
-    shared_data->opener_lookup =
-        opener_lookup_create(ol_path, args->game_args->ld);
-  }
-
   shared_data->opening_pass_table = NULL;
   const char *op_path = getenv("MAGPIE_OPENING_PASS_TABLE");
   if (op_path && op_path[0] != '\0') {
@@ -595,7 +576,6 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
     }
   }
   force_table_destroy(shared_data->force_table);
-  opener_lookup_destroy(shared_data->opener_lookup);
   if (shared_data->opening_pass_table) {
     fprintf(stderr,
             "opening_pass: %d racks; remaining target games = %lld\n",
@@ -2042,71 +2022,21 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   const bool include_pass = is_pass_rack || turn >= 5;
 
   MoveList *ml = w->eb_move_list;
-  int n_moves = -1;
-
-  // Slice 2d: try precomputed opener lookup first. Empty board guaranteed
-  // by the line ~1933 board_get_tiles_played==0 guard. Fall back to full
-  // movegen if the table isn't loaded or the rack is missing (defensive).
-  if (w->shared_data->opener_lookup != NULL) {
-    char canon_key[28];
-    Rack *p_rack = player_get_rack(game_get_player(gr->game, p_idx));
-    opener_lookup_canonical_rack(p_rack, w->shared_data->ld, canon_key);
-    int n_lookup = 0;
-    const OpenerPlay *plays =
-        opener_lookup_query(w->shared_data->opener_lookup, canon_key,
-                            &n_lookup);
-    if (plays != NULL && n_lookup > 0 &&
-        n_lookup <= move_list_get_capacity(ml)) {
-      // Populate ml from precomputed plays. Equity in binary is microequity
-      // (×1M); magpie's Equity unit is milliequity (×1000). Divide by 1000.
-      move_list_reset(ml);
-      for (int i = 0; i < n_lookup; i++) {
-        const OpenerPlay *p = &plays[i];
-        Move *mv = move_list_get_move(ml, i);
-        const int32_t equity_q = (int32_t)p->equity_q_bits;
-        const Equity equity = (Equity)(equity_q / 1000);
-        if (p->action_type == 0) {  // play
-          // word_mls already has high-bit-set blanks per magpie convention.
-          MachineLetter strip[15];
-          for (int j = 0; j < p->word_len; j++) strip[j] = p->word_mls[j];
-          move_set_all(mv, strip, /*leftstrip=*/0,
-                       /*rightstrip=*/p->word_len - 1,
-                       /*score=*/int_to_equity(p->score),
-                       p->row_start, p->col_start,
-                       /*tiles_played=*/p->word_len,
-                       p->dir, GAME_EVENT_TILE_PLACEMENT_MOVE,
-                       /*leave_value=*/equity - int_to_equity(p->score));
-        } else {  // exchange
-          MachineLetter strip[7];
-          for (int j = 0; j < p->word_len; j++) strip[j] = p->word_mls[j];
-          move_set_all(mv, strip, 0, p->word_len - 1,
-                       /*score=*/0, 0, 0, p->word_len, 0,
-                       GAME_EVENT_EXCHANGE,
-                       /*leave_value=*/equity);
-        }
-      }
-      ml->count = n_lookup;
-      n_moves = n_lookup;
-    }
-  }
-
-  if (n_moves < 0) {
-    const MoveGenArgs gen_args = {
-        .game = gr->game,
-        .move_list = ml,
-        .move_record_type = MOVE_RECORD_ALL,
-        .move_sort_type = MOVE_SORT_EQUITY,
-        .override_kwg = NULL,
-        .thread_index = w->worker_index,
-        .eq_margin_movegen = 0,
-        .target_equity = EQUITY_MAX_VALUE,
-        .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
-        .tiles_played_bv = NULL,
-        .initial_tiles_bv = 0};
-    generate_moves(&gen_args);
-    n_moves = move_list_get_count(ml);
-    move_list_sort_moves(ml);
-  }
+  const MoveGenArgs gen_args = {
+      .game = gr->game,
+      .move_list = ml,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_EQUITY,
+      .override_kwg = NULL,
+      .thread_index = w->worker_index,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+      .tiles_played_bv = NULL,
+      .initial_tiles_bv = 0};
+  generate_moves(&gen_args);
+  const int n_moves = move_list_get_count(ml);
+  move_list_sort_moves(ml);
 
   bool has_play = false;
   for (int m = 0; m < n_moves; m++) {
