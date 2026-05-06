@@ -1828,6 +1828,15 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
   ForceTable *ft = w->shared_data->force_table;
   if (!ft || !w->force_leaves || n_moves == 0) return max_slot;
   Game *game = gr->game;
+  // Force-table cell diff ranges are computed from the bag=93 opener
+  // aggregate (cur_diff_pre = 0; recorded diff = score). At T6 of K-way
+  // branched paths where T2-T5 included non-pass plays, the board has
+  // tiles and cur_diff != 0, so eff_diff = cur_diff + score never falls
+  // in the cell's narrow range. Only fire force-table at the all-pass
+  // (board-empty) leaf so the cell ranges align with the opener convention.
+  if (board_get_tiles_played(game_get_board(game)) > 0) {
+    return max_slot;
+  }
   const int bag_count = bag_get_letters(game_get_bag(game)) + (RACK_SIZE);
   int target_count = 0;
   ForceTarget **targets = force_table_lookup(ft, bag_count, &target_count);
