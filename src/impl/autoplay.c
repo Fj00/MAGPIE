@@ -1892,27 +1892,41 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
       equity_to_int(player_get_score(game_get_player(game, 1 - p_idx)));
   const int cur_diff = my_score - opp_score;
 
-  // For each move, find the FIRST matching active target by priority
-  // (PAIR > TILE > STRATUM). If found, append as a new DFS slot.
+  // Match in PAIR-then-TILE-then-STRATUM priority order ACROSS all moves
+  // (mirrors try_forced_move's outer-loop priority). This guarantees rare-
+  // pair targets get first dibs on the limited slot budget; common stratum
+  // matches don't crowd them out by virtue of appearing earlier in the
+  // equity-sorted move list.
   int slot = max_slot + 1;
-  for (int m = 0; m < n_moves && slot < EB_MAX_ACTIONS; m++) {
-    Move *move = move_list_get_move(ml, m);
-    const int score = equity_to_int(move_get_score(move));
-    const bool is_exch = (score == 0);
-    const int leave_len = (int)leaves[m].number_of_letters;
-    if (leave_len < 0 || leave_len >= 8) continue;
-    int bucket_count = 0;
-    ForceTargetSlot *bucket_slots = force_table_lookup_slots_by_shape(
-        ft, bag_count, leave_len, is_exch ? 1 : 0, &bucket_count);
-    uint32_t *bitmaps = force_table_lookup_bitmaps_by_shape(
-        ft, bag_count, leave_len, is_exch ? 1 : 0);
-    if (bucket_count == 0 || bitmaps == NULL) continue;
-    const uint32_t leave_bm = leave_bitmaps[m];
-    LeaveType move_type = LEAVE_TYPE_ALL;
-    bool move_type_known = false;
-    ForceTarget *matched = NULL;
-    for (int priority = FORCE_TARGET_PAIR;
-         priority >= FORCE_TARGET_STRATUM && matched == NULL; priority--) {
+  // Per-move scratch buffers for the priority-first-then-move loop. Sized
+  // to the same cap as force_leaves; capped here just defensively so the
+  // stack doesn't blow up if the caller ever exceeds the cap.
+  enum { PRIORITY_LOOP_CAP = 32768 };
+  if (n_moves > PRIORITY_LOOP_CAP) n_moves = PRIORITY_LOOP_CAP;
+  static _Thread_local bool used_move[PRIORITY_LOOP_CAP];
+  static _Thread_local int8_t move_type_cache[PRIORITY_LOOP_CAP];
+  for (int i = 0; i < n_moves; i++) {
+    used_move[i] = false;
+    move_type_cache[i] = -1;
+  }
+
+  for (int priority = FORCE_TARGET_PAIR;
+       priority >= FORCE_TARGET_STRATUM && slot < EB_MAX_ACTIONS; priority--) {
+    for (int m = 0; m < n_moves && slot < EB_MAX_ACTIONS; m++) {
+      if (used_move[m]) continue;
+      Move *move = move_list_get_move(ml, m);
+      const int score = equity_to_int(move_get_score(move));
+      const bool is_exch = (score == 0);
+      const int leave_len = (int)leaves[m].number_of_letters;
+      if (leave_len < 0 || leave_len >= 8) continue;
+      int bucket_count = 0;
+      ForceTargetSlot *bucket_slots = force_table_lookup_slots_by_shape(
+          ft, bag_count, leave_len, is_exch ? 1 : 0, &bucket_count);
+      uint32_t *bitmaps = force_table_lookup_bitmaps_by_shape(
+          ft, bag_count, leave_len, is_exch ? 1 : 0);
+      if (bucket_count == 0 || bitmaps == NULL) continue;
+      const uint32_t leave_bm = leave_bitmaps[m];
+      ForceTarget *matched = NULL;
       for (int t = 0; t < bucket_count; t++) {
         const uint32_t req = bitmaps[t];
         if ((leave_bm & req) != req) continue;
@@ -1927,21 +1941,22 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
             fs->subleave_mls[0] == fs->subleave_mls[1] &&
             leaves[m].array[fs->subleave_mls[0]] < 2) continue;
         if (fs->exchange == 0 && fs->leave_length >= 3) {
-          if (!move_type_known) {
-            move_type = force_classify_leave(&leaves[m], ld);
-            move_type_known = true;
+          if (move_type_cache[m] < 0) {
+            move_type_cache[m] = (int8_t)force_classify_leave(&leaves[m], ld);
           }
-          if (move_type != (LeaveType)fs->leave_type) continue;
+          if ((LeaveType)move_type_cache[m] != (LeaveType)fs->leave_type)
+            continue;
         }
         matched = fs->cold;
         break;
       }
-    }
-    if (matched != NULL) {
-      move_copy(gr->eb_action_buf[slot], move);
-      gr->eb_action_present[slot] = true;
-      gr->eb_force_target_for_slot[slot] = matched;
-      slot++;
+      if (matched != NULL) {
+        move_copy(gr->eb_action_buf[slot], move);
+        gr->eb_action_present[slot] = true;
+        gr->eb_force_target_for_slot[slot] = matched;
+        used_move[m] = true;
+        slot++;
+      }
     }
   }
   return slot - 1;
