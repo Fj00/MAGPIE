@@ -39,6 +39,12 @@ typedef struct ForceTarget {
   // Cold fields — only touched on a candidate match or during table
   // maintenance.
   int bag;
+  // Natural-draw probability of any rack producing this cell (sum_p_rack
+  // from cell_rarity.csv, summed over the bucket's diff range). Lower =
+  // rarer. Used as the secondary sort key in shape-bucket allocator so
+  // rare cells get first dibs on the per-game slot budget. Defaults to a
+  // very large number when the column is absent (treated as "common").
+  double rarity_score;
   // B5: per-bucket index pointers — used to swap-to-back when deficit hits 0.
   // Lookups return only the active prefix of each bucket (entries with
   // deficit > 0 are kept at indices 0..active-1; satisfied entries get pushed

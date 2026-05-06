@@ -502,6 +502,17 @@ ForceTable *force_table_create(const char *csv_path,
       diff_min = atoi(fields[10]);
       diff_max = atoi(fields[11]);
     }
+    // Optional rarity_score column (1-indexed col 13). Lower = rarer cell.
+    // Defaults to a very large number so cells without rarity data sort
+    // AFTER cells with known small rarity within the same deficit tier.
+    double rarity_score = 1e30;
+    if (n >= 13) {
+      char *endp = NULL;
+      double parsed = strtod(fields[12], &endp);
+      if (endp != fields[12] && parsed > 0) {
+        rarity_score = parsed;
+      }
+    }
 
     if (table->num_targets == table->capacity) {
       table->capacity *= 2;
@@ -520,6 +531,7 @@ ForceTable *force_table_create(const char *csv_path,
     t->deficit = deficit;
     t->diff_min = diff_min;
     t->diff_max = diff_max;
+    t->rarity_score = rarity_score;
 
     if (kind == FORCE_TARGET_TILE) {
       if (strlen(subleave) != 1) {
@@ -650,24 +662,34 @@ ForceTable *force_table_create(const char *csv_path,
       t->by_shape_idx = idx;
     }
   }
-  // Sort each shape bucket by deficit DESCENDING (rarest cells first).
-  // Per-emit force matching iterates from front; rarer targets match
-  // preferentially. Unlike the prior deficit-asc sort (which caused
-  // quadratic-time depleted-entry scans), depleted entries get swapped to
-  // the back via the B5 active-count mechanism (see force_table_credit_*),
-  // so iteration only touches live entries.
-  // Sort ptrs first, then re-init slots and bitmaps from sorted ptrs.
+  // Sort each shape bucket by composite key:
+  //   primary:   deficit DESC  (largest deficit first — most need attention)
+  //   secondary: rarity_score ASC  (rarest cells first within deficit tier)
+  //
+  // Per-emit force matching iterates from front; rarer targets at the same
+  // deficit level get first dibs on the limited per-game slot budget.
+  // Without rarity tiebreak, hard-to-construct cells like L5_cons JQ@16
+  // got crowded out by easier deficit=100 peers and stayed at deficit=100
+  // forever (verified against eb_run_06b residuals).
+  //
+  // Unlike the prior deficit-asc sort (which caused quadratic-time
+  // depleted-entry scans), depleted entries get swapped to the back via
+  // the B5 active-count mechanism (see force_table_credit_*), so iteration
+  // only touches live entries.
   for (int b = 0; b < FORCE_BAG_MAX; b++) {
     for (int L = 0; L < FORCE_LEAVE_LEN_MAX; L++) {
       for (int ex = 0; ex < FORCE_EXCHANGE_MAX; ex++) {
         const int n = table->by_shape_count[b][L][ex];
         if (n <= 1) continue;
         ForceTarget **arr = table->by_shape_ptrs[b][L][ex];
-        // Insertion sort by deficit desc — bucket sizes are typically small.
+        // Insertion sort by (deficit DESC, rarity ASC) — bucket sizes small.
         for (int i = 1; i < n; i++) {
           ForceTarget *key = arr[i];
           int j = i - 1;
-          while (j >= 0 && arr[j]->deficit < key->deficit) {
+          while (j >= 0 &&
+                 (arr[j]->deficit < key->deficit ||
+                  (arr[j]->deficit == key->deficit &&
+                   arr[j]->rarity_score > key->rarity_score))) {
             arr[j + 1] = arr[j]; j--;
           }
           arr[j + 1] = key;
@@ -727,7 +749,7 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
     return;
   }
   fprintf(f, "kind,bag,length,type,exchange,subleave,current,target,deficit,"
-             "forced_games_estimate,diff_min,diff_max\n");
+             "forced_games_estimate,diff_min,diff_max,rarity_score\n");
   const char *kind_names[] = {"stratum", "tile", "pair"};
   const char *type_names[] = {"all", "cons", "mixed", "vowel"};
   int rows_written = 0;
@@ -747,11 +769,12 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
     }
     // current/target/forced_games_estimate aren't tracked precisely after
     // runtime; emit 0 placeholders except deficit (the reliable field).
-    // Diff range echoed back as-loaded.
-    fprintf(f, "%s,%d,%d,%s,%d,%s,0,0,%lld,0,%d,%d\n",
+    // Diff range and rarity_score echoed back as-loaded.
+    fprintf(f, "%s,%d,%d,%s,%d,%s,0,0,%lld,0,%d,%d,%.6e\n",
             kind_names[t->kind], t->bag, t->leave_length,
             type_names[t->leave_type], t->exchange, subleave,
-            (long long)t->deficit, t->diff_min, t->diff_max);
+            (long long)t->deficit, t->diff_min, t->diff_max,
+            t->rarity_score);
     rows_written++;
   }
   fclose(f);
