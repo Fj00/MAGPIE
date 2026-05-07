@@ -83,6 +83,16 @@ typedef struct AutoplaySharedData {
   OpeningPassTable *opening_pass_table;
   bool stop_on_opening_pass_complete;
   PassCycleTable *pass_cycle_table;
+  // Rare-rack injection pool. Loaded from MAGPIE_EB_RARE_RACK_POOL=path.csv
+  // (same format as MAGPIE_PASS_CYCLE_RACKS: rack,weight,is_pass — but
+  // is_pass=0 for all entries since rare racks are play-favorable by
+  // selection). When set, every 5th iter (iter_count % 5 == 4) overrides
+  // the active player's rack_source to 2 (rare) and force_kind to 0
+  // (pass), so the rare rack rides through to T5/T6 unchanged.
+  PassCycleTable *rare_rack_pool;
+  // 0 = P2 receives rare (T6 coverage), 1 = P1 receives rare (T5
+  // coverage). Set by MAGPIE_EB_RARE_TARGET=p1|p2. Default p2.
+  int rare_target_player;
   EmptyBoardRecorder *empty_board_recorder;
   EmptyBoardStrataRecorder *empty_board_strata_recorder;
   // Slice 2: K-way fork branching at empty-board cycle-alive turns. Activated
@@ -504,6 +514,27 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
         pass_cycle_table_create(pc_racks, pc_out);
   }
 
+  shared_data->rare_rack_pool = NULL;
+  shared_data->rare_target_player = 1;  // default: P2 (T6 coverage)
+  const char *rare_pool = getenv("MAGPIE_EB_RARE_RACK_POOL");
+  if (rare_pool && rare_pool[0] != '\0') {
+    // Reuse the pass_cycle file format: rack,weight,is_pass. Output path
+    // is /dev/null since we don't record per rare-pool game outcomes.
+    shared_data->rare_rack_pool =
+        pass_cycle_table_create(rare_pool, "/dev/null");
+    if (shared_data->rare_rack_pool) {
+      const char *rt = getenv("MAGPIE_EB_RARE_TARGET");
+      if (rt && (rt[0] == 'p' || rt[0] == 'P') &&
+          (rt[1] == '1')) {
+        shared_data->rare_target_player = 0;
+      }
+      fprintf(stderr,
+              "empty_board: rare-rack pool ENABLED (target=%s, every 5th "
+              "iter overrides source=2, force=pass)\n",
+              shared_data->rare_target_player == 0 ? "P1" : "P2");
+    }
+  }
+
   shared_data->empty_board_recorder = NULL;
   const char *eb_out = getenv("MAGPIE_EMPTY_BOARD_OUT");
   if (eb_out && eb_out[0] != '\0') {
@@ -589,6 +620,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   }
   opening_pass_table_destroy(shared_data->opening_pass_table);
   pass_cycle_table_destroy(shared_data->pass_cycle_table);
+  pass_cycle_table_destroy(shared_data->rare_rack_pool);
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
   free(shared_data);
@@ -831,30 +863,50 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   game_runner->pass_cycle_abandoned = false;
   if (!used_forced_rack && game_runner->shared_data->pass_cycle_table) {
     PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
+    PassCycleTable *rrp = game_runner->shared_data->rare_rack_pool;
     const int p1 = starting_player_index;
     const int p2 = 1 - starting_player_index;
-    // P1: always pool-sampled. Rejection-sample to match eb_p1_force_kind
-    // so each (is_pass=1, is_pass=0) class is equally represented despite
-    // the pool's natural skew.
-    const int p1_target_is_pass =
-        (game_runner->eb_p1_force_kind == 0) ? 1 : 0;
+    // P1: pool by default. If eb_p1_rack_source == 2 and rare pool is
+    // loaded, sample P1 from rare pool instead (forced pass at T1 via
+    // eb_p1_force_kind=0; classification skipped — rare racks are play-
+    // favorable by selection but the cycle requires them to pass).
     const char *p1_rack = NULL;
-    pass_cycle_sample_p1_target_is_pass(
-        pct, iter_output->iter_count, p1_target_is_pass, &p1_rack);
+    if (game_runner->eb_p1_rack_source == 2 && rrp != NULL) {
+      pass_cycle_sample_p1(rrp, iter_output->iter_count, &p1_rack);
+    } else {
+      const int p1_target_is_pass =
+          (game_runner->eb_p1_force_kind == 0) ? 1 : 0;
+      pass_cycle_sample_p1_target_is_pass(
+          pct, iter_output->iter_count, p1_target_is_pass, &p1_rack);
+    }
     if (p1_rack != NULL) {
       const int n1 = draw_rack_string_from_bag(game, p1, p1_rack);
       if (n1 > 0) {
         // Override force_kind from the actual sampled rack's is_pass —
         // rejection sampling can fall back to an unfiltered sample.
-        const int is_pass = pass_cycle_lookup_is_pass(pct, p1_rack);
-        game_runner->eb_p1_force_kind = (is_pass == 1) ? 0 : 1;
+        // For rare-source P1 we keep force_kind=0 (pass) regardless.
+        if (game_runner->eb_p1_rack_source != 2) {
+          const int is_pass = pass_cycle_lookup_is_pass(pct, p1_rack);
+          game_runner->eb_p1_force_kind = (is_pass == 1) ? 0 : 1;
+        }
 
-        // P2 rack: pool (rejection-sampled by eb_p2_force_kind) or
-        // bag-random per eb_p2_rack_source. Pool variant gives clean
-        // is_pass/is_pass=0 P2 racks; bag variant exposes play-prone
-        // P2 racks to the T2 force-pass/exch counterfactual.
+        // P2 rack: pool (rejection-sampled by eb_p2_force_kind), bag-
+        // random, or rare-pool (eb_p2_rack_source = 0|1|2). Rare-pool P2
+        // forces pass at T2 regardless of eb_p2_force_kind.
         bool p2_drawn = false;
-        if (game_runner->eb_p2_rack_source == 0) {
+        if (game_runner->eb_p2_rack_source == 2 && rrp != NULL) {
+          const char *p2_rack = NULL;
+          pass_cycle_sample_p1(rrp,
+                               iter_output->iter_count ^ 0xa5a5a5a5a5a5a5a5ULL,
+                               &p2_rack);
+          if (p2_rack != NULL) {
+            const int n2 = draw_rack_string_from_bag(game, p2, p2_rack);
+            if (n2 > 0) {
+              game_runner->pass_cycle_opp_rack_str = p2_rack;
+              p2_drawn = true;
+            }
+          }
+        } else if (game_runner->eb_p2_rack_source == 0) {
           const int p2_target_is_pass =
               (game_runner->eb_p2_force_kind == 0) ? 1 : 0;
           const char *p2_rack = NULL;
@@ -1358,7 +1410,18 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
       canonical[n] = '\0';
     }
     PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
+    PassCycleTable *rrp = game_runner->shared_data->rare_rack_pool;
+    bool force_pass = false;
     if (pass_cycle_lookup_is_pass(pct, canonical) == 1) {
+      force_pass = true;
+    } else if (rrp != NULL &&
+               pass_cycle_lookup_is_pass(rrp, canonical) >= 0) {
+      // Rare-pool rack: force pass at every cycle-empty turn so the rare
+      // rack rides through to T5/T6 unchanged. The rare-pool's is_pass
+      // value is 0 by selection but presence in the pool is what matters.
+      force_pass = true;
+    }
+    if (force_pass) {
       Move *spare = move_list_get_spare_move(
           autoplay_worker->move_lists[player_on_turn_index]);
       move_set_as_pass(spare);
@@ -2357,8 +2420,9 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
   if (autoplay_worker->shared_data->eb_branch_active &&
       autoplay_worker->shared_data->pass_cycle_table != NULL) {
     int starter = starting_player_index;
+    int p1_rack_source = 0;  // 0 = pool, 2 = rare
     int p1_force_kind = 0;   // 0 = pass (is_pass=1 rack), 1 = exch
-    int p2_rack_source = 0;  // 0 = pool, 1 = bag-random
+    int p2_rack_source = 0;  // 0 = pool, 1 = bag-random, 2 = rare
     int p2_force_kind = 0;   // 0 = pass, 1 = exch
     if (autoplay_worker->shared_data->eb_mix_random) {
       // iter_count bit allocation (T1-pool, T2-balanced mode):
@@ -2372,7 +2436,20 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
       p2_rack_source = (int)((iter_output->iter_count >> 2) & 1ULL);
       p2_force_kind = (int)((iter_output->iter_count >> 3) & 1ULL);
     }
-    game_runner1->eb_p1_rack_source = 0;
+    // Rare-rack injection: every 5th iter overrides the target player's
+    // rack_source to 2 (rare) and force_kind to 0 (pass). 1-in-5 = 20%
+    // rare-rack allocation as designed.
+    if (autoplay_worker->shared_data->rare_rack_pool != NULL &&
+        (iter_output->iter_count % 5ULL) == 4ULL) {
+      if (autoplay_worker->shared_data->rare_target_player == 0) {
+        p1_rack_source = 2;
+        p1_force_kind = 0;
+      } else {
+        p2_rack_source = 2;
+        p2_force_kind = 0;
+      }
+    }
+    game_runner1->eb_p1_rack_source = p1_rack_source;
     game_runner1->eb_p1_force_kind = p1_force_kind;
     game_runner1->eb_p2_rack_source = p2_rack_source;
     game_runner1->eb_p2_force_kind = p2_force_kind;
