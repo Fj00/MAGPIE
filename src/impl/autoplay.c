@@ -2128,9 +2128,9 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
     }
   }
 
-  // T5 and T6 both use subset-mode exchange fan-out (skipping the blank
-  // at T5, plus 1-pointers at T6 — see filter below). T2-T4 stay K=3
-  // (one best-equity exchange counterfactual).
+  // T5 and T6 both use subset-mode exchange fan-out (every legal
+  // exchange subset becomes a separate slot). T2-T4 stay K=3 (one
+  // best-equity exchange counterfactual).
   const bool subset_mode = (turn >= 5);
   const bool include_play_in_subset = subset_mode && has_play;
   int max_slot = -1;
@@ -2144,29 +2144,18 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   }
 
   if (subset_mode) {
-    // Filter subset-mode exchanges to drop strictly-dominated subsets:
-    //   T6 (cycle terminus): drop any exchange containing blank or
-    //     1-point tiles — exchanging cheap tiles when the game ends
-    //     immediately can never be right.
-    //   T5 (no legal plays): drop any exchange containing the blank only.
-    //     Exchanging 1-pointers can still be correct here if the opponent
-    //     plays after, so we keep those subsets.
-    const LetterDistribution *ld_filt = game_get_ld(gr->game);
-    const int min_score = (turn == 6) ? 2 : 1;
+    // No filter — every legal exchange subset is enumerated as a slot
+    // so the model gets training data on all exchange decisions
+    // (including strictly-dominated ones — exchanging blanks or
+    // 1-pointers — so it learns those are bad). Previously T6 dropped
+    // exchanges containing blanks/1-pointers under the assumption "game
+    // ends immediately"; that's wrong since T7+ continue with HastyBot
+    // playout, AND missing the data prevents the model from learning
+    // the dominance.
     int slot = 1;
     for (int m = 0; m < n_moves && slot < EB_MAX_ACTIONS; m++) {
       Move *cand = move_list_get_move(ml, m);
       if (move_get_type(cand) != GAME_EVENT_EXCHANGE) continue;
-      const int nt = move_get_tiles_played(cand);
-      bool ok = true;
-      for (int i = 0; i < nt; i++) {
-        const MachineLetter tml = move_get_tile(cand, i);
-        if (equity_to_int(ld_get_score(ld_filt, tml)) < min_score) {
-          ok = false;
-          break;
-        }
-      }
-      if (!ok) continue;
       move_copy(gr->eb_action_buf[slot], cand);
       gr->eb_action_present[slot] = true;
       if (slot > max_slot) max_slot = slot;
