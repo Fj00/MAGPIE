@@ -2126,8 +2126,17 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   // of equity; non-is_pass racks fall through to HastyBot equity.
   char canon[RACK_SIZE + 2] = {0};
   eb_canonical_rack(gr->game, p_idx, canon);
+  PassCycleTable *eb_rrp = w->shared_data->rare_rack_pool;
+  // Rare-pool racks: treat as is_pass for fork purposes so the K-way
+  // fork includes the pass slot at T3-T5 and preserves the rare rack
+  // (with its specific cell support) through to the T6 recording turn.
+  // Without this the rare-rack injection silently fails — the fork picks
+  // exch/play which changes the rack and the rare cell never fires.
+  const bool is_rare_pool_rack =
+      eb_rrp != NULL && pass_cycle_lookup_is_pass(eb_rrp, canon) >= 0;
   const bool is_pass_rack =
-      pass_cycle_lookup_is_pass(w->shared_data->pass_cycle_table, canon) == 1;
+      pass_cycle_lookup_is_pass(w->shared_data->pass_cycle_table, canon) == 1
+      || is_rare_pool_rack;
   const bool include_pass = is_pass_rack || turn >= 5;
 
   MoveList *ml = w->eb_move_list;
