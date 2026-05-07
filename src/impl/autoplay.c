@@ -93,10 +93,15 @@ typedef struct AutoplaySharedData {
   // probability = no-op (use the natural rack).
   //
   // Env vars (each independent):
-  //   MAGPIE_EB_PASS_POOL=path.csv     — pass-favorable racks
-  //   MAGPIE_EB_EXCH_POOL=path.csv     — exchange-favorable racks
-  //   MAGPIE_EB_BINGO_POOL=path.csv    — bingo-favorable racks
-  //   MAGPIE_EB_RARE_POOL_CELLS=path.csv — rare cells (deficit-aware)
+  //   MAGPIE_EB_PASS_POOL=path.csv  — pass-favorable racks
+  //                                   (format: rack,weight,is_pass)
+  //   MAGPIE_EB_EXCH_POOL=path.csv  — exchange-favorable racks (same fmt)
+  //   MAGPIE_EB_BINGO_POOL=path.csv — bingo-favorable racks (same fmt)
+  //   MAGPIE_EB_RARE_POOL=path.csv  — rare-cell-supporting racks
+  //                                   (format: rack,length,type,kind,
+  //                                   subleave,diff — multi-row per rack;
+  //                                   built by build_rare_pool_with_cells.py;
+  //                                   deficit-aware sampler at runtime)
   //
   // Each pool that's missing falls through to probability for its 1/5
   // share — partial config is fine.
@@ -550,10 +555,10 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   if (bp && bp[0] != '\0') {
     shared_data->bingo_pool = pass_cycle_table_create(bp, "/dev/null");
   }
-  const char *rare_cells = getenv("MAGPIE_EB_RARE_POOL_CELLS");
-  if (rare_cells && rare_cells[0] != '\0' && shared_data->force_table) {
+  const char *rare_pool = getenv("MAGPIE_EB_RARE_POOL");
+  if (rare_pool && rare_pool[0] != '\0' && shared_data->force_table) {
     shared_data->rare_rack_cells = rare_pool_create(
-        rare_cells, shared_data->force_table, shared_data->ld);
+        rare_pool, shared_data->force_table, shared_data->ld);
   }
   if (shared_data->pass_pool || shared_data->exch_pool ||
       shared_data->bingo_pool || shared_data->rare_rack_cells) {
