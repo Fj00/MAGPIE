@@ -23,6 +23,7 @@
 #include "../ent/empty_board_strata.h"
 #include "../ent/opening_pass.h"
 #include "../ent/pass_cycle.h"
+#include "../ent/rare_pool.h"
 #include "../ent/inference_args.h"
 #include "../ent/inference_results.h"
 #include "../ent/klv.h"
@@ -90,6 +91,14 @@ typedef struct AutoplaySharedData {
   // the active player's rack_source to 2 (rare) and force_kind to 0
   // (pass), so the rare rack rides through to T5/T6 unchanged.
   PassCycleTable *rare_rack_pool;
+  // Optional deficit-aware sampler for the rare pool. Loaded from
+  // MAGPIE_EB_RARE_POOL_CELLS=path.csv (rack,length,type,kind,subleave,
+  // diff — one row per (rack, cell)). When present, draws use
+  // rare_pool_sample_deficit_aware (max marginal score with random
+  // tie-break) instead of uniform sampling from rare_rack_pool. Both
+  // env vars must be set together; the rack-list in MAGPIE_EB_RARE_RACK_POOL
+  // is still used for rack→string and bag-drawability.
+  RarePool *rare_rack_cells;
   // 0 = P2 receives rare (T6 coverage), 1 = P1 receives rare (T5
   // coverage). Set by MAGPIE_EB_RARE_TARGET=p1|p2. Default p2.
   int rare_target_player;
@@ -534,6 +543,18 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
               shared_data->rare_target_player == 0 ? "P1" : "P2");
     }
   }
+  shared_data->rare_rack_cells = NULL;
+  const char *rare_cells = getenv("MAGPIE_EB_RARE_POOL_CELLS");
+  if (rare_cells && rare_cells[0] != '\0' && shared_data->force_table) {
+    shared_data->rare_rack_cells = rare_pool_create(
+        rare_cells, shared_data->force_table, shared_data->ld);
+    if (shared_data->rare_rack_cells) {
+      fprintf(stderr,
+              "empty_board: rare-pool deficit-aware sampler ENABLED "
+              "(%d racks with cell coverage)\n",
+              rare_pool_num_racks(shared_data->rare_rack_cells));
+    }
+  }
 
   shared_data->empty_board_recorder = NULL;
   const char *eb_out = getenv("MAGPIE_EMPTY_BOARD_OUT");
@@ -621,6 +642,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   opening_pass_table_destroy(shared_data->opening_pass_table);
   pass_cycle_table_destroy(shared_data->pass_cycle_table);
   pass_cycle_table_destroy(shared_data->rare_rack_pool);
+  rare_pool_destroy(shared_data->rare_rack_cells);
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
   free(shared_data);
@@ -864,16 +886,24 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   if (!used_forced_rack && game_runner->shared_data->pass_cycle_table) {
     PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
     PassCycleTable *rrp = game_runner->shared_data->rare_rack_pool;
+    RarePool *rrc = game_runner->shared_data->rare_rack_cells;
     const int p1 = starting_player_index;
     const int p2 = 1 - starting_player_index;
-    // P1: pool by default. If eb_p1_rack_source == 2 and rare pool is
-    // loaded, sample P1 from rare pool instead (forced pass at T1 via
-    // eb_p1_force_kind=0; classification skipped — rare racks are play-
-    // favorable by selection but the cycle requires them to pass).
+    // P1: pool by default. If eb_p1_rack_source == 2:
+    //   - Prefer rare_rack_cells (deficit-aware sampler) when loaded
+    //   - Else fall back to rare_rack_pool (uniform random)
+    // Force pass at T1 via eb_p1_force_kind=0 regardless.
     const char *p1_rack = NULL;
-    if (game_runner->eb_p1_rack_source == 2 && rrp != NULL) {
+    if (game_runner->eb_p1_rack_source == 2 && rrc != NULL) {
+      const int idx = rare_pool_sample_deficit_aware(
+          rrc, iter_output->iter_count);
+      if (idx >= 0) p1_rack = rare_pool_get_rack(rrc, idx);
+    }
+    if (p1_rack == NULL && game_runner->eb_p1_rack_source == 2 &&
+        rrp != NULL) {
       pass_cycle_sample_p1(rrp, iter_output->iter_count, &p1_rack);
-    } else {
+    }
+    if (p1_rack == NULL) {
       const int p1_target_is_pass =
           (game_runner->eb_p1_force_kind == 0) ? 1 : 0;
       pass_cycle_sample_p1_target_is_pass(
@@ -892,13 +922,20 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
 
         // P2 rack: pool (rejection-sampled by eb_p2_force_kind), bag-
         // random, or rare-pool (eb_p2_rack_source = 0|1|2). Rare-pool P2
-        // forces pass at T2 regardless of eb_p2_force_kind.
+        // prefers deficit-aware sampler if loaded, else uniform.
         bool p2_drawn = false;
-        if (game_runner->eb_p2_rack_source == 2 && rrp != NULL) {
+        if (game_runner->eb_p2_rack_source == 2) {
           const char *p2_rack = NULL;
-          pass_cycle_sample_p1(rrp,
-                               iter_output->iter_count ^ 0xa5a5a5a5a5a5a5a5ULL,
-                               &p2_rack);
+          if (rrc != NULL) {
+            const int idx = rare_pool_sample_deficit_aware(
+                rrc, iter_output->iter_count ^ 0xa5a5a5a5a5a5a5a5ULL);
+            if (idx >= 0) p2_rack = rare_pool_get_rack(rrc, idx);
+          }
+          if (p2_rack == NULL && rrp != NULL) {
+            pass_cycle_sample_p1(
+                rrp, iter_output->iter_count ^ 0xa5a5a5a5a5a5a5a5ULL,
+                &p2_rack);
+          }
           if (p2_rack != NULL) {
             const int n2 = draw_rack_string_from_bag(game, p2, p2_rack);
             if (n2 > 0) {

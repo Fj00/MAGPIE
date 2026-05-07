@@ -416,6 +416,31 @@ uint32_t *force_table_lookup_bitmaps_by_shape(ForceTable *table, int bag,
   return table->by_shape_bitmaps[bag][leave_length][ex];
 }
 
+ForceTarget *force_table_lookup_target_by_key(
+    ForceTable *table, int bag, int leave_length, LeaveType type,
+    ForceTargetKind kind, int exchange, MachineLetter sub_ml0,
+    MachineLetter sub_ml1, int subleave_count, int diff) {
+  if (!table || bag < 0 || bag >= FORCE_BAG_MAX) return NULL;
+  // Use the by_bag bucket — small enough that a linear scan is fine
+  // (called only at rare-pool load time, not per game).
+  const int ex = exchange ? 1 : 0;
+  const int n = table->by_bag_count[bag];
+  ForceTarget **arr = table->by_bag_ptrs[bag];
+  for (int i = 0; i < n; i++) {
+    ForceTarget *t = arr[i];
+    if (t->leave_length != leave_length) continue;
+    if ((int)t->leave_type != (int)type) continue;
+    if ((int)t->kind != (int)kind) continue;
+    if (t->exchange != ex) continue;
+    if (t->subleave_count != subleave_count) continue;
+    if (subleave_count >= 1 && t->subleave_mls[0] != sub_ml0) continue;
+    if (subleave_count >= 2 && t->subleave_mls[1] != sub_ml1) continue;
+    if (diff < t->diff_min || diff > t->diff_max) continue;
+    return t;
+  }
+  return NULL;
+}
+
 int64_t force_table_total_remaining(const ForceTable *table) {
   int64_t total = 0;
   for (int i = 0; i < table->num_targets; i++) {

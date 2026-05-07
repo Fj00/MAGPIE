@@ -162,4 +162,14 @@ int force_table_num_targets(const ForceTable *table);
 LeaveType force_classify_leave(const Rack *leave,
                                const LetterDistribution *ld);
 
+// Lookup a target by its full (bag, leave_length, type, kind, exchange,
+// subleave, diff) key. `diff` is the single cell diff (e.g. from
+// cell_rarity.csv); the function returns the unique target whose
+// [diff_min, diff_max] range contains it. Returns NULL if no target matches.
+// Used by the rare-rack pool loader to resolve cell keys to ForceTarget*.
+ForceTarget *force_table_lookup_target_by_key(
+    ForceTable *table, int bag, int leave_length, LeaveType type,
+    ForceTargetKind kind, int exchange, MachineLetter sub_ml0,
+    MachineLetter sub_ml1, int subleave_count, int diff);
+
 #endif
