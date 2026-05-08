@@ -654,7 +654,7 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
     char *tok = strtok(buf, ",");
     while (tok != NULL) {
       const int t = atoi(tok);
-      if (t >= 2 && t <= 6) shared_data->eb_force_turns_mask |= (1 << t);
+      if (t >= 1 && t <= 6) shared_data->eb_force_turns_mask |= (1 << t);
       tok = strtok(NULL, ",");
     }
     fprintf(stderr, "empty_board: force-table ACTIVE at turns mask 0x%x "
