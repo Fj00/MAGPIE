@@ -132,6 +132,39 @@ typedef struct AutoplaySharedData {
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
+// Per-turn role for single-target-turn EB recording. Each turn (1..6) gets
+// classified relative to the target turn; the role drives both the fan-out
+// branch set in eb_enumerate_actions and the natural-play forcing in
+// game_runner_get_move.
+typedef enum {
+  EB_ROLE_TARGET,       // The recording turn — full subset fan-out + 5-way inject.
+  EB_ROLE_OPP_FIRST,    // Earliest opp turn before target — 50/50 pool-sampled
+                        // rack, 2 branches always (pass + best-exch).
+  EB_ROLE_OPP_CLOSEST,  // Opp turn at target-1 (and not also OPP_FIRST) —
+                        // inherited rack, 2 branches always.
+  EB_ROLE_OPP_MID,      // Opp turn between OPP_FIRST and OPP_CLOSEST — inherited
+                        // rack, 2 branches if is_pass, 1 branch (force-exch) else.
+  EB_ROLE_REC_PRE,      // Recording-player turn before target — bag-random rack,
+                        // force pass unconditionally (rack discarded at target).
+  EB_ROLE_POST,         // Turn after target — natural HastyBot play, no fork,
+                        // no recording.
+} EbTurnRole;
+
+// Classify a turn relative to the target. Player parity: T_odd = P1, T_even = P2.
+// Recording player at Tn = P1 if n is odd else P2. First opp turn (the earliest
+// turn whose player is the opponent) is T2 for odd-target (P1 records) and T1
+// for even-target (P2 records).
+static EbTurnRole eb_classify_turn(int target_turn, int turn) {
+  if (turn == target_turn) return EB_ROLE_TARGET;
+  if (turn > target_turn) return EB_ROLE_POST;
+  const bool same_player = ((turn ^ target_turn) & 1) == 0;
+  if (same_player) return EB_ROLE_REC_PRE;
+  const int first_opp = (target_turn % 2 == 1) ? 2 : 1;
+  if (turn == first_opp) return EB_ROLE_OPP_FIRST;
+  if (turn == target_turn - 1) return EB_ROLE_OPP_CLOSEST;
+  return EB_ROLE_OPP_MID;
+}
+
 typedef struct AutoplayIterOutput {
   uint64_t seed;
   uint64_t iter_count;
@@ -1879,39 +1912,6 @@ static void eb_canonical_rack(const Game *game, int player_index, char *out) {
     out[n++] = '?';
   }
   out[n] = '\0';
-}
-
-// Per-turn role for single-target-turn EB recording. Each turn (1..6) gets
-// classified relative to the target turn; the role drives both the fan-out
-// branch set in eb_enumerate_actions and the natural-play forcing in
-// game_runner_get_move.
-typedef enum {
-  EB_ROLE_TARGET,       // The recording turn — full subset fan-out + 5-way inject.
-  EB_ROLE_OPP_FIRST,    // Earliest opp turn before target — 50/50 pool-sampled
-                        // rack, 2 branches always (pass + best-exch).
-  EB_ROLE_OPP_CLOSEST,  // Opp turn at target-1 (and not also OPP_FIRST) —
-                        // inherited rack, 2 branches always.
-  EB_ROLE_OPP_MID,      // Opp turn between OPP_FIRST and OPP_CLOSEST — inherited
-                        // rack, 2 branches if is_pass, 1 branch (force-exch) else.
-  EB_ROLE_REC_PRE,      // Recording-player turn before target — bag-random rack,
-                        // force pass unconditionally (rack discarded at target).
-  EB_ROLE_POST,         // Turn after target — natural HastyBot play, no fork,
-                        // no recording.
-} EbTurnRole;
-
-// Classify a turn relative to the target. Player parity: T_odd = P1, T_even = P2.
-// Recording player at Tn = P1 if n is odd else P2. First opp turn (the earliest
-// turn whose player is the opponent) is T2 for odd-target (P1 records) and T1
-// for even-target (P2 records).
-static EbTurnRole eb_classify_turn(int target_turn, int turn) {
-  if (turn == target_turn) return EB_ROLE_TARGET;
-  if (turn > target_turn) return EB_ROLE_POST;
-  const bool same_player = ((turn ^ target_turn) & 1) == 0;
-  if (same_player) return EB_ROLE_REC_PRE;
-  const int first_opp = (target_turn % 2 == 1) ? 2 : 1;
-  if (turn == first_opp) return EB_ROLE_OPP_FIRST;
-  if (turn == target_turn - 1) return EB_ROLE_OPP_CLOSEST;
-  return EB_ROLE_OPP_MID;
 }
 
 // Render a Rack's tile multiset to a canonical sorted-letters-then-blanks
