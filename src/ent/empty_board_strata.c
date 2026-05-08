@@ -120,14 +120,16 @@ static FILE *ebs_get_file(EmptyBoardStrataRecorder *r, int T, int K, int L,
   if (r->fhs[T][K][L][ty]) return r->fhs[T][K][L][ty];
   pthread_mutex_lock(&r->open_mutex);
   if (!r->fhs[T][K][L][ty]) {
-    char dir1[256], dir2[256], dir3[256], path[512];
-    snprintf(dir1, sizeof(dir1), "%s/T%d", r->base_dir, T);
+    char dir1[256], dir2[256], path[512];
+    // With single-target-turn recording (MAGPIE_EB_TARGET_TURN), only one
+    // T value is ever written per run, so the T<n>/ subdir layer is just
+    // noise — flatten the strata layout to <base_dir>/K<k>/L<l>/<type>.csv.
+    // The run.log records the target turn for documentation.
+    snprintf(dir1, sizeof(dir1), "%s/K%d", r->base_dir, K);
     ebs_mkdir_or_die(dir1);
-    snprintf(dir2, sizeof(dir2), "%s/K%d", dir1, K);
+    snprintf(dir2, sizeof(dir2), "%s/L%d", dir1, L);
     ebs_mkdir_or_die(dir2);
-    snprintf(dir3, sizeof(dir3), "%s/L%d", dir2, L);
-    ebs_mkdir_or_die(dir3);
-    snprintf(path, sizeof(path), "%s/%s.csv", dir3, EBS_TYPE_NAMES[ty]);
+    snprintf(path, sizeof(path), "%s/%s.csv", dir2, EBS_TYPE_NAMES[ty]);
     FILE *fh = fopen(path, "w");
     if (!fh) {
       log_fatal("empty_board_strata: cannot open %s (%s)", path,
