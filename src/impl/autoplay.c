@@ -120,16 +120,15 @@ typedef struct AutoplaySharedData {
   // by MAGPIE_EMPTY_BOARD_BRANCH=1. When set, play_autoplay_game_or_game_pair
   // dispatches a single-runner DFS that explores forks at branchable turns.
   bool eb_branch_active;
-  // Slice 2c: 50/50 mix between pool-sampled P2 (current default; cycle
-  // favorable, deep-cycle data) and bag-random P2 (realistic-opp half;
-  // turn 2 branched explicitly to capture pass/exch/play V at turn 2).
-  // Activated by MAGPIE_EMPTY_BOARD_MIX_RANDOM=1; alternates per pair_id.
-  bool eb_mix_random;
   // Bitmask of empty-board cycle turns at which to consult the force_table
   // and add matching forced moves as additional DFS slots (scope-B forcing).
   // Bit N set = active at turn N. Set by MAGPIE_EB_FORCE_TURNS env var
   // (comma-separated turn list, e.g. "6" or "5,6"). Requires force_table.
   int eb_force_turns_mask;
+  // Single-target-turn recording: which turn (1..6) is the recording
+  // target. All other turns are pass-cycle plumbing or post-target natural
+  // play. Set by MAGPIE_EB_TARGET_TURN; default 6.
+  int eb_target_turn;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -540,11 +539,25 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   shared_data->bingo_pool = NULL;
   shared_data->play_pool = NULL;
   shared_data->rare_rack_cells = NULL;
-  shared_data->rare_target_player = 1;  // default: P2 (T6 is P2's turn)
-  const char *rt = getenv("MAGPIE_EB_RARE_TARGET");
-  if (rt && (rt[0] == 'p' || rt[0] == 'P') && (rt[1] == '1')) {
-    shared_data->rare_target_player = 0;
+  // Parse target turn first; rare_target_player is derived from its parity.
+  shared_data->eb_target_turn = 6;
+  const char *eb_target = getenv("MAGPIE_EB_TARGET_TURN");
+  if (eb_target && eb_target[0] != '\0') {
+    const int t = atoi(eb_target);
+    if (t >= 1 && t <= 6) {
+      shared_data->eb_target_turn = t;
+    } else {
+      fprintf(stderr,
+              "empty_board: invalid MAGPIE_EB_TARGET_TURN=%s (must be 1..6); "
+              "using default 6\n", eb_target);
+    }
   }
+  // Recording player parity: T_odd = P1 (index 0), T_even = P2 (index 1).
+  shared_data->rare_target_player =
+      (shared_data->eb_target_turn % 2 == 1) ? 0 : 1;
+  fprintf(stderr, "empty_board: target turn = T%d (recording player = P%d)\n",
+          shared_data->eb_target_turn,
+          shared_data->rare_target_player + 1);
   const char *pp = getenv("MAGPIE_EB_PASS_POOL");
   if (pp && pp[0] != '\0') {
     shared_data->pass_pool = pass_cycle_table_create(pp, "/dev/null");
@@ -570,9 +583,10 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
       shared_data->bingo_pool || shared_data->play_pool ||
       shared_data->rare_rack_cells) {
     fprintf(stderr,
-            "empty_board: T6 source mix ENABLED (target=%s) — pools: "
+            "empty_board: T%d source mix ENABLED (recording=P%d) — pools: "
             "pass=%s exch=%s bingo=%s play=%s rare=%s\n",
-            shared_data->rare_target_player == 0 ? "P1" : "P2",
+            shared_data->eb_target_turn,
+            shared_data->rare_target_player + 1,
             shared_data->pass_pool ? "yes" : "no",
             shared_data->exch_pool ? "yes" : "no",
             shared_data->bingo_pool ? "yes" : "no",
@@ -598,14 +612,6 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
     fprintf(stderr,
             "empty_board: K-way fork branching ENABLED (turns 3-5 if "
             "is_pass rack)\n");
-  }
-  shared_data->eb_mix_random = false;
-  const char *eb_mix = getenv("MAGPIE_EMPTY_BOARD_MIX_RANDOM");
-  if (eb_mix && eb_mix[0] != '\0' && eb_mix[0] != '0') {
-    shared_data->eb_mix_random = true;
-    fprintf(stderr,
-            "empty_board: mix-random ENABLED — alternating pool / "
-            "bag-random P2 per pair, turn 2 branched on bag-random half\n");
   }
   shared_data->eb_force_turns_mask = 0;
   const char *eb_force = getenv("MAGPIE_EB_FORCE_TURNS");
@@ -801,7 +807,7 @@ typedef struct GameRunner {
   // Capacity covers worst case: pass + 127 distinct exch subsets of a 7-tile
   // rack + 1 best-play + slack. eb_action_present[i] is true iff slot i is
   // populated this enumeration; the DFS skips false slots.
-#define EB_MAX_ACTIONS 132
+#define EB_MAX_ACTIONS 320
   Move *eb_action_buf[EB_MAX_ACTIONS];
   bool eb_action_present[EB_MAX_ACTIONS];
   int eb_n_action_buf;
@@ -1409,6 +1415,87 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     move_set_as_pass(spare);
     move = spare;
   }
+  // Single-target-turn EB role-driven forcing. Replaces the legacy T1/T2
+  // explicit force block. Runs only when EB DFS is active and we're still
+  // on an empty board pre-target.
+  if (!move && game_runner->eb_active &&
+      game_runner->pass_cycle_active &&
+      game_runner->pass_cycle_branch == 0 &&
+      board_get_tiles_played(game_get_board(game)) == 0) {
+    const int target = game_runner->shared_data->eb_target_turn;
+    const int turn = game_runner->pass_cycle_n_moves + 1;
+    const EbTurnRole role = eb_classify_turn(target, turn);
+    if (role == EB_ROLE_REC_PRE) {
+      // Recording player pre-target turn — rack will be discarded at TARGET
+      // inject, just force pass to keep board empty.
+      Move *spare = move_list_get_spare_move(
+          autoplay_worker->move_lists[player_on_turn_index]);
+      move_set_as_pass(spare);
+      move = spare;
+    } else if (role == EB_ROLE_OPP_MID) {
+      // OPP_MID returned 0 from eb_enumerate_actions when rack is_pass=0
+      // (single-branch case). Force best-equity exchange so the cycle
+      // continues without playing tiles. is_pass=1 falls through to the
+      // existing pass_cycle force-pass block below (which handles it).
+      char canonical[RACK_SIZE + 2] = {0};
+      {
+        const LetterDistribution *ld = game_get_ld(game);
+        const uint16_t dist_size = rack_get_dist_size(player_rack);
+        int n = 0;
+        for (uint16_t i = 1; i < dist_size && n < RACK_SIZE; i++) {
+          const int c = rack_get_letter(player_rack, i);
+          for (int k = 0; k < c && n < RACK_SIZE; k++) {
+            canonical[n++] = ld->ld_ml_to_hl[i][0];
+          }
+        }
+        const int nblanks = rack_get_letter(player_rack, 0);
+        for (int k = 0; k < nblanks && n < RACK_SIZE; k++) {
+          canonical[n++] = '?';
+        }
+        canonical[n] = '\0';
+      }
+      PassCycleTable *pct = game_runner->shared_data->pass_cycle_table;
+      const bool is_pass =
+          pass_cycle_lookup_is_pass(pct, canonical) == 1;
+      if (!is_pass) {
+        const MoveGenArgs gen_args = {
+            .game = game,
+            .move_list = autoplay_worker->move_lists[player_on_turn_index],
+            .move_record_type = MOVE_RECORD_ALL,
+            .move_sort_type = MOVE_SORT_EQUITY,
+            .override_kwg = NULL,
+            .thread_index = autoplay_worker->worker_index,
+            .eq_margin_movegen = 0,
+            .target_equity = EQUITY_MAX_VALUE,
+            .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+            .tiles_played_bv = NULL,
+            .initial_tiles_bv = 0};
+        generate_moves(&gen_args);
+        MoveList *ml = autoplay_worker->move_lists[player_on_turn_index];
+        const int n_moves = move_list_get_count(ml);
+        move_list_sort_moves(ml);
+        Move *best_exch = NULL;
+        for (int m = 0; m < n_moves; m++) {
+          Move *cand = move_list_get_move(ml, m);
+          if (move_get_type(cand) == GAME_EVENT_EXCHANGE) {
+            best_exch = cand;
+            break;
+          }
+        }
+        if (best_exch) {
+          move = best_exch;
+        } else {
+          Move *spare = move_list_get_spare_move(
+              autoplay_worker->move_lists[player_on_turn_index]);
+          move_set_as_pass(spare);
+          move = spare;
+        }
+      }
+    }
+    // OPP_FIRST, OPP_CLOSEST, TARGET, POST: handled by DFS via
+    // eb_forced_move (set at the top of this function), or natural HastyBot
+    // for POST. Nothing to do here.
+  }
   // Pass-cycle mode (branch 0, empty board): each turn, check the player
   // on turn's CURRENT rack against the pool. is_pass=1 → force pass.
   // Otherwise leave the move to natural HastyBot play (which will exchange
@@ -1446,61 +1533,9 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
       move = spare;
     }
   }
-  // T1+T2 explicit forcing: T1 forces P1 per eb_p1_force_kind (derived
-  // from P1 rack's is_pass), T2 forces P2 per eb_p2_force_kind (set
-  // from iter_count bit 3). This guarantees the cycle starts even for
-  // is_pass=0 P1 racks (which the auto-pass above doesn't catch) AND
-  // gives balanced T2 data across (rack_source × force_kind) for P2
-  // including play-prone bag-random racks.
-  // pass_cycle_n_moves==0 → about to play T1; ==1 → T2.
-  if (!move && game_runner->pass_cycle_active &&
-      game_runner->pass_cycle_n_moves < 2 &&
-      board_get_tiles_played(game_get_board(game)) == 0) {
-    const int force_kind =
-        (game_runner->pass_cycle_n_moves == 0)
-            ? game_runner->eb_p1_force_kind
-            : game_runner->eb_p2_force_kind;
-    Move *spare = move_list_get_spare_move(
-        autoplay_worker->move_lists[player_on_turn_index]);
-    if (force_kind == 0) {
-      move_set_as_pass(spare);
-      move = spare;
-    } else {
-      // Force-exchange: generate moves and pick best-equity exchange.
-      const MoveGenArgs gen_args = {
-          .game = game,
-          .move_list = autoplay_worker->move_lists[player_on_turn_index],
-          .move_record_type = MOVE_RECORD_ALL,
-          .move_sort_type = MOVE_SORT_EQUITY,
-          .override_kwg = NULL,
-          .thread_index = autoplay_worker->worker_index,
-          .eq_margin_movegen = 0,
-          .target_equity = EQUITY_MAX_VALUE,
-          .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
-          .tiles_played_bv = NULL,
-          .initial_tiles_bv = 0};
-      generate_moves(&gen_args);
-      MoveList *ml = autoplay_worker->move_lists[player_on_turn_index];
-      const int n_moves = move_list_get_count(ml);
-      move_list_sort_moves(ml);
-      Move *best_exch = NULL;
-      for (int m = 0; m < n_moves; m++) {
-        Move *cand = move_list_get_move(ml, m);
-        if (move_get_type(cand) == GAME_EVENT_EXCHANGE) {
-          best_exch = cand;
-          break;
-        }
-      }
-      if (best_exch) {
-        move = best_exch;
-      } else {
-        // No exchange available (shouldn't happen with full bag); fall
-        // back to pass.
-        move_set_as_pass(spare);
-        move = spare;
-      }
-    }
-  }
+  // (Legacy T1/T2 explicit force-kind block removed — replaced by the
+  // role-driven force block above which uses eb_classify_turn instead of
+  // iter_count-derived force_kind bits.)
   if (!move) {
     move = try_forced_move(autoplay_worker, game_runner);
   }
@@ -1846,6 +1881,59 @@ static void eb_canonical_rack(const Game *game, int player_index, char *out) {
   out[n] = '\0';
 }
 
+// Per-turn role for single-target-turn EB recording. Each turn (1..6) gets
+// classified relative to the target turn; the role drives both the fan-out
+// branch set in eb_enumerate_actions and the natural-play forcing in
+// game_runner_get_move.
+typedef enum {
+  EB_ROLE_TARGET,       // The recording turn — full subset fan-out + 5-way inject.
+  EB_ROLE_OPP_FIRST,    // Earliest opp turn before target — 50/50 pool-sampled
+                        // rack, 2 branches always (pass + best-exch).
+  EB_ROLE_OPP_CLOSEST,  // Opp turn at target-1 (and not also OPP_FIRST) —
+                        // inherited rack, 2 branches always.
+  EB_ROLE_OPP_MID,      // Opp turn between OPP_FIRST and OPP_CLOSEST — inherited
+                        // rack, 2 branches if is_pass, 1 branch (force-exch) else.
+  EB_ROLE_REC_PRE,      // Recording-player turn before target — bag-random rack,
+                        // force pass unconditionally (rack discarded at target).
+  EB_ROLE_POST,         // Turn after target — natural HastyBot play, no fork,
+                        // no recording.
+} EbTurnRole;
+
+// Classify a turn relative to the target. Player parity: T_odd = P1, T_even = P2.
+// Recording player at Tn = P1 if n is odd else P2. First opp turn (the earliest
+// turn whose player is the opponent) is T2 for odd-target (P1 records) and T1
+// for even-target (P2 records).
+static EbTurnRole eb_classify_turn(int target_turn, int turn) {
+  if (turn == target_turn) return EB_ROLE_TARGET;
+  if (turn > target_turn) return EB_ROLE_POST;
+  const bool same_player = ((turn ^ target_turn) & 1) == 0;
+  if (same_player) return EB_ROLE_REC_PRE;
+  const int first_opp = (target_turn % 2 == 1) ? 2 : 1;
+  if (turn == first_opp) return EB_ROLE_OPP_FIRST;
+  if (turn == target_turn - 1) return EB_ROLE_OPP_CLOSEST;
+  return EB_ROLE_OPP_MID;
+}
+
+// Render a Rack's tile multiset to a canonical sorted-letters-then-blanks
+// string (matches eb_canonical_rack format). Used for fan-out dedup on
+// (action_type, score, leave).
+static void eb_render_leave(const Rack *leave, const LetterDistribution *ld,
+                            char *out, size_t cap) {
+  const uint16_t dist_size = rack_get_dist_size(leave);
+  size_t n = 0;
+  for (uint16_t i = 1; i < dist_size && n + 1 < cap; i++) {
+    const int c = rack_get_letter(leave, i);
+    for (int k = 0; k < c && n + 1 < cap; k++) {
+      out[n++] = ld->ld_ml_to_hl[i][0];
+    }
+  }
+  const int nblanks = rack_get_letter(leave, 0);
+  for (int k = 0; k < nblanks && n + 1 < cap; k++) {
+    out[n++] = '?';
+  }
+  out[n] = '\0';
+}
+
 // Save/restore wrapper for eb_active per-runner state that lives outside
 // game state (snap stack offsets and per-player action history buffers).
 typedef struct EbMetaSave {
@@ -2057,6 +2145,94 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
 // populated slot index + 1 (so callers iterate 0..N-1 and check the flag),
 // or 0 if not branchable.
 //
+// Annotate already-populated subset_mode slots with their matching
+// force-target so eb_emit_leaf can credit the deficit. Mirrors the
+// PAIR-then-TILE-then-STRATUM priority order of eb_append_force_target_slots
+// but operates on slots (not on the full move list), since subset_mode
+// already enumerated every distinct (action_type, score, leave) action.
+// Each slot is matched at most once; later slots aren't displaced.
+static void eb_annotate_force_targets_to_slots(AutoplayWorker *w,
+                                               GameRunner *gr, int max_slot) {
+  ForceTable *ft = w->shared_data->force_table;
+  if (!ft) return;
+  Game *game = gr->game;
+  // Same all-pass-leaf restriction as eb_append_force_target_slots: cell
+  // diff ranges are bag=93 opener-derived, only valid when board is empty.
+  if (board_get_tiles_played(game_get_board(game)) > 0) return;
+  const int bag_count = bag_get_letters(game_get_bag(game)) + (RACK_SIZE);
+  int target_count = 0;
+  ForceTarget **targets = force_table_lookup(ft, bag_count, &target_count);
+  if (target_count == 0) return;
+  bool any_active = false;
+  for (int i = 0; i < target_count; i++) {
+    if (targets[i]->deficit > 0) { any_active = true; break; }
+  }
+  if (!any_active) return;
+  (void)targets;
+
+  const LetterDistribution *ld = game_get_ld(game);
+  Rack leave;
+  rack_set_dist_size(&leave, ld_get_size(ld));
+
+  const int p_idx = game_get_player_on_turn_index(game);
+  const int my_score =
+      equity_to_int(player_get_score(game_get_player(game, p_idx)));
+  const int opp_score =
+      equity_to_int(player_get_score(game_get_player(game, 1 - p_idx)));
+  const int cur_diff = my_score - opp_score;
+
+  bool used_slot[EB_MAX_ACTIONS] = {false};
+  for (int priority = FORCE_TARGET_PAIR;
+       priority >= FORCE_TARGET_STRATUM; priority--) {
+    for (int s = 1; s <= max_slot; s++) {
+      if (used_slot[s] || !gr->eb_action_present[s]) continue;
+      Move *mv = gr->eb_action_buf[s];
+      const game_event_t mt = move_get_type(mv);
+      if (mt != GAME_EVENT_TILE_PLACEMENT_MOVE && mt != GAME_EVENT_EXCHANGE) {
+        continue;  // pass slot — never a force-target match
+      }
+      rack_reset(&leave);
+      get_leave_for_move(mv, game, &leave);
+      const int leave_len = (int)leave.number_of_letters;
+      if (leave_len < 0 || leave_len >= 8) continue;
+      const int score = equity_to_int(move_get_score(mv));
+      const bool is_exch = (mt == GAME_EVENT_EXCHANGE);
+      uint32_t leave_bm = 0;
+      for (uint16_t i = 0; i < leave.dist_size && i < 32; i++) {
+        if (leave.array[i] > 0) leave_bm |= ((uint32_t)1) << i;
+      }
+      int bucket_count = 0;
+      ForceTargetSlot *bucket_slots = force_table_lookup_slots_by_shape(
+          ft, bag_count, leave_len, is_exch ? 1 : 0, &bucket_count);
+      uint32_t *bitmaps = force_table_lookup_bitmaps_by_shape(
+          ft, bag_count, leave_len, is_exch ? 1 : 0);
+      if (bucket_count == 0 || bitmaps == NULL) continue;
+      ForceTarget *matched = NULL;
+      for (int t = 0; t < bucket_count; t++) {
+        const uint32_t req = bitmaps[t];
+        if ((leave_bm & req) != req) continue;
+        ForceTargetSlot *fs = &bucket_slots[t];
+        if (fs->deficit <= 0 || (int)fs->kind != priority) continue;
+        const int eff_diff = cur_diff + score;
+        if (eff_diff < fs->diff_min || eff_diff > fs->diff_max) continue;
+        if (fs->subleave_count == 2 &&
+            fs->subleave_mls[0] == fs->subleave_mls[1] &&
+            leave.array[fs->subleave_mls[0]] < 2) continue;
+        if (fs->exchange == 0 && fs->leave_length >= 3) {
+          const LeaveType lt = force_classify_leave(&leave, ld);
+          if ((LeaveType)lt != (LeaveType)fs->leave_type) continue;
+        }
+        matched = fs->cold;
+        break;
+      }
+      if (matched != NULL) {
+        gr->eb_force_target_for_slot[s] = matched;
+        used_slot[s] = true;
+      }
+    }
+  }
+}
+
 // Modes:
 //  - turn 1: never branched
 //  - turn 2: branched only on bag-random P2 half (mix_random mode)
@@ -2064,17 +2240,17 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
 //  - turn 5 (no legal plays): subset fan-out — pass (if is_pass) +
 //            every distinct exch subset
 //  - turn 6: always branched, full subset fan-out — pass (if is_pass) +
-//            every distinct exch subset + best-play
+//            every distinct (action_type, score, leave) action (pass +
+//            exch subsets + plays)
 //
 // Pass is included only when the current player's rack is is_pass=1; for
 // non-pass racks pass is never a meaningful action and gets omitted to
-// halve compute. Best-exch and best-play (K=3 mode) or all exch subsets
-// (subset mode) are always included.
+// halve compute.
 //
 // Slot layout is STABLE across runs and across is_pass/non-is_pass racks:
 //   K=3 mode:    slot 0 = pass, slot 1 = best-exch, slot 2 = best-play
-//   subset mode: slot 0 = pass, slots 1..N = exch subsets in equity order,
-//                slot N+1 = best-play (turn 6 only)
+//   subset mode: slot 0 = pass, slots 1..M = exch subsets,
+//                slots M+1..N = distinct play (score, leave) signatures
 // Empty slots (pass omitted, or no legal play, etc.) keep their index and
 // the iterator skips them via the present-flag — branch_id encoding stays
 // reproducible regardless of which actions a particular position offers.
@@ -2089,27 +2265,17 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   if (!gr->eb_active || gr->eb_n_snaps >= 6) return 0;
   if (board_get_tiles_played(game_get_board(gr->game)) > 0) return 0;
   const int turn = gr->eb_n_snaps + 1;
-  // T1 never branched (the cycle anchor — starter's force-pass on is_pass
-  // rack is the experimental design that opens the cycle subtree).
-  // T2-T6 always branched for full V-function coverage of action
-  // counterfactuals at every cycle-alive empty-board decision.
-  if (turn == 1) return 0;
+  const int target_turn = w->shared_data->eb_target_turn;
+  const EbTurnRole role = eb_classify_turn(target_turn, turn);
+  // REC_PRE and POST never fork — natural-play path drives the move (force
+  // pass for REC_PRE via the role-driven force block; HastyBot for POST).
+  if (role == EB_ROLE_REC_PRE || role == EB_ROLE_POST) return 0;
 
   const int p_idx = game_get_player_on_turn_index(gr->game);
-  // Pass slot inclusion (per spec):
-  //   T5, T6: pass always included — opp_history accumulated by then makes
-  //           pass a meaningful counterfactual even for natural racks.
-  //   T3, T4: pass only if rack is is_pass=1 — otherwise pass is never
-  //           strategically correct at these early-cycle decisions.
-  //   T2 (random mode): same as T3/T4 — only for is_pass racks.
-  // is_pass status is also used downstream to decide the natural slot:
-  // is_pass racks force-pass via pass_cycle, so natural=slot 0 regardless
-  // of equity; non-is_pass racks fall through to HastyBot equity.
   char canon[RACK_SIZE + 2] = {0};
   eb_canonical_rack(gr->game, p_idx, canon);
   const bool is_pass_rack =
       pass_cycle_lookup_is_pass(w->shared_data->pass_cycle_table, canon) == 1;
-  const bool include_pass = is_pass_rack || turn >= 5;
 
   MoveList *ml = w->eb_move_list;
   const MoveGenArgs gen_args = {
@@ -2128,93 +2294,89 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   const int n_moves = move_list_get_count(ml);
   move_list_sort_moves(ml);
 
-  bool has_play = false;
-  for (int m = 0; m < n_moves; m++) {
-    if (move_get_type(move_list_get_move(ml, m)) ==
-        GAME_EVENT_TILE_PLACEMENT_MOVE) {
-      has_play = true;
-      break;
-    }
-  }
-
-  // T5 and T6 both use subset-mode exchange fan-out (every legal
-  // exchange subset becomes a separate slot). T2-T4 stay K=3 (one
-  // best-equity exchange counterfactual).
-  const bool subset_mode = (turn >= 5);
-  const bool include_play_in_subset = subset_mode && has_play;
+  const LetterDistribution *ld = game_get_ld(gr->game);
+  const uint16_t ld_size = ld_get_size(ld);
   int max_slot = -1;
   int play_slot = -1;  // populated slot index of the best-play action
 
-  // Slot 0 always reserved for pass; populate only if rack is_pass.
-  if (include_pass) {
+  if (role == EB_ROLE_TARGET) {
+    // Full fan-out: pass + every distinct (action_type, score, leave) action.
+    // Blank-letter equivalents (MANE/SANE/CANE — same score and leave,
+    // different blank assignment) collapse to one slot. Empirical max across
+    // all 3.2M valid racks is 294 slots (1 pass + 127 exch + 166 play).
+    bool has_play = false;
+    for (int m = 0; m < n_moves; m++) {
+      if (move_get_type(move_list_get_move(ml, m)) ==
+          GAME_EVENT_TILE_PLACEMENT_MOVE) {
+        has_play = true;
+        break;
+      }
+    }
     move_set_as_pass(gr->eb_action_buf[0]);
     gr->eb_action_present[0] = true;
     max_slot = 0;
-  }
-
-  if (subset_mode) {
-    // No filter — every legal exchange subset is enumerated as a slot
-    // so the model gets training data on all exchange decisions
-    // (including strictly-dominated ones — exchanging blanks or
-    // 1-pointers — so it learns those are bad). Previously T6 dropped
-    // exchanges containing blanks/1-pointers under the assumption "game
-    // ends immediately"; that's wrong since T7+ continue with HastyBot
-    // playout, AND missing the data prevents the model from learning
-    // the dominance.
+    Rack tmp_leave;
+    rack_set_dist_size(&tmp_leave, ld_size);
+    enum { SIG_LEN = 16 };
+    static _Thread_local char slot_sig[EB_MAX_ACTIONS][SIG_LEN];
+    int n_sigs = 0;
     int slot = 1;
-    for (int m = 0; m < n_moves && slot < EB_MAX_ACTIONS; m++) {
-      Move *cand = move_list_get_move(ml, m);
-      if (move_get_type(cand) != GAME_EVENT_EXCHANGE) continue;
-      move_copy(gr->eb_action_buf[slot], cand);
-      gr->eb_action_present[slot] = true;
-      if (slot > max_slot) max_slot = slot;
-      slot++;
-    }
-    if (include_play_in_subset && slot < EB_MAX_ACTIONS) {
-      for (int m = 0; m < n_moves; m++) {
+    for (int phase = 0; phase < 2 && slot < EB_MAX_ACTIONS; phase++) {
+      const game_event_t kind = (phase == 0)
+          ? GAME_EVENT_EXCHANGE
+          : GAME_EVENT_TILE_PLACEMENT_MOVE;
+      if (kind == GAME_EVENT_TILE_PLACEMENT_MOVE && !has_play) continue;
+      for (int m = 0; m < n_moves && slot < EB_MAX_ACTIONS; m++) {
         Move *cand = move_list_get_move(ml, m);
-        if (move_get_type(cand) == GAME_EVENT_TILE_PLACEMENT_MOVE) {
-          move_copy(gr->eb_action_buf[slot], cand);
-          gr->eb_action_present[slot] = true;
-          play_slot = slot;
-          if (slot > max_slot) max_slot = slot;
-          break;
+        if (move_get_type(cand) != kind) continue;
+        rack_reset(&tmp_leave);
+        get_leave_for_move(cand, gr->game, &tmp_leave);
+        char leave_str[RACK_SIZE + 2];
+        eb_render_leave(&tmp_leave, ld, leave_str, sizeof(leave_str));
+        const int score = equity_to_int(move_get_score(cand));
+        char sig[SIG_LEN];
+        const char tc = (kind == GAME_EVENT_EXCHANGE) ? 'X' : 'P';
+        snprintf(sig, sizeof(sig), "%c%d|%s", tc, score, leave_str);
+        bool dup = false;
+        for (int k = 0; k < n_sigs; k++) {
+          if (strcmp(slot_sig[k], sig) == 0) { dup = true; break; }
         }
+        if (dup) continue;
+        memcpy(slot_sig[n_sigs++], sig, SIG_LEN);
+        move_copy(gr->eb_action_buf[slot], cand);
+        gr->eb_action_present[slot] = true;
+        if (kind == GAME_EVENT_TILE_PLACEMENT_MOVE && play_slot < 0) {
+          play_slot = slot;
+        }
+        if (slot > max_slot) max_slot = slot;
+        slot++;
       }
     }
   } else {
-    // K=3 mode: slot 1 = best-exch, slot 2 = best-play.
+    // OPP_FIRST / OPP_CLOSEST → 2 slots always: pass + best-equity-exch.
+    // OPP_MID → if is_pass: same 2 slots; else 0 slots (natural play forces
+    //          best-equity-exch via the role-driven force block).
+    if (role == EB_ROLE_OPP_MID && !is_pass_rack) return 0;
     Move *best_exch = NULL;
-    Move *best_play = NULL;
-    for (int m = 0; m < n_moves && (!best_exch || !best_play); m++) {
+    for (int m = 0; m < n_moves; m++) {
       Move *cand = move_list_get_move(ml, m);
-      const game_event_t mt = move_get_type(cand);
-      if (!best_exch && mt == GAME_EVENT_EXCHANGE) best_exch = cand;
-      else if (!best_play && mt == GAME_EVENT_TILE_PLACEMENT_MOVE)
-        best_play = cand;
+      if (move_get_type(cand) == GAME_EVENT_EXCHANGE) {
+        best_exch = cand;
+        break;
+      }
     }
-    if (best_exch) {
-      move_copy(gr->eb_action_buf[1], best_exch);
-      gr->eb_action_present[1] = true;
-      if (1 > max_slot) max_slot = 1;
-    }
-    if (best_play) {
-      move_copy(gr->eb_action_buf[2], best_play);
-      gr->eb_action_present[2] = true;
-      play_slot = 2;
-      if (2 > max_slot) max_slot = 2;
-    }
+    if (best_exch == NULL) return 0;  // Can't fork with no exchange option.
+    move_set_as_pass(gr->eb_action_buf[0]);
+    gr->eb_action_present[0] = true;
+    move_copy(gr->eb_action_buf[1], best_exch);
+    gr->eb_action_present[1] = true;
+    max_slot = 1;
   }
 
-  // Determine the natural slot — what HastyBot/force-pass would have
-  // chosen from OUR ENUMERATED SET. Scan movegen output in equity order;
-  // the first move whose action matches an enumerated slot is natural.
-  // For exchanges that's a multiset comparison of exchanged tiles; for
-  // tile placements any play matches our single best-play slot (since
-  // movegen emits in equity order and our play_slot holds the best).
-  // is_pass racks bypass equity entirely — pass_cycle force-pass would
-  // dominate regardless.
-  if (max_slot >= 0) {
+  // Natural-slot scan — only meaningful at the TARGET turn (where the
+  // divergence filter and snap recording need it). For OPP_* turns we don't
+  // record, so natural_slot stays -1.
+  if (role == EB_ROLE_TARGET && max_slot >= 0) {
     if (is_pass_rack) {
       gr->eb_natural_slot = 0;
     } else {
@@ -2232,7 +2394,6 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
             Move *slot_mv = gr->eb_action_buf[s];
             if (move_get_type(slot_mv) != GAME_EVENT_EXCHANGE) continue;
             if (move_get_tiles_played(slot_mv) != nt_cand) continue;
-            // Multiset equality on machine-letter tile lists.
             uint8_t cnt_a[MAX_ALPHABET_SIZE] = {0};
             uint8_t cnt_b[MAX_ALPHABET_SIZE] = {0};
             for (int i = 0; i < nt_cand; i++) {
@@ -2249,13 +2410,13 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
     }
   }
 
-  // Force-table extension: append any active force-target slots so the DFS
-  // explores them too. Each appended slot's eb_force_target_for_slot[]
-  // points to the target; eb_emit_leaf credits the target's deficit when
-  // the snap is emitted.
-  if (w->shared_data->force_table != NULL &&
+  // Force-table annotation: at TARGET, match populated slots to active
+  // force-targets so eb_emit_leaf can credit deficits. Force-table fires
+  // only at the target turn (validated at startup).
+  if (role == EB_ROLE_TARGET &&
+      w->shared_data->force_table != NULL &&
       (w->shared_data->eb_force_turns_mask & (1 << turn))) {
-    max_slot = eb_append_force_target_slots(w, gr, ml, n_moves, max_slot);
+    eb_annotate_force_targets_to_slots(w, gr, max_slot);
   }
 
   // Need at least 2 populated slots for the fork to be meaningful.
@@ -2271,64 +2432,51 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
   EmptyBoardRecorder *ebr = w->shared_data->empty_board_recorder;
   EmptyBoardStrataRecorder *ebs = w->shared_data->empty_board_strata_recorder;
   if ((!ebr && !ebs) || gr->eb_n_snaps == 0) return;
-  // Natural-post-Tk filter: emit snap at turn Tk only if no divergence
-  // occurred AFTER Tk. eb_last_divergence_turn is the last non-natural
-  // fork in this leaf's ancestry (-1 = pure natural, all snaps qualify).
-  // Condition: last_divergence_turn <= snap_turn (equiv: not > snap_turn).
-  // This ensures each (Tk, action) row appears in exactly one leaf — the
-  // one where every subsequent fork chose the natural slot.
+  // Single-target-turn recording: emit one row at the target snap only.
+  // Pre-target snaps are pass-cycle plumbing; post-target turns play
+  // naturally with no fork (so the natural-post-Tk filter is trivially
+  // satisfied for the target snap).
+  const int target_turn = w->shared_data->eb_target_turn;
+  const int idx = target_turn - 1;
+  if (idx < 0 || idx >= gr->eb_n_snaps) return;
   const int s0 =
       equity_to_int(player_get_score(game_get_player(gr->game, 0)));
   const int s1 =
       equity_to_int(player_get_score(game_get_player(gr->game, 1)));
-  for (int i = 0; i < gr->eb_n_snaps; i++) {
-    if (gr->eb_last_divergence_turn > gr->eb_snaps[i].turn_on_empty_board) {
-      continue;
-    }
-    const int p = gr->eb_snaps[i].player_on_turn;
-    const int my = (p == 0) ? s0 : s1;
-    const int opp = (p == 0) ? s1 : s0;
-    const int outcome = my > opp ? 2 : (my == opp ? 1 : 0);
-    empty_board_recorder_write(
-        ebr, gr->game_number, branch_id,
-        gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
-        gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
-        gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
-        gr->eb_snaps[i].leave, outcome, gr->eb_p2_rack_source,
-        gr->eb_snaps[i].natural_slot);
-    empty_board_strata_write(
-        w->shared_data->empty_board_strata_recorder, gr->game_number,
-        branch_id, gr->eb_snaps[i].turn_on_empty_board, gr->eb_snaps[i].rack,
-        gr->eb_snaps[i].opp_history, gr->eb_snaps[i].action_kind,
-        gr->eb_snaps[i].action_repr, gr->eb_snaps[i].action_size,
-        gr->eb_snaps[i].leave, outcome, gr->eb_p2_rack_source,
-        gr->eb_snaps[i].natural_slot, gr->eb_snaps[i].move_score,
-        gr->eb_divergence_turn, gr->eb_p1_rack_source,
-        gr->eb_p1_force_kind, gr->eb_p2_force_kind);
+  const int p = gr->eb_snaps[idx].player_on_turn;
+  const int my = (p == 0) ? s0 : s1;
+  const int opp = (p == 0) ? s1 : s0;
+  const int outcome = my > opp ? 2 : (my == opp ? 1 : 0);
+  empty_board_recorder_write(
+      ebr, gr->game_number, branch_id,
+      gr->eb_snaps[idx].turn_on_empty_board, gr->eb_snaps[idx].rack,
+      gr->eb_snaps[idx].opp_history, gr->eb_snaps[idx].action_kind,
+      gr->eb_snaps[idx].action_repr, gr->eb_snaps[idx].action_size,
+      gr->eb_snaps[idx].leave, outcome, gr->eb_p2_rack_source,
+      gr->eb_snaps[idx].natural_slot);
+  empty_board_strata_write(
+      ebs, gr->game_number,
+      branch_id, gr->eb_snaps[idx].turn_on_empty_board, gr->eb_snaps[idx].rack,
+      gr->eb_snaps[idx].opp_history, gr->eb_snaps[idx].action_kind,
+      gr->eb_snaps[idx].action_repr, gr->eb_snaps[idx].action_size,
+      gr->eb_snaps[idx].leave, outcome, gr->eb_p2_rack_source,
+      gr->eb_snaps[idx].natural_slot, gr->eb_snaps[idx].move_score,
+      gr->eb_divergence_turn, gr->eb_p1_rack_source,
+      gr->eb_p1_force_kind, gr->eb_p2_force_kind);
 
-    // Force-target credit: if this snap's slot was force-table-driven,
-    // decrement the target's deficit using THIS leaf's outcome at the
-    // forced player's diff. (Forced slot diff = current cur_diff at the
-    // turn; for cycle turns with no plays before, cur_diff is always 0.)
-    const int snap_turn = gr->eb_snaps[i].turn_on_empty_board;
-    if (snap_turn >= 1 && snap_turn <= 6) {
-      ForceTarget *ft_target = gr->eb_snap_force_target[snap_turn];
-      if (ft_target != NULL && w->shared_data->force_table != NULL) {
-        const int p_idx = gr->eb_snaps[i].player_on_turn;
-        const int my_final =
-            equity_to_int(player_get_score(game_get_player(gr->game, p_idx)));
-        const int opp_final =
-            equity_to_int(
-                player_get_score(game_get_player(gr->game, 1 - p_idx)));
-        const bool is_tie = (my_final == opp_final);
-        const bool is_win = (my_final > opp_final);
-        // Credit at the post-action diff = pre_action_diff (0 in cycle) +
-        // this snap's move_score. Matches the aggregator and bucketing
-        // convention so credits land in the correct diff bucket.
-        force_table_credit_game(w->shared_data->force_table, ft_target,
-                                gr->eb_snaps[i].move_score, is_win, is_tie);
-      }
-    }
+  // Force-target credit at the target snap.
+  ForceTarget *ft_target = gr->eb_snap_force_target[target_turn];
+  if (ft_target != NULL && w->shared_data->force_table != NULL) {
+    const int p_idx = gr->eb_snaps[idx].player_on_turn;
+    const int my_final =
+        equity_to_int(player_get_score(game_get_player(gr->game, p_idx)));
+    const int opp_final =
+        equity_to_int(
+            player_get_score(game_get_player(gr->game, 1 - p_idx)));
+    const bool is_tie = (my_final == opp_final);
+    const bool is_win = (my_final > opp_final);
+    force_table_credit_game(w->shared_data->force_table, ft_target,
+                            gr->eb_snaps[idx].move_score, is_win, is_tie);
   }
 }
 
@@ -2371,12 +2519,12 @@ static bool swap_player_rack(Game *game, int p, const char *target_rack) {
   return false;
 }
 
-// At T6, pick a rack source uniformly from {pass, exch, bingo, rare,
-// play} (5 cells × 20%) and inject a rack from the chosen source. Each
-// pool is independent — missing pools leave the natural rack for that
-// 1/5. Only fires when the on-turn player matches rare_target_player
-// (default P2).
-static void inject_t6_rack_by_category(
+// At the start of the target turn, pick a rack source uniformly from
+// {pass, exch, bingo, rare, play} (5 cells × 20%) and inject a rack from
+// the chosen source. Each pool is independent — missing pools leave the
+// natural rack for that 1/5. Only fires when the on-turn player matches
+// rare_target_player (auto-derived from target turn parity).
+static void inject_target_turn_rack_by_category(
     AutoplayWorker *w, GameRunner *gr, uint64_t seed) {
   const int p = game_get_player_on_turn_index(gr->game);
   if (p != w->shared_data->rare_target_player) return;
@@ -2415,19 +2563,20 @@ static void inject_t6_rack_by_category(
 static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
                         uint64_t branch_id) {
   while (!game_runner_is_game_over(gr)) {
-    // T6 source-mix injection: at the start of T6 (eb_n_snaps==5 means
-    // T1-T5 done, board still empty) pick a rack source uniformly from
-    // {pass, exch, bingo, rare, probability} and inject a rack from
-    // that source. Skips if no pools loaded or on-turn player isn't the
-    // rare_target_player. probability = no-op natural rack.
-    if (gr->eb_active && gr->eb_n_snaps == 5 &&
+    // Target-turn source-mix injection: at the start of the target turn
+    // (eb_n_snaps == target_turn - 1, board still empty) pick a rack source
+    // uniformly from {pass, exch, bingo, rare, play} and inject a rack from
+    // the chosen source. Skips if no pools loaded or on-turn player isn't the
+    // rare_target_player.
+    if (gr->eb_active &&
+        gr->eb_n_snaps == w->shared_data->eb_target_turn - 1 &&
         board_get_tiles_played(game_get_board(gr->game)) == 0 &&
         (w->shared_data->pass_pool != NULL ||
          w->shared_data->exch_pool != NULL ||
          w->shared_data->bingo_pool != NULL ||
          w->shared_data->play_pool != NULL ||
          w->shared_data->rare_rack_cells != NULL)) {
-      inject_t6_rack_by_category(w, gr, gr->seed ^ branch_id);
+      inject_target_turn_rack_by_category(w, gr, gr->seed ^ branch_id);
     }
     const int n_actions = eb_enumerate_actions(w, gr);
     if (n_actions == 0) {
@@ -2508,32 +2657,38 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
                                      const AutoplayIterOutput *iter_output) {
   const int starting_player_index = (int)(iter_output->iter_count % 2);
 
-  // Slice 2 dispatch: K-way fork DFS over the empty-board cycle subtree.
-  // Single-runner mode — game_runner2 is unused. Each pair_id explores its
-  // own fork tree, emitting per-leaf records.
+  // EB single-target-turn dispatch: single-runner mode, each pair explores
+  // a small fork tree (forks at OPP_FIRST/OPP_CLOSEST/OPP_MID(is_pass) and
+  // full fan-out at TARGET) and emits one record per leaf at the target.
   if (autoplay_worker->shared_data->eb_branch_active &&
       autoplay_worker->shared_data->pass_cycle_table != NULL) {
-    int starter = starting_player_index;
-    int p1_force_kind = 0;   // 0 = pass (is_pass=1 rack), 1 = exch
-    int p2_rack_source = 0;  // 0 = pool, 1 = bag-random
-    int p2_force_kind = 0;   // 0 = pass, 1 = exch
-    if (autoplay_worker->shared_data->eb_mix_random) {
-      // iter_count bit allocation (T1-pool, T2-balanced mode):
-      //   bit 0: P1 force kind (drives pool rejection sampling 50/50
-      //          between is_pass=1 and is_pass=0 racks)
-      //   bit 1: starter
-      //   bit 2: P2 rack source (0 = pool, 1 = bag-random)
-      //   bit 3: P2 force kind at T2 (0 = pass, 1 = exch)
-      p1_force_kind = (int)(iter_output->iter_count & 1ULL);
-      starter = (int)((iter_output->iter_count >> 1) & 1ULL);
-      p2_rack_source = (int)((iter_output->iter_count >> 2) & 1ULL);
-      p2_force_kind = (int)((iter_output->iter_count >> 3) & 1ULL);
-    }
+    // Pin starter to P1 (index 0) so the on-turn player at the target turn
+    // always matches the auto-derived rare_target_player. With alternating
+    // starter, half of pairs would have wrong-parity on-turn at target and
+    // miss the inject. eb_p1_force_kind drives the STARTER's rack class —
+    // with starter pinned, this is global P1.
+    //
+    // Opponent at OPP_FIRST gets a 50/50 pool sample (is_pass=1 vs is_pass=0)
+    // alternating per pair via iter_count bit 0. Recording player's
+    // pre-target rack is replaced at TARGET inject, so its force_kind is
+    // immaterial — pin to 0.
+    const int target = autoplay_worker->shared_data->eb_target_turn;
+    const int opp_force_kind = (int)(iter_output->iter_count & 1ULL);
     game_runner1->eb_p1_rack_source = 0;
-    game_runner1->eb_p1_force_kind = p1_force_kind;
-    game_runner1->eb_p2_rack_source = p2_rack_source;
-    game_runner1->eb_p2_force_kind = p2_force_kind;
-    game_runner_start(autoplay_worker, game_runner1, iter_output, starter, 0);
+    game_runner1->eb_p2_rack_source = 0;
+    if (target % 2 == 0) {
+      // Even target → P2 records, P1 is opponent. Alternate P1's force_kind.
+      game_runner1->eb_p1_force_kind = opp_force_kind;
+      game_runner1->eb_p2_force_kind = 0;
+    } else {
+      // Odd target → P1 records, P2 is opponent. Alternate P2's force_kind.
+      // (target=1 has no opp pre-target turns; opp_force_kind is unused but
+      // the assignment is harmless.)
+      game_runner1->eb_p1_force_kind = 0;
+      game_runner1->eb_p2_force_kind = opp_force_kind;
+    }
+    game_runner_start(autoplay_worker, game_runner1, iter_output,
+                      /*starter=*/0, 0);
     play_eb_dfs(autoplay_worker, game_runner1, 0);
     autoplay_add_game(autoplay_worker, game_runner1, false);
     return;
