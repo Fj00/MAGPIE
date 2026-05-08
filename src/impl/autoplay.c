@@ -120,11 +120,6 @@ typedef struct AutoplaySharedData {
   // by MAGPIE_EMPTY_BOARD_BRANCH=1. When set, play_autoplay_game_or_game_pair
   // dispatches a single-runner DFS that explores forks at branchable turns.
   bool eb_branch_active;
-  // Bitmask of empty-board cycle turns at which to consult the force_table
-  // and add matching forced moves as additional DFS slots (scope-B forcing).
-  // Bit N set = active at turn N. Set by MAGPIE_EB_FORCE_TURNS env var
-  // (comma-separated turn list, e.g. "6" or "5,6"). Requires force_table.
-  int eb_force_turns_mask;
   // Single-target-turn recording: which turn (1..6) is the recording
   // target. All other turns are pass-cycle plumbing or post-target natural
   // play. Set by MAGPIE_EB_TARGET_TURN; default 6.
@@ -646,20 +641,9 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
             "empty_board: K-way fork branching ENABLED (turns 3-5 if "
             "is_pass rack)\n");
   }
-  shared_data->eb_force_turns_mask = 0;
-  const char *eb_force = getenv("MAGPIE_EB_FORCE_TURNS");
-  if (eb_force && eb_force[0] != '\0') {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%s", eb_force);
-    char *tok = strtok(buf, ",");
-    while (tok != NULL) {
-      const int t = atoi(tok);
-      if (t >= 1 && t <= 6) shared_data->eb_force_turns_mask |= (1 << t);
-      tok = strtok(NULL, ",");
-    }
-    fprintf(stderr, "empty_board: force-table ACTIVE at turns mask 0x%x "
-            "(input: %s)\n", shared_data->eb_force_turns_mask, eb_force);
-  }
+  // Force-table activation is implicit: when EB is on (eb_branch_active),
+  // per-emit credit fires at the TARGET turn. When EB is off, legacy
+  // game-end credit fires via pending_force_target. No separate env var.
   return shared_data;
 }
 
@@ -1845,10 +1829,10 @@ void autoplay_add_game(AutoplayWorker *autoplay_worker,
   // targets this is the moment the deficit actually decrements (and only
   // when the outcome bumps min(wins, losses) at the force-turn diff).
   // Skip if EB-cycle force-table mode is active: per-emit credit in
-  // eb_emit_leaf already handled deficits for forced T2-T6 slots.
+  // eb_emit_leaf already handled deficits at the target turn.
   ForceTable *ft = autoplay_worker->shared_data->force_table;
   if (ft != NULL && game_runner->pending_force_target != NULL &&
-      autoplay_worker->shared_data->eb_force_turns_mask == 0) {
+      !autoplay_worker->shared_data->eb_branch_active) {
     const Game *game = game_runner->game;
     const int p_idx = game_runner->pending_force_player_index;
     const int my_final =
@@ -2412,10 +2396,8 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
 
   // Force-table annotation: at TARGET, match populated slots to active
   // force-targets so eb_emit_leaf can credit deficits. Force-table fires
-  // only at the target turn (validated at startup).
-  if (role == EB_ROLE_TARGET &&
-      w->shared_data->force_table != NULL &&
-      (w->shared_data->eb_force_turns_mask & (1 << turn))) {
+  // implicitly at the target turn whenever a force_table is loaded.
+  if (role == EB_ROLE_TARGET && w->shared_data->force_table != NULL) {
     eb_annotate_force_targets_to_slots(w, gr, max_slot);
   }
 
