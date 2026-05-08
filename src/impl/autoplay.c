@@ -620,6 +620,25 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
             shared_data->bingo_pool ? "yes" : "no",
             shared_data->play_pool ? "yes" : "no",
             shared_data->rare_rack_cells ? "yes" : "no");
+    // Loud warning if any pool is missing — rack-class distribution at
+    // TARGET will be skewed toward natural (pass-cycle pool) for the
+    // missing 1/5 share(s).
+    int missing = !shared_data->pass_pool + !shared_data->exch_pool +
+                  !shared_data->bingo_pool + !shared_data->play_pool +
+                  !shared_data->rare_rack_cells;
+    if (missing > 0) {
+      fprintf(stderr,
+              "WARNING: %d of 5 pools NOT loaded — TARGET-turn rack "
+              "distribution will be skewed (%d/5 = %.0f%% natural fallback). "
+              "Load all 5 of MAGPIE_EB_{PASS,EXCH,BINGO,PLAY,RARE}_POOL "
+              "for uniform 20/20/20/20/20 5-way mix.\n",
+              missing, missing, missing * 20.0);
+    }
+  } else {
+    fprintf(stderr,
+            "WARNING: NO pools loaded — TARGET-turn racks will be 100%% "
+            "natural (pass-cycle pool sample). Set "
+            "MAGPIE_EB_{PASS,EXCH,BINGO,PLAY,RARE}_POOL for the 5-way mix.\n");
   }
 
   shared_data->empty_board_recorder = NULL;
