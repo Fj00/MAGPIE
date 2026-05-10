@@ -851,7 +851,7 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
   }
   fprintf(f, "kind,bag,length,type,exchange,subleave,current,target,deficit,"
              "forced_games_estimate,diff_min,diff_max,rarity_score\n");
-  const char *kind_names[] = {"stratum", "tile", "pair"};
+  const char *kind_names[] = {"stratum", "tile", "pair", "bag_tile"};
   const char *type_names[] = {"all", "cons", "mixed", "vowel"};
   int rows_written = 0;
   for (int i = 0; i < table->num_targets; i++) {
@@ -859,14 +859,20 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
     if (t->deficit <= 0) {
       continue;
     }
-    char subleave[3] = {0};
-    if (t->subleave_count >= 1) {
-      subleave[0] = (t->subleave_mls[0] == 0) ? '?' :
-                    ld->ld_ml_to_hl[t->subleave_mls[0]][0];
-    }
-    if (t->subleave_count >= 2) {
-      subleave[1] = (t->subleave_mls[1] == 0) ? '?' :
-                    ld->ld_ml_to_hl[t->subleave_mls[1]][0];
+    char subleave[8] = {0};  // up to "<TILE>_free" = 6 + null
+    if (t->kind == FORCE_TARGET_BAG_TILE) {
+      const char tile_ch = (t->subleave_mls[0] == 0)
+                               ? '?' : ld->ld_ml_to_hl[t->subleave_mls[0]][0];
+      snprintf(subleave, sizeof(subleave), "%c_free", tile_ch);
+    } else {
+      if (t->subleave_count >= 1) {
+        subleave[0] = (t->subleave_mls[0] == 0) ? '?' :
+                      ld->ld_ml_to_hl[t->subleave_mls[0]][0];
+      }
+      if (t->subleave_count >= 2) {
+        subleave[1] = (t->subleave_mls[1] == 0) ? '?' :
+                      ld->ld_ml_to_hl[t->subleave_mls[1]][0];
+      }
     }
     // current/target/forced_games_estimate aren't tracked precisely after
     // runtime; emit 0 placeholders except deficit (the reliable field).

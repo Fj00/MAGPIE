@@ -1788,14 +1788,16 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
       const int leave_len = (int)strlen(game_runner->eb_snaps[slot].leave);
       const int is_exch_snap =
           (game_runner->eb_snaps[slot].action_kind == 1) ? 1 : 0;
-      // Diff at this snap: my_score - opp_score (pre-move).
+      // Diff at this snap: matches the aggregator's "diff = pre_action_diff
+      // + move_score" convention (post-action, from on-turn player's
+      // perspective). For passes/exchanges score==0, so eff_diff == pre.
       const int s0_snap =
           equity_to_int(player_get_score(game_get_player(game, 0)));
       const int s1_snap =
           equity_to_int(player_get_score(game_get_player(game, 1)));
       const int my_snap = (player_on_turn_index == 0) ? s0_snap : s1_snap;
       const int opp_snap = (player_on_turn_index == 0) ? s1_snap : s0_snap;
-      const int diff_snap = my_snap - opp_snap;
+      const int pre_diff = my_snap - opp_snap;
       // Leave-type classification (only matters at L >= 3).
       Rack tmp_leave_for_type;
       rack_set_dist_size(&tmp_leave_for_type, ds_eb);
@@ -1810,6 +1812,7 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
               ? force_classify_leave(&tmp_leave_for_type, ld_eb)
               : LEAVE_TYPE_ALL;
       const int snap_score = game_runner->eb_snaps[slot].move_score;
+      const int eff_diff_snap = pre_diff + snap_score;
       // Iterate the shape bucket's slots; collect BAG_TILE matches.
       int bucket_count = 0;
       ForceTargetSlot *slots = force_table_lookup_slots_by_shape(
@@ -1824,7 +1827,7 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
             continue;
           }
           if (force_target_matches_bag(s->cold, player_rack, leave_len,
-                                       ltype_snap, snap_score, diff_snap,
+                                       ltype_snap, snap_score, eff_diff_snap,
                                        ld_eb)) {
             game_runner->eb_snap_bag_targets[slot][bag_n++] = s->cold;
           }
