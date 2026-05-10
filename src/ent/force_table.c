@@ -84,6 +84,9 @@ static ForceTargetKind parse_kind(const char *s) {
   if (strcmp(s, "pair") == 0) {
     return FORCE_TARGET_PAIR;
   }
+  if (strcmp(s, "bag_tile") == 0) {
+    return FORCE_TARGET_BAG_TILE;
+  }
   return -1;
 }
 
@@ -202,12 +205,58 @@ bool force_target_matches(const ForceTarget *target, const Rack *leave,
 // for each tile type required to be present in the leave. For pair targets
 // with same-tile pairs (e.g. "??"), only one bit is set in the bitmap (the
 // count check is done downstream).
+//
+// BAG_TILE targets return 0 — their match predicate is on the rack, not on
+// the leave. The leave-bitmap pre-filter `(leave_bitmap & req) == req`
+// trivially passes when req == 0 (don't reject), so BAG_TILE slots fall
+// through to the per-slot kind check in the matching loop.
 static inline uint32_t required_bitmap_for_target(const ForceTarget *target) {
+  if (target->kind == FORCE_TARGET_BAG_TILE) {
+    return 0;
+  }
   uint32_t bm = 0;
   for (int i = 0; i < target->subleave_count; i++) {
     bm |= ((uint32_t)1) << target->subleave_mls[i];
   }
   return bm;
+}
+
+bool force_target_matches_bag(const ForceTarget *target,
+                              const Rack *pre_move_rack,
+                              int leave_length, LeaveType leave_type,
+                              int score, int diff,
+                              const LetterDistribution *ld) {
+  if (target->deficit <= 0) {
+    return false;
+  }
+  if (target->kind != FORCE_TARGET_BAG_TILE) {
+    return false;
+  }
+  if (leave_length != target->leave_length) {
+    return false;
+  }
+  int is_exchange = (score == 0) ? 1 : 0;
+  if (is_exchange != target->exchange) {
+    return false;
+  }
+  if (diff < target->diff_min || diff > target->diff_max) {
+    return false;
+  }
+  // Type check (parallel to force_target_matches): for plays with leave_length
+  // >= 3, the leave's cons/mixed/vowel classification must match the target.
+  if (target->exchange == 0 && target->leave_length >= 3) {
+    if (leave_type != target->leave_type) {
+      return false;
+    }
+  }
+  // _free predicate: rack lacks at least one of target's tile.
+  // rack.count(t) < TILE_BAG[t] ⇒ unseen > 0 ⇒ bag_exp_t > 0.
+  const MachineLetter t = target->subleave_mls[0];
+  const int tile_bag_count = ld_get_dist(ld, t);
+  if (pre_move_rack->array[t] >= tile_bag_count) {
+    return false;
+  }
+  return true;
 }
 
 // Populate a ForceTargetSlot from its full target. Used at load time and
@@ -584,6 +633,33 @@ ForceTable *force_table_create(const char *csv_path,
       t->subleave_count = 2;
       if (t->subleave_mls[0] == 0xFF || t->subleave_mls[1] == 0xFF) {
         log_warn("force_table: unknown pair %s on line %d", subleave, line_no);
+        table->num_targets--;
+        continue;
+      }
+    } else if (kind == FORCE_TARGET_BAG_TILE) {
+      // Expected format: "<TILE>_free" — single tile char + "_free" suffix.
+      // The "_free" semantics: cell credits when the rack LACKS at least
+      // one of this tile (unseen > 0). The "_held" complement is not
+      // needed (handled by bucket merging when impossible, dominant by
+      // default when possible).
+      const size_t sl_len = strlen(subleave);
+      if (sl_len < 6 || strcmp(subleave + sl_len - 5, "_free") != 0) {
+        log_warn("force_table: bad bag_tile subleave %s on line %d "
+                 "(expected '<TILE>_free')", subleave, line_no);
+        table->num_targets--;
+        continue;
+      }
+      if (sl_len != 6) { // single tile char + "_free"
+        log_warn("force_table: bag_tile subleave %s must be 1 tile char + "
+                 "'_free' on line %d", subleave, line_no);
+        table->num_targets--;
+        continue;
+      }
+      t->subleave_mls[0] = char_to_ml(ld, subleave[0]);
+      t->subleave_count = 1;
+      if (t->subleave_mls[0] == 0xFF) {
+        log_warn("force_table: unknown bag_tile %s on line %d", subleave,
+                 line_no);
         table->num_targets--;
         continue;
       }

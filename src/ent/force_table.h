@@ -13,7 +13,18 @@ typedef enum {
   FORCE_TARGET_STRATUM = 0,
   FORCE_TARGET_TILE = 1,
   FORCE_TARGET_PAIR = 2,
+  // BAG_TILE: cell credits when the player's pre-move RACK lacks at least
+  // one of the target's tile (rack.count(tile) < TILE_BAG[tile]). Drives
+  // the V model's `bag_exp_<tile>` feature variation in skewed buckets.
+  // CSV `subleave` field uses "<TILE>_free" format (e.g. "Z_free").
+  // Count-based decrement at game-end (same path as TILE/PAIR).
+  FORCE_TARGET_BAG_TILE = 3,
 } ForceTargetKind;
+
+// Per-game cap on simultaneous BAG_TILE matches. A move's rack composition
+// can satisfy at most 27 cells (one per tile in the bag), so 27 is the
+// hard ceiling. GameRunner stores up to this many pending bag targets.
+#define MAX_PENDING_BAG_TARGETS 27
 
 typedef enum {
   LEAVE_TYPE_ALL = 0,
@@ -116,6 +127,18 @@ uint32_t *force_table_lookup_bitmaps_by_shape(ForceTable *table, int bag,
 // matching).
 bool force_target_matches(const ForceTarget *target, const Rack *leave,
                           int score, int diff);
+
+// BAG_TILE matcher: checks whether the player's pre-move RACK satisfies
+// the target's `_free` predicate (rack lacks at least one of the target's
+// tile, so unseen_tile > 0). Same (leave_length, exchange, type, diff)
+// gates as `force_target_matches`; uses the leave's classification (passed
+// by caller via the leave's length and the LeaveType pre-classified).
+// `ld` is needed to look up TILE_BAG[tile] for the count check.
+bool force_target_matches_bag(const ForceTarget *target,
+                              const Rack *pre_move_rack,
+                              int leave_length, LeaveType leave_type,
+                              int score, int diff,
+                              const LetterDistribution *ld);
 
 // Decrement a target's deficit. If the deficit transitions from 1 to 0,
 // the table's active-target counter is decremented. Returns true if the

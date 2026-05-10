@@ -855,6 +855,13 @@ typedef struct GameRunner {
   // descends into a forced slot; eb_emit_leaf reads to credit the deficit
   // per emitted snap. Saved/restored across sibling forks via EbMetaSave.
   ForceTarget *eb_snap_force_target[7];
+  // Per-snap BAG_TILE matches. Computed at snap-capture time using the
+  // pre-move rack against the active shape bucket's BAG_TILE slots.
+  // Up to MAX_PENDING_BAG_TARGETS per snap (one per tile in bag).
+  // Credited at game-end in eb_emit_leaf — count-based, no per-cell
+  // win/loss tally.
+  ForceTarget *eb_snap_bag_targets[7][MAX_PENDING_BAG_TARGETS];
+  uint8_t eb_snap_bag_count[7];
 } GameRunner;
 
 GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
@@ -883,6 +890,7 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
     game_runner->eb_force_target_for_slot[i] = NULL;
   }
   for (int i = 0; i < 7; i++) game_runner->eb_snap_force_target[i] = NULL;
+  for (int i = 0; i < 7; i++) game_runner->eb_snap_bag_count[i] = 0;
   if (autoplay_worker->shared_data->eb_branch_active) {
     game_runner->eb_n_action_buf = EB_MAX_ACTIONS;
     for (int i = 0; i < EB_MAX_ACTIONS; i++) {
@@ -1035,6 +1043,7 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   game_runner->pending_force_target = NULL;
   game_runner->pending_force_diff = 0;
   game_runner->pending_force_player_index = 0;
+  for (int i = 0; i < 7; i++) game_runner->eb_snap_bag_count[i] = 0;
   // If every target is satisfied, treat the game as already-forced so all
   // its turns get recorded normally (unbiased hasty self-play).
   game_runner->force_triggered =
@@ -1765,6 +1774,65 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
             : 0;
     game_runner->eb_n_snaps++;
 
+    // BAG_TILE force-cell matching. Runs only when this snap IS the target
+    // turn (only one snap per game gets emitted/credited). The pre-move
+    // rack composition is the match key; all matched cells are credited
+    // count-based at game-end via eb_emit_leaf.
+    game_runner->eb_snap_bag_count[slot] = 0;
+    ForceTable *ft_bag = game_runner->shared_data->force_table;
+    const int target_turn_check = game_runner->shared_data->eb_target_turn;
+    if (ft_bag != NULL && (slot + 1) == target_turn_check) {
+      const int bag_count_snap =
+          bag_get_letters(game_get_bag(game)) + (RACK_SIZE);
+      // Leave length and exchange flag derived from snap fields.
+      const int leave_len = (int)strlen(game_runner->eb_snaps[slot].leave);
+      const int is_exch_snap =
+          (game_runner->eb_snaps[slot].action_kind == 1) ? 1 : 0;
+      // Diff at this snap: my_score - opp_score (pre-move).
+      const int s0_snap =
+          equity_to_int(player_get_score(game_get_player(game, 0)));
+      const int s1_snap =
+          equity_to_int(player_get_score(game_get_player(game, 1)));
+      const int my_snap = (player_on_turn_index == 0) ? s0_snap : s1_snap;
+      const int opp_snap = (player_on_turn_index == 0) ? s1_snap : s0_snap;
+      const int diff_snap = my_snap - opp_snap;
+      // Leave-type classification (only matters at L >= 3).
+      Rack tmp_leave_for_type;
+      rack_set_dist_size(&tmp_leave_for_type, ds_eb);
+      rack_reset(&tmp_leave_for_type);
+      if (move_get_type(move) == GAME_EVENT_PASS) {
+        rack_copy(&tmp_leave_for_type, player_rack);
+      } else {
+        get_leave_for_move(move, game, &tmp_leave_for_type);
+      }
+      const LeaveType ltype_snap =
+          (leave_len >= 3 && is_exch_snap == 0)
+              ? force_classify_leave(&tmp_leave_for_type, ld_eb)
+              : LEAVE_TYPE_ALL;
+      const int snap_score = game_runner->eb_snaps[slot].move_score;
+      // Iterate the shape bucket's slots; collect BAG_TILE matches.
+      int bucket_count = 0;
+      ForceTargetSlot *slots = force_table_lookup_slots_by_shape(
+          ft_bag, bag_count_snap, leave_len, is_exch_snap, &bucket_count);
+      if (slots != NULL && bucket_count > 0) {
+        uint8_t bag_n = 0;
+        for (int t = 0; t < bucket_count &&
+             bag_n < MAX_PENDING_BAG_TARGETS; t++) {
+          ForceTargetSlot *s = &slots[t];
+          if (s->deficit <= 0 ||
+              (int)s->kind != FORCE_TARGET_BAG_TILE) {
+            continue;
+          }
+          if (force_target_matches_bag(s->cold, player_rack, leave_len,
+                                       ltype_snap, snap_score, diff_snap,
+                                       ld_eb)) {
+            game_runner->eb_snap_bag_targets[slot][bag_n++] = s->cold;
+          }
+        }
+        game_runner->eb_snap_bag_count[slot] = bag_n;
+      }
+    }
+
     // Append this action to player_on_turn's per-cycle action history.
     char *hist = (player_on_turn_index == 0) ? game_runner->eb_actions_p0
                                              : game_runner->eb_actions_p1;
@@ -2478,6 +2546,20 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
     const bool is_win = (my_final > opp_final);
     force_table_credit_game(w->shared_data->force_table, ft_target,
                             gr->eb_snaps[idx].move_score, is_win, is_tie);
+  }
+
+  // BAG_TILE credit: each cell matched at snap-capture time gets one
+  // count-based decrement (force_table_credit_game routes BAG_TILE
+  // through the non-STRATUM branch automatically).
+  if (w->shared_data->force_table != NULL && gr->eb_snap_bag_count[idx] > 0) {
+    for (int b = 0; b < gr->eb_snap_bag_count[idx]; b++) {
+      ForceTarget *bt = gr->eb_snap_bag_targets[idx][b];
+      if (bt != NULL) {
+        // is_win/is_tie irrelevant for count-based credit; pass false/false.
+        force_table_credit_game(w->shared_data->force_table, bt,
+                                gr->eb_snaps[idx].move_score, false, false);
+      }
+    }
   }
 }
 
