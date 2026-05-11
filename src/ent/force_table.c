@@ -249,9 +249,14 @@ bool force_target_matches_bag(const ForceTarget *target,
       return false;
     }
   }
-  // _free predicate: rack lacks at least one of target's tile.
-  // rack.count(t) < TILE_BAG[t] ⇒ unseen > 0 ⇒ bag_exp_t > 0.
   const MachineLetter t = target->subleave_mls[0];
+  if (target->subleave_count == 2) {
+    // Exact-count semantics: rack must have exactly subleave_mls[1] of t.
+    const int target_count = (int)target->subleave_mls[1];
+    return pre_move_rack->array[t] == target_count;
+  }
+  // _free semantics: rack lacks at least one of target's tile.
+  // rack.count(t) < TILE_BAG[t] ⇒ unseen > 0 ⇒ bag_exp_t > 0.
   const int tile_bag_count = ld_get_dist(ld, t);
   if (pre_move_rack->array[t] >= tile_bag_count) {
     return false;
@@ -637,29 +642,37 @@ ForceTable *force_table_create(const char *csv_path,
         continue;
       }
     } else if (kind == FORCE_TARGET_BAG_TILE) {
-      // Expected format: "<TILE>_free" — single tile char + "_free" suffix.
-      // The "_free" semantics: cell credits when the rack LACKS at least
-      // one of this tile (unseen > 0). The "_held" complement is not
-      // needed (handled by bucket merging when impossible, dominant by
-      // default when possible).
+      // Two subleave formats supported:
+      //   "<TILE>_free"  → cell credits when rack LACKS at least one of TILE
+      //                    (unseen > 0). subleave_count=1, mls[1] unused.
+      //   "<TILE>_<C>"   → cell credits when rack has exactly C of TILE
+      //                    (rack[t] == C). subleave_count=2, mls[1]=C.
+      //                    Used for symmetric per-count bag-rare-rack
+      //                    coverage (e.g. ?_2 = both blanks on rack).
+      //                    C is a single decimal digit 0..7.
       const size_t sl_len = strlen(subleave);
-      if (sl_len < 6 || strcmp(subleave + sl_len - 5, "_free") != 0) {
+      if (sl_len < 3 || subleave[1] != '_') {
         log_warn("force_table: bad bag_tile subleave %s on line %d "
-                 "(expected '<TILE>_free')", subleave, line_no);
-        table->num_targets--;
-        continue;
-      }
-      if (sl_len != 6) { // single tile char + "_free"
-        log_warn("force_table: bag_tile subleave %s must be 1 tile char + "
-                 "'_free' on line %d", subleave, line_no);
+                 "(expected '<TILE>_free' or '<TILE>_<digit>')",
+                 subleave, line_no);
         table->num_targets--;
         continue;
       }
       t->subleave_mls[0] = char_to_ml(ld, subleave[0]);
-      t->subleave_count = 1;
       if (t->subleave_mls[0] == 0xFF) {
         log_warn("force_table: unknown bag_tile %s on line %d", subleave,
                  line_no);
+        table->num_targets--;
+        continue;
+      }
+      if (sl_len == 6 && strcmp(subleave + 2, "free") == 0) {
+        t->subleave_count = 1;  // "_free" semantics
+      } else if (sl_len == 3 && subleave[2] >= '0' && subleave[2] <= '7') {
+        t->subleave_count = 2;  // "_<C>" exact-count semantics
+        t->subleave_mls[1] = (MachineLetter)(subleave[2] - '0');
+      } else {
+        log_warn("force_table: bag_tile subleave %s on line %d must be "
+                 "'<TILE>_free' or '<TILE>_<0-7>'", subleave, line_no);
         table->num_targets--;
         continue;
       }
@@ -863,7 +876,13 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
     if (t->kind == FORCE_TARGET_BAG_TILE) {
       const char tile_ch = (t->subleave_mls[0] == 0)
                                ? '?' : ld->ld_ml_to_hl[t->subleave_mls[0]][0];
-      snprintf(subleave, sizeof(subleave), "%c_free", tile_ch);
+      if (t->subleave_count == 2) {
+        // Exact-count: "<TILE>_<C>"
+        snprintf(subleave, sizeof(subleave), "%c_%d", tile_ch,
+                 (int)t->subleave_mls[1]);
+      } else {
+        snprintf(subleave, sizeof(subleave), "%c_free", tile_ch);
+      }
     } else {
       if (t->subleave_count >= 1) {
         subleave[0] = (t->subleave_mls[0] == 0) ? '?' :
