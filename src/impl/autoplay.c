@@ -1916,6 +1916,10 @@ void print_current_status(AutoplayWorker *autoplay_worker,
             lg_shared_data->gen_start_games,
         lg_shared_data->gens_completed + 1,
         rack_list_get_racks_below_target_count(lg_shared_data->rack_list));
+  } else if (shared_data->force_table) {
+    string_builder_add_formatted_string(
+        status_sb, " Force-table remaining deficit: %ld.\n",
+        (long)force_table_total_remaining(shared_data->force_table));
   } else {
     string_builder_add_string(status_sb, "\n");
   }
