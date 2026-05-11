@@ -135,20 +135,10 @@ static void rare_pool_load_file(RarePool *rp, const char *csv_path,
     int sub_count = (int)strlen(sub_buf);
     MachineLetter sub_ml0 = 0, sub_ml1 = 0;
     if (kind == FORCE_TARGET_BAG_TILE) {
-      // bag_tile subleave: "<TILE>_free" or "<TILE>_<C>" — match parser
-      // in force_table.c. For "_free": sub_count=1. For "_<C>": sub_count=2
-      // with mls[1] = C, used to look up the per-count cell.
+      // bag_tile subleave format: "<TILE>_free" — extract just the tile.
+      // Match force_table.c's parser. sub_count for matching = 1.
       sub_ml0 = char_to_ml(ld, sub_buf[0]);
-      const size_t sl_len = strlen(sub_buf);
-      if (sl_len == 6 && strcmp(sub_buf + 2, "free") == 0) {
-        sub_count = 1;
-      } else if (sl_len == 3 && sub_buf[1] == '_' &&
-                 sub_buf[2] >= '0' && sub_buf[2] <= '7') {
-        sub_count = 2;
-        sub_ml1 = (MachineLetter)(sub_buf[2] - '0');
-      } else {
-        continue;
-      }
+      sub_count = 1;
     } else {
       if (sub_count >= 1) sub_ml0 = char_to_ml(ld, sub_buf[0]);
       if (sub_count >= 2) sub_ml1 = char_to_ml(ld, sub_buf[1]);
