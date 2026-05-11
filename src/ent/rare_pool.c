@@ -48,6 +48,7 @@ static ForceTargetKind kind_str_to_enum(const char *s) {
   if (strcmp(s, "tile") == 0) return FORCE_TARGET_TILE;
   if (strcmp(s, "pair") == 0) return FORCE_TARGET_PAIR;
   if (strcmp(s, "stratum") == 0) return FORCE_TARGET_STRATUM;
+  if (strcmp(s, "bag_tile") == 0) return FORCE_TARGET_BAG_TILE;
   return (ForceTargetKind)-1;
 }
 
@@ -93,24 +94,21 @@ static void append_target(RareRack *r, ForceTarget *t) {
   r->targets[r->num_targets++] = t;
 }
 
-RarePool *rare_pool_create(const char *csv_path, ForceTable *force_table,
-                           const LetterDistribution *ld) {
-  if (!csv_path || !force_table || !ld) return NULL;
+// Internal: load (rack,cell) rows from a CSV into an existing pool.
+// Header is consumed; each row resolved via force_table_lookup and
+// appended to the matching rack's target list.
+static void rare_pool_load_file(RarePool *rp, const char *csv_path,
+                                 ForceTable *force_table,
+                                 const LetterDistribution *ld) {
   FILE *f = fopen(csv_path, "r");
   if (!f) {
     fprintf(stderr, "rare_pool: cannot open %s\n", csv_path);
-    return NULL;
+    return;
   }
-  RarePool *rp = (RarePool *)malloc_or_die(sizeof(RarePool));
-  rp->racks = NULL;
-  rp->num_racks = 0;
-  rp->cap_racks = 0;
-
   char line[512];
   if (!fgets(line, sizeof(line), f)) {
     fclose(f);
-    rare_pool_destroy(rp);
-    return NULL;
+    return;
   }
   // Header: rack,length,type,kind,subleave,diff
   int n_rows = 0, n_resolved = 0, n_unresolved = 0;
@@ -136,8 +134,15 @@ RarePool *rare_pool_create(const char *csv_path, ForceTable *force_table,
     if ((int)type < 0 || (int)kind < 0) continue;
     int sub_count = (int)strlen(sub_buf);
     MachineLetter sub_ml0 = 0, sub_ml1 = 0;
-    if (sub_count >= 1) sub_ml0 = char_to_ml(ld, sub_buf[0]);
-    if (sub_count >= 2) sub_ml1 = char_to_ml(ld, sub_buf[1]);
+    if (kind == FORCE_TARGET_BAG_TILE) {
+      // bag_tile subleave format: "<TILE>_free" — extract just the tile.
+      // Match force_table.c's parser. sub_count for matching = 1.
+      sub_ml0 = char_to_ml(ld, sub_buf[0]);
+      sub_count = 1;
+    } else {
+      if (sub_count >= 1) sub_ml0 = char_to_ml(ld, sub_buf[0]);
+      if (sub_count >= 2) sub_ml1 = char_to_ml(ld, sub_buf[1]);
+    }
     if (sub_ml0 == 0xFF || (sub_count >= 2 && sub_ml1 == 0xFF)) continue;
     // Force-target lookup: bag=93 (opener), exchange=0 (cells in
     // cell_rarity.csv are play-kind only — built from action_type==play).
@@ -154,10 +159,31 @@ RarePool *rare_pool_create(const char *csv_path, ForceTable *force_table,
   }
   fclose(f);
   fprintf(stderr,
-          "rare_pool: %d racks loaded; %d/%d (rack,cell) rows resolved "
-          "(%d unresolved — likely cells absent from current force_table)\n",
-          rp->num_racks, n_resolved, n_rows, n_unresolved);
+          "rare_pool: loaded %s — %d/%d rows resolved (%d unresolved); "
+          "pool now has %d racks\n",
+          csv_path, n_resolved, n_rows, n_unresolved, rp->num_racks);
+}
+
+RarePool *rare_pool_create(const char *csv_path, ForceTable *force_table,
+                           const LetterDistribution *ld) {
+  if (!csv_path || !force_table || !ld) return NULL;
+  RarePool *rp = (RarePool *)malloc_or_die(sizeof(RarePool));
+  rp->racks = NULL;
+  rp->num_racks = 0;
+  rp->cap_racks = 0;
+  rare_pool_load_file(rp, csv_path, force_table, ld);
+  if (rp->num_racks == 0) {
+    rare_pool_destroy(rp);
+    return NULL;
+  }
   return rp;
+}
+
+void rare_pool_load_more(RarePool *rp, const char *csv_path,
+                          ForceTable *force_table,
+                          const LetterDistribution *ld) {
+  if (!rp || !csv_path || !force_table || !ld) return;
+  rare_pool_load_file(rp, csv_path, force_table, ld);
 }
 
 void rare_pool_destroy(RarePool *rp) {

@@ -23,6 +23,14 @@ typedef struct RarePool RarePool;
 RarePool *rare_pool_create(const char *csv_path, ForceTable *force_table,
                            const LetterDistribution *ld);
 
+// Append more (rack, cell) rows from another CSV into an existing pool.
+// Used to merge multiple rare-pool files (e.g. leave-cell pool +
+// bag-tile pool) into a single in-memory pool the deficit-aware sampler
+// draws from uniformly. Same CSV schema as `rare_pool_create`.
+void rare_pool_load_more(RarePool *rp, const char *csv_path,
+                          ForceTable *force_table,
+                          const LetterDistribution *ld);
+
 void rare_pool_destroy(RarePool *rp);
 
 // Number of distinct racks in the pool.

@@ -607,6 +607,20 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
     shared_data->rare_rack_cells = rare_pool_create(
         rare_pool, shared_data->force_table, shared_data->ld);
   }
+  // Optional bag-tile rare pool — merged into the same in-memory pool
+  // so the deficit-aware sampler treats leave-cell and bag-cell racks
+  // uniformly. If the leave-cell pool wasn't provided, this can stand
+  // alone (rare_pool_create handles the first file).
+  const char *bag_rare_pool = getenv("MAGPIE_EB_BAG_RARE_POOL");
+  if (bag_rare_pool && bag_rare_pool[0] != '\0' && shared_data->force_table) {
+    if (shared_data->rare_rack_cells) {
+      rare_pool_load_more(shared_data->rare_rack_cells, bag_rare_pool,
+                           shared_data->force_table, shared_data->ld);
+    } else {
+      shared_data->rare_rack_cells = rare_pool_create(
+          bag_rare_pool, shared_data->force_table, shared_data->ld);
+    }
+  }
   if (shared_data->pass_pool || shared_data->exch_pool ||
       shared_data->bingo_pool || shared_data->play_pool ||
       shared_data->rare_rack_cells) {
