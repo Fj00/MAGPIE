@@ -919,14 +919,24 @@ typedef struct GameRunner {
   Move *eb_action_buf[EB_MAX_ACTIONS];
   bool eb_action_present[EB_MAX_ACTIONS];
   int eb_n_action_buf;
-  // Force-table target attached to each enumerated slot (NULL if natural).
+  // Force-table targets attached to each enumerated slot (none if natural).
   // Set by eb_append_force_target_slots; consumed in play_eb_dfs which
-  // copies the chosen slot's target into eb_snap_force_target[turn].
-  ForceTarget *eb_force_target_for_slot[EB_MAX_ACTIONS];
-  // Per-snap force-target (indexed by snap turn 1..6). Set when DFS
-  // descends into a forced slot; eb_emit_leaf reads to credit the deficit
-  // per emitted snap. Saved/restored across sibling forks via EbMetaSave.
-  ForceTarget *eb_snap_force_target[7];
+  // copies the chosen slot's targets into eb_snap_force_targets[turn][].
+  // Multi-credit: a single move can match many leave cells (e.g. each
+  // distinct tile in the leave + each distinct pair) at the same
+  // (stratum, diff). Storing the FULL set of matches lets game-end
+  // credit every matched cell, not just one.
+  // Cap chosen ample: leave_length up to 7 → 7 distinct tile cells +
+  // C(7,2)=21 pair cells + 1 stratum cell + headroom = 32.
+  enum { EB_MAX_LEAVE_TARGETS_PER_MOVE = 32 };
+  ForceTarget *eb_force_targets_for_slot[EB_MAX_ACTIONS]
+                                        [EB_MAX_LEAVE_TARGETS_PER_MOVE];
+  uint8_t eb_force_target_count_for_slot[EB_MAX_ACTIONS];
+  // Per-snap leave-target list (indexed by snap turn 1..6). Set when
+  // DFS descends into a forced slot; eb_emit_leaf reads to credit each
+  // matched leave cell. Saved/restored across sibling forks via EbMetaSave.
+  ForceTarget *eb_snap_force_targets[7][EB_MAX_LEAVE_TARGETS_PER_MOVE];
+  uint8_t eb_snap_force_target_count[7];
   // Per-snap BAG_TILE matches. Computed at snap-capture time using the
   // pre-move rack against the active shape bucket's BAG_TILE slots.
   // Up to MAX_PENDING_BAG_TARGETS per snap (one per tile in bag).
@@ -959,9 +969,9 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
   game_runner->eb_n_action_buf = 0;
   for (int i = 0; i < EB_MAX_ACTIONS; i++) {
     game_runner->eb_action_buf[i] = NULL;
-    game_runner->eb_force_target_for_slot[i] = NULL;
+    game_runner->eb_force_target_count_for_slot[i] = 0;
   }
-  for (int i = 0; i < 7; i++) game_runner->eb_snap_force_target[i] = NULL;
+  for (int i = 0; i < 7; i++) game_runner->eb_snap_force_target_count[i] = 0;
   for (int i = 0; i < 7; i++) game_runner->eb_snap_bag_count[i] = 0;
   if (autoplay_worker->shared_data->eb_branch_active) {
     game_runner->eb_n_action_buf = EB_MAX_ACTIONS;
@@ -2238,6 +2248,11 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
     move_type_cache[i] = -1;
   }
 
+  // Outer loop: iterate priorities so the slot order still favors
+  // PAIR-matching moves first, then TILE, then STRATUM. The per-priority
+  // scan only checks for ANY match at that priority — once a move is
+  // assigned to a slot, a second scan collects ALL matches (across all
+  // priorities) into the slot's multi-target list for game-end credit.
   for (int priority = FORCE_TARGET_PAIR;
        priority >= FORCE_TARGET_STRATUM && slot < EB_MAX_ACTIONS; priority--) {
     for (int m = 0; m < n_moves && slot < EB_MAX_ACTIONS; m++) {
@@ -2254,16 +2269,17 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
           ft, bag_count, leave_len, is_exch ? 1 : 0);
       if (bucket_count == 0 || bitmaps == NULL) continue;
       const uint32_t leave_bm = leave_bitmaps[m];
-      ForceTarget *matched = NULL;
+      const int eff_diff = cur_diff + score;
+      // Inline closure: does slot[t] match the move at the requested kind?
+      // (Returns true only when fs->kind matches the kind argument; for
+      // the gating scan pass kind=priority; for the collect-all pass
+      // pass kind=-1 to accept any kind.)
+      bool gate_matched = false;
       for (int t = 0; t < bucket_count; t++) {
         const uint32_t req = bitmaps[t];
         if ((leave_bm & req) != req) continue;
         ForceTargetSlot *fs = &bucket_slots[t];
         if (fs->deficit <= 0 || (int)fs->kind != priority) continue;
-        // Aggregator stores diff = pre_action_diff + move_score (post-action,
-        // from the perspective of the player on turn). Match against same.
-        // For exchanges/passes score==0 so eff_diff == cur_diff.
-        const int eff_diff = cur_diff + score;
         if (eff_diff < fs->diff_min || eff_diff > fs->diff_max) continue;
         if (fs->subleave_count == 2 &&
             fs->subleave_mls[0] == fs->subleave_mls[1] &&
@@ -2275,16 +2291,46 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
           if ((LeaveType)move_type_cache[m] != (LeaveType)fs->leave_type)
             continue;
         }
-        matched = fs->cold;
+        gate_matched = true;
         break;
       }
-      if (matched != NULL) {
-        move_copy(gr->eb_action_buf[slot], move);
-        gr->eb_action_present[slot] = true;
-        gr->eb_force_target_for_slot[slot] = matched;
-        used_move[m] = true;
-        slot++;
+      if (!gate_matched) continue;
+      // Collect ALL matches for this move (across PAIR/TILE/STRATUM kinds)
+      // into the slot's target list. Same predicate set, just no per-kind
+      // filter. Cap at EB_MAX_LEAVE_TARGETS_PER_MOVE; in practice a single
+      // play matches at most ~15-25 leave cells (tiles + pairs in leave +
+      // optional stratum cell).
+      uint8_t n_matches = 0;
+      for (int t = 0;
+           t < bucket_count && n_matches < EB_MAX_LEAVE_TARGETS_PER_MOVE;
+           t++) {
+        const uint32_t req = bitmaps[t];
+        if ((leave_bm & req) != req) continue;
+        ForceTargetSlot *fs = &bucket_slots[t];
+        if (fs->deficit <= 0) continue;
+        if ((int)fs->kind != FORCE_TARGET_PAIR &&
+            (int)fs->kind != FORCE_TARGET_TILE &&
+            (int)fs->kind != FORCE_TARGET_STRATUM) {
+          continue;  // skip BAG_TILE — handled separately at snap-capture
+        }
+        if (eff_diff < fs->diff_min || eff_diff > fs->diff_max) continue;
+        if (fs->subleave_count == 2 &&
+            fs->subleave_mls[0] == fs->subleave_mls[1] &&
+            leaves[m].array[fs->subleave_mls[0]] < 2) continue;
+        if (fs->exchange == 0 && fs->leave_length >= 3) {
+          if (move_type_cache[m] < 0) {
+            move_type_cache[m] = (int8_t)force_classify_leave(&leaves[m], ld);
+          }
+          if ((LeaveType)move_type_cache[m] != (LeaveType)fs->leave_type)
+            continue;
+        }
+        gr->eb_force_targets_for_slot[slot][n_matches++] = fs->cold;
       }
+      gr->eb_force_target_count_for_slot[slot] = n_matches;
+      move_copy(gr->eb_action_buf[slot], move);
+      gr->eb_action_present[slot] = true;
+      used_move[m] = true;
+      slot++;
     }
   }
   return slot - 1;
@@ -2357,28 +2403,57 @@ static void eb_annotate_force_targets_to_slots(AutoplayWorker *w,
       uint32_t *bitmaps = force_table_lookup_bitmaps_by_shape(
           ft, bag_count, leave_len, is_exch ? 1 : 0);
       if (bucket_count == 0 || bitmaps == NULL) continue;
-      ForceTarget *matched = NULL;
+      // Gating scan: does this slot match ANY target at the current priority?
+      bool gate_matched = false;
+      const int eff_diff = cur_diff + score;
+      LeaveType cached_leave_type = (LeaveType)-1;
       for (int t = 0; t < bucket_count; t++) {
         const uint32_t req = bitmaps[t];
         if ((leave_bm & req) != req) continue;
         ForceTargetSlot *fs = &bucket_slots[t];
         if (fs->deficit <= 0 || (int)fs->kind != priority) continue;
-        const int eff_diff = cur_diff + score;
         if (eff_diff < fs->diff_min || eff_diff > fs->diff_max) continue;
         if (fs->subleave_count == 2 &&
             fs->subleave_mls[0] == fs->subleave_mls[1] &&
             leave.array[fs->subleave_mls[0]] < 2) continue;
         if (fs->exchange == 0 && fs->leave_length >= 3) {
-          const LeaveType lt = force_classify_leave(&leave, ld);
-          if ((LeaveType)lt != (LeaveType)fs->leave_type) continue;
+          if (cached_leave_type < 0)
+            cached_leave_type = force_classify_leave(&leave, ld);
+          if ((LeaveType)cached_leave_type != (LeaveType)fs->leave_type)
+            continue;
         }
-        matched = fs->cold;
+        gate_matched = true;
         break;
       }
-      if (matched != NULL) {
-        gr->eb_force_target_for_slot[s] = matched;
-        used_slot[s] = true;
+      if (!gate_matched) continue;
+      // Collect ALL matches for this slot's move (across all leave kinds)
+      // for game-end credit. Mirrors eb_append_force_target_slots's
+      // multi-credit collection.
+      uint8_t n_matches = 0;
+      for (int t = 0;
+           t < bucket_count && n_matches < EB_MAX_LEAVE_TARGETS_PER_MOVE;
+           t++) {
+        const uint32_t req = bitmaps[t];
+        if ((leave_bm & req) != req) continue;
+        ForceTargetSlot *fs = &bucket_slots[t];
+        if (fs->deficit <= 0) continue;
+        if ((int)fs->kind != FORCE_TARGET_PAIR &&
+            (int)fs->kind != FORCE_TARGET_TILE &&
+            (int)fs->kind != FORCE_TARGET_STRATUM) continue;
+        if (eff_diff < fs->diff_min || eff_diff > fs->diff_max) continue;
+        if (fs->subleave_count == 2 &&
+            fs->subleave_mls[0] == fs->subleave_mls[1] &&
+            leave.array[fs->subleave_mls[0]] < 2) continue;
+        if (fs->exchange == 0 && fs->leave_length >= 3) {
+          if (cached_leave_type < 0)
+            cached_leave_type = force_classify_leave(&leave, ld);
+          if ((LeaveType)cached_leave_type != (LeaveType)fs->leave_type)
+            continue;
+        }
+        gr->eb_force_targets_for_slot[s][n_matches++] = fs->cold;
       }
+      gr->eb_force_target_count_for_slot[s] = n_matches;
+      used_slot[s] = true;
     }
   }
 }
@@ -2408,7 +2483,7 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   // Clear presence flags first so any early return leaves a sane state.
   for (int i = 0; i < EB_MAX_ACTIONS; i++) {
     gr->eb_action_present[i] = false;
-    gr->eb_force_target_for_slot[i] = NULL;
+    gr->eb_force_target_count_for_slot[i] = 0;
   }
   gr->eb_natural_slot = -1;
 
@@ -2612,9 +2687,12 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
       gr->eb_divergence_turn, gr->eb_p1_rack_source,
       gr->eb_p1_force_kind, gr->eb_p2_force_kind);
 
-  // Force-target credit at the target snap.
-  ForceTarget *ft_target = gr->eb_snap_force_target[target_turn];
-  if (ft_target != NULL && w->shared_data->force_table != NULL) {
+  // Force-target credit at the target snap. Multi-credit: a single play
+  // can match many leave cells (tile + pair + stratum kinds at the same
+  // (stratum, diff)) — credit ALL of them, not just one. Mirrors the
+  // multi-credit pattern already used for BAG_TILE cells below.
+  if (w->shared_data->force_table != NULL &&
+      gr->eb_snap_force_target_count[target_turn] > 0) {
     const int p_idx = gr->eb_snaps[idx].player_on_turn;
     const int my_final =
         equity_to_int(player_get_score(game_get_player(gr->game, p_idx)));
@@ -2623,8 +2701,15 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
             player_get_score(game_get_player(gr->game, 1 - p_idx)));
     const bool is_tie = (my_final == opp_final);
     const bool is_win = (my_final > opp_final);
-    force_table_credit_game(w->shared_data->force_table, ft_target,
-                            gr->eb_snaps[idx].move_score, is_win, is_tie);
+    const uint8_t cnt = gr->eb_snap_force_target_count[target_turn];
+    for (uint8_t k = 0; k < cnt; k++) {
+      ForceTarget *ft_target = gr->eb_snap_force_targets[target_turn][k];
+      if (ft_target != NULL) {
+        force_table_credit_game(
+            w->shared_data->force_table, ft_target,
+            gr->eb_snaps[idx].move_score, is_win, is_tie);
+      }
+    }
   }
 
   // BAG_TILE credit: each cell matched at snap-capture time gets one
@@ -2785,10 +2870,15 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     // n_actions is max_slot+1; iterate stable slot indices and skip absent.
     Move local_actions[EB_MAX_ACTIONS];
     bool local_present[EB_MAX_ACTIONS];
-    ForceTarget *local_force_target[EB_MAX_ACTIONS];
+    ForceTarget *local_force_targets[EB_MAX_ACTIONS]
+                                    [EB_MAX_LEAVE_TARGETS_PER_MOVE];
+    uint8_t local_force_target_count[EB_MAX_ACTIONS];
     for (int s = 0; s < n_actions; s++) {
       local_present[s] = gr->eb_action_present[s];
-      local_force_target[s] = gr->eb_force_target_for_slot[s];
+      local_force_target_count[s] = gr->eb_force_target_count_for_slot[s];
+      for (uint8_t k = 0; k < local_force_target_count[s]; k++) {
+        local_force_targets[s][k] = gr->eb_force_targets_for_slot[s][k];
+      }
       if (local_present[s]) {
         move_copy(&local_actions[s], gr->eb_action_buf[s]);
       }
@@ -2826,10 +2916,15 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
         gr->eb_last_divergence_turn = fork_turn;
         gr->eb_n_divergences++;
       }
-      // Track force-target attached to this slot at this turn (NULL if
-      // natural). eb_emit_leaf consults this per-snap to credit deficits.
+      // Track force-targets attached to this slot at this turn (empty
+      // count if natural). eb_emit_leaf consults this per-snap to credit
+      // every matched leave cell.
       if (fork_turn >= 1 && fork_turn <= 6) {
-        gr->eb_snap_force_target[fork_turn] = local_force_target[s];
+        const uint8_t cnt = local_force_target_count[s];
+        gr->eb_snap_force_target_count[fork_turn] = cnt;
+        for (uint8_t k = 0; k < cnt; k++) {
+          gr->eb_snap_force_targets[fork_turn][k] = local_force_targets[s][k];
+        }
       }
       game_runner_play_move(w, gr);
       gr->eb_forced_move = NULL;
