@@ -46,10 +46,17 @@
 #include "move_gen.h"
 #include "rack_list.h"
 #include "simmer.h"
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+// Diagnostic counter — incremented once per eb_emit_leaf call that gets
+// past the early-return guards. Paired with force-table credit counters in
+// the progress line to investigate the multi-credit regression (cf.
+// noble-popping-kitten plan).
+static _Atomic uint64_t g_eb_leaves_emitted = 0;
 
 typedef struct LeavegenSharedData {
   int num_gens;
@@ -1994,8 +2001,27 @@ void print_current_status(AutoplayWorker *autoplay_worker,
         rack_list_get_racks_below_target_count(lg_shared_data->rack_list));
   } else if (shared_data->force_table) {
     string_builder_add_formatted_string(
-        status_sb, " Force-table remaining deficit: %ld.\n",
+        status_sb, " Force-table remaining deficit: %ld.",
         (long)force_table_total_remaining(shared_data->force_table));
+    // Per-tick diagnostic counters for the multi-credit regression.
+    // Snapshot + reset so each line shows in-interval activity (matches
+    // the wall-clock-per-interval style of the games-per-tick line).
+    ForceCounters fc;
+    force_table_get_counters(&fc);
+    force_table_reset_counters();
+    const uint64_t leaves =
+        atomic_exchange_explicit(&g_eb_leaves_emitted, 0,
+                                 memory_order_relaxed);
+    string_builder_add_formatted_string(
+        status_sb,
+        " counters: leaves=%llu credits=%llu landed=%llu zero=%llu "
+        "stratum_nb=%llu retries=%llu.\n",
+        (unsigned long long)leaves,
+        (unsigned long long)fc.credit_calls,
+        (unsigned long long)fc.decrements_landed,
+        (unsigned long long)fc.noops_already_zero,
+        (unsigned long long)fc.stratum_no_bump,
+        (unsigned long long)fc.cas_retries);
   } else {
     string_builder_add_string(status_sb, "\n");
   }
@@ -2663,6 +2689,7 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
   EmptyBoardRecorder *ebr = w->shared_data->empty_board_recorder;
   EmptyBoardStrataRecorder *ebs = w->shared_data->empty_board_strata_recorder;
   if ((!ebr && !ebs) || gr->eb_n_snaps == 0) return;
+  atomic_fetch_add_explicit(&g_eb_leaves_emitted, 1, memory_order_relaxed);
   // Single-target-turn recording: emit one row at the target snap only.
   // Pre-target snaps are pass-cycle plumbing; post-target turns play
   // naturally with no fork (so the natural-post-Tk filter is trivially

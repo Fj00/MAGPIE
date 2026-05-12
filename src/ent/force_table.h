@@ -180,6 +180,20 @@ bool force_table_is_exhausted(const ForceTable *table);
 // Total remaining deficit across all targets (for progress reporting).
 int64_t force_table_total_remaining(const ForceTable *table);
 
+// Diagnostic counters for the multi-credit regression investigation. Tracks
+// how many credit calls land as decrements vs no-ops, and CAS-loop retries
+// under contention. Reset and snapshot at progress ticks.
+typedef struct ForceCounters {
+  uint64_t credit_calls;        // force_table_credit_game entry count
+  uint64_t decrements_landed;   // CAS-decrement that actually fired
+  uint64_t noops_already_zero;  // decrement saw deficit==0 on entry
+  uint64_t stratum_no_bump;     // stratum credit didn't bump min(w,l)
+  uint64_t cas_retries;         // CAS-loop retry count
+} ForceCounters;
+
+void force_table_get_counters(ForceCounters *out);
+void force_table_reset_counters(void);
+
 // Dump the remaining deficits to a CSV with the same schema as the input,
 // skipping targets whose deficit is 0. Used for progress reporting and to
 // produce an updated force_targets.csv for subsequent runs.

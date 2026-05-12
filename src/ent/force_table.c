@@ -14,6 +14,36 @@
 // Maximum bag count indexed directly. Bag sizes we care about are 0..93.
 #define FORCE_BAG_MAX 94
 
+// Diagnostic counters (see force_table.h). File-scope atomics; cheap relaxed
+// increments on the credit hot path. Used to investigate the multi-credit
+// regression: counts how many credit calls land as decrements vs no-ops.
+static _Atomic uint64_t g_credit_calls = 0;
+static _Atomic uint64_t g_decrements_landed = 0;
+static _Atomic uint64_t g_noops_already_zero = 0;
+static _Atomic uint64_t g_stratum_no_bump = 0;
+static _Atomic uint64_t g_cas_retries = 0;
+
+void force_table_get_counters(ForceCounters *out) {
+  out->credit_calls =
+      atomic_load_explicit(&g_credit_calls, memory_order_relaxed);
+  out->decrements_landed =
+      atomic_load_explicit(&g_decrements_landed, memory_order_relaxed);
+  out->noops_already_zero =
+      atomic_load_explicit(&g_noops_already_zero, memory_order_relaxed);
+  out->stratum_no_bump =
+      atomic_load_explicit(&g_stratum_no_bump, memory_order_relaxed);
+  out->cas_retries =
+      atomic_load_explicit(&g_cas_retries, memory_order_relaxed);
+}
+
+void force_table_reset_counters(void) {
+  atomic_store_explicit(&g_credit_calls, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_decrements_landed, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_noops_already_zero, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_stratum_no_bump, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_cas_retries, 0, memory_order_relaxed);
+}
+
 // Per-stratum diff-tally bounds: ±FORCE_DIFF_MAX. Diffs outside this range
 // are clamped to the boundary (matches the spreadsheet WINDOW behavior).
 // 1001 buckets per stratum target × 8 bytes = 8 KB.
@@ -344,10 +374,15 @@ bool force_table_decrement_target(ForceTable *table, ForceTarget *target) {
   // updates under concurrent multi-credit traffic — see the noble-
   // popping-kitten plan / commit log.
   int64_t cur = atomic_load_explicit(&target->deficit, memory_order_relaxed);
+  if (cur == 0) {
+    atomic_fetch_add_explicit(&g_noops_already_zero, 1, memory_order_relaxed);
+    return true;  // already drained
+  }
   while (cur > 0) {
     if (atomic_compare_exchange_weak_explicit(
             &target->deficit, &cur, cur - 1,
             memory_order_relaxed, memory_order_relaxed)) {
+      atomic_fetch_add_explicit(&g_decrements_landed, 1, memory_order_relaxed);
       const int64_t new_deficit = cur - 1;
       // Mirror to the parallel slot cache so the hot match loop sees
       // the new value without dereferencing the cold target. (Slot
@@ -380,12 +415,17 @@ bool force_table_decrement_target(ForceTable *table, ForceTarget *target) {
       return false;
     }
     // CAS failed; cur was reloaded by atomic_compare_exchange_weak.
+    atomic_fetch_add_explicit(&g_cas_retries, 1, memory_order_relaxed);
   }
-  return true;  // already drained
+  // Lost the race — another thread drained the cell to 0 while we were
+  // looping. Count as a no-op (same outcome as entering with deficit==0).
+  atomic_fetch_add_explicit(&g_noops_already_zero, 1, memory_order_relaxed);
+  return true;
 }
 
 void force_table_credit_game(ForceTable *table, ForceTarget *target,
                              int diff, bool is_win, bool is_tie) {
+  atomic_fetch_add_explicit(&g_credit_calls, 1, memory_order_relaxed);
   // Tile/pair: count-based semantics (one matched game = one credit).
   if (target->kind != FORCE_TARGET_STRATUM) {
     force_table_decrement_target(table, target);
@@ -408,6 +448,7 @@ void force_table_credit_game(ForceTable *table, ForceTarget *target,
   }
   const int bucket = clamped + FORCE_DIFF_MAX;
   if (is_tie || st == NULL) {
+    atomic_fetch_add_explicit(&g_stratum_no_bump, 1, memory_order_relaxed);
     return;
   }
   // Pack wins in the high 32 bits, losses in the low 32 bits.
@@ -422,6 +463,8 @@ void force_table_credit_game(ForceTable *table, ForceTarget *target,
   const uint32_t new_min = (new_w < new_l) ? new_w : new_l;
   if (new_min > old_min) {
     force_table_decrement_target(table, target);
+  } else {
+    atomic_fetch_add_explicit(&g_stratum_no_bump, 1, memory_order_relaxed);
   }
 }
 
