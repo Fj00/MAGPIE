@@ -114,12 +114,22 @@ typedef struct AutoplaySharedData {
   // MAGPIE_EB_RARE_TARGET=p1|p2. Default p2 (T6 is P2's turn in the
   // canonical EB cycle).
   int rare_target_player;
-  // Probability the T6 source-mix injects from the rare-pool.
-  // Default 0.20 (uniform 5-way among pass/exch/bingo/play/rare). Higher
-  // values bias toward rare-pool injection — speeds up force-table
-  // exhaustion at the cost of less natural diversity in T6 racks.
-  // Set via MAGPIE_EB_RARE_FRAC env var.
-  double rare_frac;
+  // T6 source-mix probability for the rare-pool slot. Adaptive ramp:
+  //   rare_frac = MIN + (MAX - MIN) * completion^2
+  // where completion = 1 - current_deficit / initial_deficit.
+  // Quadratic ramp keeps rare_frac near MIN early (let natural pools
+  // crush common cells) and bumps to MAX as the slow tail dominates.
+  //
+  // Defaults MIN=0.20, MAX=0.60: starts at 20/20/20/20/20 (uniform 5-way),
+  // ramps to 60/10/10/10/10 at full completion.
+  // Override via MAGPIE_EB_RARE_FRAC_MIN / MAGPIE_EB_RARE_FRAC_MAX, or
+  // MAGPIE_EB_RARE_FRAC (legacy: sets both MIN and MAX to the same value
+  // for static fraction).
+  double rare_frac_min;
+  double rare_frac_max;
+  // Cached at startup from force_table_total_remaining; the denominator
+  // for the completion ratio. Stays constant once set.
+  int64_t initial_total_deficit;
   EmptyBoardRecorder *empty_board_recorder;
   EmptyBoardStrataRecorder *empty_board_strata_recorder;
   // Slice 2: K-way fork branching at empty-board cycle-alive turns. Activated
@@ -544,6 +554,12 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   shared_data->stop_on_force_exhaust =
       shared_data->force_table != NULL &&
       getenv("MAGPIE_FORCE_STOP_ON_EXHAUST") != NULL;
+  // Snapshot initial total deficit for the rare_frac adaptive ramp's
+  // completion-ratio denominator. Done once at startup; stays constant.
+  if (shared_data->force_table != NULL) {
+    shared_data->initial_total_deficit =
+        force_table_total_remaining(shared_data->force_table);
+  }
 
   shared_data->opening_pass_table = NULL;
   const char *op_path = getenv("MAGPIE_OPENING_PASS_TABLE");
@@ -592,20 +608,42 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   fprintf(stderr, "empty_board: target turn = T%d (recording player = P%d)\n",
           shared_data->eb_target_turn,
           shared_data->rare_target_player + 1);
-  shared_data->rare_frac = 0.20;
+  shared_data->rare_frac_min = 0.20;
+  shared_data->rare_frac_max = 0.60;
+  // Legacy single-value override: both MIN and MAX set to the same value.
   const char *rare_frac_env = getenv("MAGPIE_EB_RARE_FRAC");
   if (rare_frac_env && rare_frac_env[0] != '\0') {
     double f = atof(rare_frac_env);
     if (f >= 0.0 && f <= 1.0) {
-      shared_data->rare_frac = f;
+      shared_data->rare_frac_min = f;
+      shared_data->rare_frac_max = f;
     } else {
       fprintf(stderr,
               "empty_board: invalid MAGPIE_EB_RARE_FRAC=%s (must be in "
-              "[0.0, 1.0]); using default 0.20\n", rare_frac_env);
+              "[0.0, 1.0]); ignored\n", rare_frac_env);
     }
   }
-  fprintf(stderr, "empty_board: rare-pool injection fraction = %.2f\n",
-          shared_data->rare_frac);
+  // Per-bound overrides take precedence over the legacy single value.
+  const char *rfmin = getenv("MAGPIE_EB_RARE_FRAC_MIN");
+  if (rfmin && rfmin[0] != '\0') {
+    double f = atof(rfmin);
+    if (f >= 0.0 && f <= 1.0) shared_data->rare_frac_min = f;
+  }
+  const char *rfmax = getenv("MAGPIE_EB_RARE_FRAC_MAX");
+  if (rfmax && rfmax[0] != '\0') {
+    double f = atof(rfmax);
+    if (f >= 0.0 && f <= 1.0) shared_data->rare_frac_max = f;
+  }
+  if (shared_data->rare_frac_max < shared_data->rare_frac_min) {
+    shared_data->rare_frac_max = shared_data->rare_frac_min;
+  }
+  fprintf(stderr,
+          "empty_board: rare-pool injection ramp = [%.2f .. %.2f] "
+          "(quadratic in completion fraction)\n",
+          shared_data->rare_frac_min, shared_data->rare_frac_max);
+  shared_data->initial_total_deficit = 0;
+  // Snapshot initial deficit AFTER the force_table is loaded; deferred
+  // a few lines below where shared_data->force_table is set.
   const char *pp = getenv("MAGPIE_EB_PASS_POOL");
   if (pp && pp[0] != '\0') {
     shared_data->pass_pool = pass_cycle_table_create(pp, "/dev/null");
@@ -2643,17 +2681,36 @@ static bool swap_player_rack(Game *game, int p, const char *target_rack) {
   return false;
 }
 
-// At the start of the target turn, pick a rack source weighted by
-// `rare_frac` (default 0.20 → uniform 5-way among
-// {pass, exch, bingo, rare, play}; 1.0 → always rare-pool).
-//
-// The four non-rare categories share equally in the (1 - rare_frac)
-// remainder. Missing pools leave the natural rack for their slice.
+// At the start of the target turn, pick a rack source weighted by an
+// adaptively-ramped `rare_frac`:
+//   completion = 1 - current_deficit / initial_deficit
+//   rare_frac  = MIN + (MAX - MIN) * completion^2
+// where MIN/MAX come from MAGPIE_EB_RARE_FRAC_{MIN,MAX} (defaults 0.20,
+// 0.60). The four non-rare categories share equally in (1 - rare_frac).
+// Missing pools leave the natural rack for their slice.
 // Only fires when the on-turn player matches rare_target_player.
 static void inject_target_turn_rack_by_category(
     AutoplayWorker *w, GameRunner *gr, uint64_t seed) {
   const int p = game_get_player_on_turn_index(gr->game);
   if (p != w->shared_data->rare_target_player) return;
+
+  // Compute current rare_frac via the adaptive ramp. Reading the deficit
+  // is O(num_targets) and runs once per recorded T6 game (~1/game) — a
+  // few microseconds per call, negligible vs the rest of the turn.
+  double rare_frac = w->shared_data->rare_frac_min;
+  if (w->shared_data->rare_frac_max > w->shared_data->rare_frac_min &&
+      w->shared_data->initial_total_deficit > 0 &&
+      w->shared_data->force_table != NULL) {
+    const int64_t cur =
+        force_table_total_remaining(w->shared_data->force_table);
+    double completion =
+        1.0 - ((double)cur / (double)w->shared_data->initial_total_deficit);
+    if (completion < 0.0) completion = 0.0;
+    if (completion > 1.0) completion = 1.0;
+    rare_frac = w->shared_data->rare_frac_min +
+                (w->shared_data->rare_frac_max -
+                 w->shared_data->rare_frac_min) * completion * completion;
+  }
 
   // Two-stage decision:
   //   1) draw r ∈ [0, 1). If r < rare_frac → cat = 3 (rare).
@@ -2662,7 +2719,7 @@ static void inject_target_turn_rack_by_category(
   const uint64_t h = seed * 0x9e3779b97f4a7c15ULL + 0x123456789abcdef0ULL;
   const double r = ((double)(h >> 11)) / (double)(1ULL << 53);
   int cat;
-  if (r < w->shared_data->rare_frac) {
+  if (r < rare_frac) {
     cat = 3;
   } else {
     // Map r ∈ [rare_frac, 1) to one of 4 non-rare categories.
