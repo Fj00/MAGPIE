@@ -934,7 +934,10 @@ typedef struct GameRunner {
   uint8_t eb_force_target_count_for_slot[EB_MAX_ACTIONS];
   // Per-snap leave-target list (indexed by snap turn 1..6). Set when
   // DFS descends into a forced slot; eb_emit_leaf reads to credit each
-  // matched leave cell. Saved/restored across sibling forks via EbMetaSave.
+  // matched leave cell. Reset per game in game_runner_start, overwritten
+  // per-fork-iter in play_eb_dfs, and forced to 0 on the natural-only
+  // (n_actions==0) branch to prevent stale counts from a previous fork
+  // iteration leaking into emit at the natural-only turn.
   ForceTarget *eb_snap_force_targets[7][EB_MAX_LEAVE_TARGETS_PER_MOVE];
   uint8_t eb_snap_force_target_count[7];
   // Per-snap BAG_TILE matches. Computed at snap-capture time using the
@@ -971,8 +974,10 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
     game_runner->eb_action_buf[i] = NULL;
     game_runner->eb_force_target_count_for_slot[i] = 0;
   }
-  for (int i = 0; i < 7; i++) game_runner->eb_snap_force_target_count[i] = 0;
-  for (int i = 0; i < 7; i++) game_runner->eb_snap_bag_count[i] = 0;
+  for (int i = 0; i < 7; i++) {
+    game_runner->eb_snap_force_target_count[i] = 0;
+    game_runner->eb_snap_bag_count[i] = 0;
+  }
   if (autoplay_worker->shared_data->eb_branch_active) {
     game_runner->eb_n_action_buf = EB_MAX_ACTIONS;
     for (int i = 0; i < EB_MAX_ACTIONS; i++) {
@@ -1125,7 +1130,10 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   game_runner->pending_force_target = NULL;
   game_runner->pending_force_diff = 0;
   game_runner->pending_force_player_index = 0;
-  for (int i = 0; i < 7; i++) game_runner->eb_snap_bag_count[i] = 0;
+  for (int i = 0; i < 7; i++) {
+    game_runner->eb_snap_bag_count[i] = 0;
+    game_runner->eb_snap_force_target_count[i] = 0;
+  }
   // If every target is satisfied, treat the game as already-forced so all
   // its turns get recorded normally (unbiased hasty self-play).
   game_runner->force_triggered =
@@ -2861,6 +2869,15 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     const int n_actions = eb_enumerate_actions(w, gr);
     if (n_actions == 0) {
       // Not a fork point — play one move using normal selection.
+      // Clear any stale leave-target snap count for the about-to-be-played
+      // turn. If we don't, a previous fork iteration's count carries over
+      // and eb_emit_leaf credits stale ForceTarget* slots that may already
+      // have deficit==0 (force_table_decrement_target no-ops, but the call
+      // overhead is real and the credit math is wrong).
+      const int natural_turn = gr->eb_n_snaps + 1;
+      if (natural_turn >= 1 && natural_turn <= 6) {
+        gr->eb_snap_force_target_count[natural_turn] = 0;
+      }
       game_runner_play_move(w, gr);
       continue;
     }
