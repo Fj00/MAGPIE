@@ -114,6 +114,12 @@ typedef struct AutoplaySharedData {
   // MAGPIE_EB_RARE_TARGET=p1|p2. Default p2 (T6 is P2's turn in the
   // canonical EB cycle).
   int rare_target_player;
+  // Probability the T6 source-mix injects from the rare-pool.
+  // Default 0.20 (uniform 5-way among pass/exch/bingo/play/rare). Higher
+  // values bias toward rare-pool injection — speeds up force-table
+  // exhaustion at the cost of less natural diversity in T6 racks.
+  // Set via MAGPIE_EB_RARE_FRAC env var.
+  double rare_frac;
   EmptyBoardRecorder *empty_board_recorder;
   EmptyBoardStrataRecorder *empty_board_strata_recorder;
   // Slice 2: K-way fork branching at empty-board cycle-alive turns. Activated
@@ -586,6 +592,20 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   fprintf(stderr, "empty_board: target turn = T%d (recording player = P%d)\n",
           shared_data->eb_target_turn,
           shared_data->rare_target_player + 1);
+  shared_data->rare_frac = 0.20;
+  const char *rare_frac_env = getenv("MAGPIE_EB_RARE_FRAC");
+  if (rare_frac_env && rare_frac_env[0] != '\0') {
+    double f = atof(rare_frac_env);
+    if (f >= 0.0 && f <= 1.0) {
+      shared_data->rare_frac = f;
+    } else {
+      fprintf(stderr,
+              "empty_board: invalid MAGPIE_EB_RARE_FRAC=%s (must be in "
+              "[0.0, 1.0]); using default 0.20\n", rare_frac_env);
+    }
+  }
+  fprintf(stderr, "empty_board: rare-pool injection fraction = %.2f\n",
+          shared_data->rare_frac);
   const char *pp = getenv("MAGPIE_EB_PASS_POOL");
   if (pp && pp[0] != '\0') {
     shared_data->pass_pool = pass_cycle_table_create(pp, "/dev/null");
@@ -2623,19 +2643,33 @@ static bool swap_player_rack(Game *game, int p, const char *target_rack) {
   return false;
 }
 
-// At the start of the target turn, pick a rack source uniformly from
-// {pass, exch, bingo, rare, play} (5 cells × 20%) and inject a rack from
-// the chosen source. Each pool is independent — missing pools leave the
-// natural rack for that 1/5. Only fires when the on-turn player matches
-// rare_target_player (auto-derived from target turn parity).
+// At the start of the target turn, pick a rack source weighted by
+// `rare_frac` (default 0.20 → uniform 5-way among
+// {pass, exch, bingo, rare, play}; 1.0 → always rare-pool).
+//
+// The four non-rare categories share equally in the (1 - rare_frac)
+// remainder. Missing pools leave the natural rack for their slice.
+// Only fires when the on-turn player matches rare_target_player.
 static void inject_target_turn_rack_by_category(
     AutoplayWorker *w, GameRunner *gr, uint64_t seed) {
   const int p = game_get_player_on_turn_index(gr->game);
   if (p != w->shared_data->rare_target_player) return;
 
-  // Pick category 0..4 uniformly. 0=pass, 1=exch, 2=bingo, 3=rare, 4=play.
+  // Two-stage decision:
+  //   1) draw r ∈ [0, 1). If r < rare_frac → cat = 3 (rare).
+  //   2) otherwise pick uniformly among {0=pass, 1=exch, 2=bingo, 4=play}.
+  // 0=pass, 1=exch, 2=bingo, 3=rare, 4=play.
   const uint64_t h = seed * 0x9e3779b97f4a7c15ULL + 0x123456789abcdef0ULL;
-  const int cat = (int)((h >> 33) % 5ULL);
+  const double r = ((double)(h >> 11)) / (double)(1ULL << 53);
+  int cat;
+  if (r < w->shared_data->rare_frac) {
+    cat = 3;
+  } else {
+    // Map r ∈ [rare_frac, 1) to one of 4 non-rare categories.
+    const uint64_t h2 = h * 0xbf58476d1ce4e5b9ULL;
+    cat = (int)((h2 >> 33) % 4ULL);
+    if (cat >= 3) cat++;  // skip slot 3 (rare)
+  }
 
   const char *target = NULL;
   if (cat == 0 && w->shared_data->pass_pool != NULL) {
