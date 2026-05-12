@@ -1,6 +1,7 @@
 #ifndef FORCE_TABLE_H
 #define FORCE_TABLE_H
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -38,7 +39,16 @@ typedef struct ForceTarget {
   // target struct brings all the per-iteration check fields. The matching
   // loop reads deficit, kind, length, exchange, type, diff range, subleave
   // before deciding whether to do a deeper check.
-  int64_t deficit;
+  //
+  // deficit is _Atomic so concurrent decrements from many worker threads
+  // don't lose updates via plain RMW races. force_table_decrement_target
+  // uses a CAS loop; hot-path filter reads use atomic_load_explicit with
+  // memory_order_relaxed to avoid the seq_cst fences a plain `_Atomic`
+  // read would compile to on x86. (Multi-credit per game makes the same
+  // ForceTarget the decrement target for many concurrent games, so plain
+  // `deficit--` lost ~half the decrements before this was fixed —
+  // see noble-popping-kitten.md / commit log.)
+  _Atomic int64_t deficit;
   ForceTargetKind kind;
   int leave_length;
   int exchange;

@@ -163,7 +163,7 @@ LeaveType force_classify_leave(const Rack *leave,
 
 bool force_target_matches(const ForceTarget *target, const Rack *leave,
                           int score, int diff) {
-  if (target->deficit <= 0) {
+  if (atomic_load_explicit(&target->deficit, memory_order_relaxed) <= 0) {
     return false;
   }
   if (leave->number_of_letters != target->leave_length) {
@@ -226,7 +226,7 @@ bool force_target_matches_bag(const ForceTarget *target,
                               int leave_length, LeaveType leave_type,
                               int score, int diff,
                               const LetterDistribution *ld) {
-  if (target->deficit <= 0) {
+  if (atomic_load_explicit(&target->deficit, memory_order_relaxed) <= 0) {
     return false;
   }
   if (target->kind != FORCE_TARGET_BAG_TILE) {
@@ -263,7 +263,8 @@ bool force_target_matches_bag(const ForceTarget *target,
 // to refresh slot.deficit when the cold deficit decrements.
 static inline void slot_init_from_target(ForceTargetSlot *slot,
                                           ForceTarget *target) {
-  slot->deficit = (int32_t)target->deficit;
+  slot->deficit = (int32_t)atomic_load_explicit(
+      &target->deficit, memory_order_relaxed);
   slot->kind = (uint8_t)target->kind;
   slot->leave_length = (uint8_t)target->leave_length;
   slot->exchange = (uint8_t)(target->exchange ? 1 : 0);
@@ -336,12 +337,24 @@ static void swap_to_back_shape(ForceTable *table, ForceTarget *target) {
 }
 
 bool force_table_decrement_target(ForceTable *table, ForceTarget *target) {
-  if (target->deficit > 0) {
-    target->deficit--;
-    // Update the parallel slot's deficit so the hot loop sees the new value
-    // without needing to dereference the cold target. (Slot's deficit is
-    // int32, but per-cell deficit always fits.)
-    {
+  // CAS loop: only the thread that observes a positive deficit AND
+  // successfully drives it from K to K-1 does the post-decrement
+  // bookkeeping. Threads observing 0 return early; CAS losers retry
+  // with the freshly-loaded value. Plain `target->deficit--` lost
+  // updates under concurrent multi-credit traffic — see the noble-
+  // popping-kitten plan / commit log.
+  int64_t cur = atomic_load_explicit(&target->deficit, memory_order_relaxed);
+  while (cur > 0) {
+    if (atomic_compare_exchange_weak_explicit(
+            &target->deficit, &cur, cur - 1,
+            memory_order_relaxed, memory_order_relaxed)) {
+      const int64_t new_deficit = cur - 1;
+      // Mirror to the parallel slot cache so the hot match loop sees
+      // the new value without dereferencing the cold target. (Slot
+      // deficit is int32, but per-cell deficit always fits. Best-effort
+      // — workers re-validate via cold target->deficit on candidate
+      // match, so a briefly-stale slot only causes false-positives that
+      // the cold check rejects.)
       const int bag = target->bag;
       const int L = target->leave_length;
       const int ex = target->exchange ? 1 : 0;
@@ -349,24 +362,26 @@ bool force_table_decrement_target(ForceTable *table, ForceTarget *target) {
           L < FORCE_LEAVE_LEN_MAX) {
         ForceTargetSlot *slots = table->by_shape_slots[bag][L][ex];
         if (slots && target->by_shape_idx >= 0) {
-          slots[target->by_shape_idx].deficit = (int32_t)target->deficit;
+          slots[target->by_shape_idx].deficit = (int32_t)new_deficit;
         }
       }
+      if (new_deficit == 0) {
+        atomic_fetch_sub_explicit(&table->active_targets, 1,
+                                   memory_order_relaxed);
+        // B5: push the now-satisfied target to the back of each bucket
+        // so workers stop iterating it. Brief lock — only contended on
+        // the (rare) deficit-hits-zero transition.
+        pthread_mutex_lock(&table->bucket_mutex);
+        swap_to_back_bag(table, target);
+        swap_to_back_shape(table, target);
+        pthread_mutex_unlock(&table->bucket_mutex);
+        return true;
+      }
+      return false;
     }
-    if (target->deficit == 0) {
-      atomic_fetch_sub_explicit(&table->active_targets, 1,
-                                memory_order_relaxed);
-      // B5: push the now-satisfied target to the back of each of its buckets
-      // so workers stop iterating it. Brief lock — only contended on the
-      // (rare) deficit-hits-zero transition.
-      pthread_mutex_lock(&table->bucket_mutex);
-      swap_to_back_bag(table, target);
-      swap_to_back_shape(table, target);
-      pthread_mutex_unlock(&table->bucket_mutex);
-      return true;
-    }
+    // CAS failed; cur was reloaded by atomic_compare_exchange_weak.
   }
-  return target->deficit == 0;
+  return true;  // already drained
 }
 
 void force_table_credit_game(ForceTable *table, ForceTarget *target,
@@ -493,7 +508,8 @@ ForceTarget *force_table_lookup_target_by_key(
 int64_t force_table_total_remaining(const ForceTable *table) {
   int64_t total = 0;
   for (int i = 0; i < table->num_targets; i++) {
-    total += table->targets[i].deficit;
+    total += atomic_load_explicit(&table->targets[i].deficit,
+                                    memory_order_relaxed);
   }
   return total;
 }
@@ -602,7 +618,7 @@ ForceTable *force_table_create(const char *csv_path,
     t->subleave_count = 0;
     t->subleave_mls[0] = 0;
     t->subleave_mls[1] = 0;
-    t->deficit = deficit;
+    atomic_store_explicit(&t->deficit, deficit, memory_order_relaxed);
     t->diff_min = diff_min;
     t->diff_max = diff_max;
     t->rarity_score = rarity_score;
