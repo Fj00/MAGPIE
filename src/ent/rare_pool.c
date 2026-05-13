@@ -13,6 +13,9 @@
 typedef struct {
   char *rack;                 // canonical sorted rack
   ForceTarget **targets;      // resolved force_table pointers
+  float *weights;             // per-target inverse-cell-count weights;
+                              // weight[j] = 1.0 / (#racks in pool covering
+                              // targets[j]); populated after all racks loaded.
   int num_targets;
   int cap_targets;
 } RareRack;
@@ -76,6 +79,7 @@ static int find_or_add_rack(RarePool *rp, const char *rack_str) {
   RareRack *r = &rp->racks[rp->num_racks++];
   r->rack = strdup(rack_str);
   r->targets = NULL;
+  r->weights = NULL;
   r->num_targets = 0;
   r->cap_targets = 0;
   return rp->num_racks - 1;
@@ -164,6 +168,79 @@ static void rare_pool_load_file(RarePool *rp, const char *csv_path,
           csv_path, n_resolved, n_rows, n_unresolved, rp->num_racks);
 }
 
+// Compute per-target weights: weight = 1.0 / (number of racks in pool
+// that cover this cell). Cells in few racks get higher weight so the
+// deficit-aware sampler prioritizes them. Idempotent — caller can rerun
+// after loading more racks.
+static int ptr_cmp(const void *a, const void *b) {
+  void *pa = *(void *const *)a;
+  void *pb = *(void *const *)b;
+  if (pa < pb) return -1;
+  if (pa > pb) return 1;
+  return 0;
+}
+
+static void rare_pool_recompute_weights(RarePool *rp) {
+  size_t total = 0;
+  for (int i = 0; i < rp->num_racks; i++) total += rp->racks[i].num_targets;
+  if (total == 0) return;
+  ForceTarget **flat = (ForceTarget **)malloc(sizeof(ForceTarget *) * total);
+  if (!flat) {
+    fprintf(stderr, "rare_pool: oom on weight flat array\n");
+    exit(1);
+  }
+  size_t fi = 0;
+  for (int i = 0; i < rp->num_racks; i++) {
+    for (int j = 0; j < rp->racks[i].num_targets; j++) {
+      flat[fi++] = rp->racks[i].targets[j];
+    }
+  }
+  qsort(flat, total, sizeof(ForceTarget *), ptr_cmp);
+  // Build (ptr, count) array of unique entries.
+  ForceTarget **uniq_ptr = (ForceTarget **)malloc(sizeof(ForceTarget *) * total);
+  int *uniq_count = (int *)malloc(sizeof(int) * total);
+  if (!uniq_ptr || !uniq_count) {
+    fprintf(stderr, "rare_pool: oom on weight unique arrays\n");
+    exit(1);
+  }
+  int n_unique = 0;
+  for (size_t k = 0; k < total; ) {
+    size_t k2 = k;
+    while (k2 < total && flat[k2] == flat[k]) k2++;
+    uniq_ptr[n_unique] = flat[k];
+    uniq_count[n_unique] = (int)(k2 - k);
+    n_unique++;
+    k = k2;
+  }
+  free(flat);
+  // Populate per-rack weights via binary search on uniq_ptr.
+  for (int i = 0; i < rp->num_racks; i++) {
+    RareRack *r = &rp->racks[i];
+    free(r->weights);
+    r->weights = (float *)malloc(sizeof(float) * (size_t)r->num_targets);
+    if (!r->weights) {
+      fprintf(stderr, "rare_pool: oom on weights\n");
+      exit(1);
+    }
+    for (int j = 0; j < r->num_targets; j++) {
+      ForceTarget *t = r->targets[j];
+      int lo = 0, hi = n_unique - 1, cnt = 1;
+      while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (uniq_ptr[mid] == t) { cnt = uniq_count[mid]; break; }
+        if (uniq_ptr[mid] < t) lo = mid + 1;
+        else hi = mid - 1;
+      }
+      r->weights[j] = 1.0f / (float)cnt;
+    }
+  }
+  free(uniq_ptr);
+  free(uniq_count);
+  fprintf(stderr,
+          "rare_pool: computed inverse-cell-count weights "
+          "(%d unique cells across %d racks)\n", n_unique, rp->num_racks);
+}
+
 RarePool *rare_pool_create(const char *csv_path, ForceTable *force_table,
                            const LetterDistribution *ld) {
   if (!csv_path || !force_table || !ld) return NULL;
@@ -176,6 +253,7 @@ RarePool *rare_pool_create(const char *csv_path, ForceTable *force_table,
     rare_pool_destroy(rp);
     return NULL;
   }
+  rare_pool_recompute_weights(rp);
   return rp;
 }
 
@@ -184,6 +262,7 @@ void rare_pool_load_more(RarePool *rp, const char *csv_path,
                           const LetterDistribution *ld) {
   if (!rp || !csv_path || !force_table || !ld) return;
   rare_pool_load_file(rp, csv_path, force_table, ld);
+  rare_pool_recompute_weights(rp);
 }
 
 void rare_pool_destroy(RarePool *rp) {
@@ -191,6 +270,7 @@ void rare_pool_destroy(RarePool *rp) {
   for (int i = 0; i < rp->num_racks; i++) {
     free(rp->racks[i].rack);
     free(rp->racks[i].targets);
+    free(rp->racks[i].weights);
   }
   free(rp->racks);
   free(rp);
@@ -215,25 +295,31 @@ static uint64_t splitmix64(uint64_t *x) {
 
 int rare_pool_sample_deficit_aware(const RarePool *rp, uint64_t seed) {
   if (!rp || rp->num_racks == 0) return -1;
-  // Single-pass max-with-reservoir: track max score and uniformly pick
-  // from the (potentially large) tied set without allocating.
-  int best_score = 0;
+  // Score = sum of inverse-cell-count weights over targets with deficit>0.
+  // Cells covered by few racks contribute more, so racks that hit rare
+  // (low-coverage) cells are preferred. Argmax (ties broken by reservoir).
+  // Granular comparison via int64 microweight to avoid float-equality
+  // pitfalls in the tied-reservoir step.
+  int64_t best_score = 0;
   int n_tied = 0;
   int picked = -1;
   uint64_t s = seed ^ 0xa1b2c3d4e5f60708ULL;
   for (int i = 0; i < rp->num_racks; i++) {
     const RareRack *r = &rp->racks[i];
-    int score = 0;
+    float score = 0.0f;
     for (int j = 0; j < r->num_targets; j++) {
-      if (r->targets[j]->deficit > 0) score++;
+      if (r->targets[j]->deficit > 0) {
+        score += r->weights ? r->weights[j] : 1.0f;
+      }
     }
-    if (score > best_score) {
-      best_score = score;
+    // Discretize score to int64 microunits for stable tie comparison.
+    int64_t score_i = (int64_t)(score * 1000000.0f + 0.5f);
+    if (score_i > best_score) {
+      best_score = score_i;
       n_tied = 1;
       picked = i;
-    } else if (score == best_score && score > 0) {
+    } else if (score_i == best_score && score_i > 0) {
       n_tied++;
-      // Reservoir step: replace `picked` with prob 1/n_tied.
       const uint64_t h = splitmix64(&s);
       if ((h % (uint64_t)n_tied) == 0) picked = i;
     }
