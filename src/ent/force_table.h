@@ -72,6 +72,13 @@ typedef struct ForceTarget {
   // to the back).
   int by_bag_idx;
   int by_shape_idx;
+  // For STRATUM cells: per-side target T = CSV target value. Cell drains
+  // when total_wins >= T AND total_losses >= T. Each credit increments
+  // W or L (or both for tie). If credited side was < T before, deficit
+  // decrements by 1. Initial in-memory deficit = 2T. Cell drained when
+  // deficit hits 0 (= both sides reached T). For non-STRATUM kinds this
+  // field is unused.
+  int32_t stratum_per_side;
 } ForceTarget;
 
 // Compact per-target hot data co-located with bucket pointer for cache-

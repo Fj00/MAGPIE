@@ -48,18 +48,19 @@ void force_table_reset_counters(void) {
   atomic_store_explicit(&g_cas_retries, 0, memory_order_relaxed);
 }
 
-// Per-stratum diff-tally bounds: ±FORCE_DIFF_MAX. Diffs outside this range
-// are clamped to the boundary (matches the spreadsheet WINDOW behavior).
-// 1001 buckets per stratum target × 8 bytes = 8 KB.
+// STRATUM cells use a single packed (wins:32, losses:32) atomic counter.
+// Per-bucket subdivision was removed — the spec wants total W and total L
+// per cell to each exceed the per-side threshold T (= CSV target column).
+// Each credit at the cell increments W or L (or both, for ties).
+typedef struct StratumTally {
+  _Atomic uint64_t wl;
+} StratumTally;
+
+// Kept for backward compat with progress-line counter names — no longer
+// per-bucket subdivision, but the FORCE_DIFF_MAX constant is still used
+// elsewhere for clamping if needed.
 #define FORCE_DIFF_MAX 500
 #define FORCE_DIFF_BUCKETS (FORCE_DIFF_MAX * 2 + 1)
-
-// Atomic packed (wins:32, losses:32). Updated with atomic_fetch_add so that
-// each game's pre-increment value uniquely tells it whether IT was the one
-// that bumped min(w,l).
-typedef struct StratumTally {
-  _Atomic uint64_t buckets[FORCE_DIFF_BUCKETS];
-} StratumTally;
 
 // A2 optimization: bucket targets by (bag, leave_length, exchange) so per-move
 // matching iterates only the small subset compatible with that move's leave
@@ -452,37 +453,46 @@ void force_table_credit_game(ForceTable *table, ForceTarget *target,
   StratumTally *st = (table->stratum_tallies != NULL)
                          ? table->stratum_tallies[idx]
                          : NULL;
-  int clamped = diff;
-  if (clamped < -FORCE_DIFF_MAX) {
-    clamped = -FORCE_DIFF_MAX;
-  } else if (clamped > FORCE_DIFF_MAX) {
-    clamped = FORCE_DIFF_MAX;
-  }
-  const int bucket = clamped + FORCE_DIFF_MAX;
-  if (is_tie || st == NULL) {
+  if (st == NULL) {
     atomic_fetch_add_explicit(&g_stratum_no_bump, 1, memory_order_relaxed);
     return;
   }
-  // Pack wins in the high 32 bits, losses in the low 32 bits.
-  const uint64_t increment = is_win ? ((uint64_t)1 << 32) : (uint64_t)1;
+  // Per-side per-cell accounting: track total wins and losses. Cell drains
+  // when both totals >= target->stratum_per_side (T). Each credit
+  // increments W and/or L; the deficit decrements once per side that
+  // crosses T for the first time.
+  //   win  → W += 1
+  //   loss → L += 1
+  //   tie  → W += 1 AND L += 1 (counts as one of each)
+  const bool inc_w = is_tie || is_win;
+  const bool inc_l = is_tie || !is_win;
+  uint64_t increment = 0;
+  if (inc_w) increment |= ((uint64_t)1 << 32);
+  if (inc_l) increment |= (uint64_t)1;
+  if (increment == 0) return;  // defensive — shouldn't happen
   const uint64_t old = atomic_fetch_add_explicit(
-      &st->buckets[bucket], increment, memory_order_relaxed);
+      &st->wl, increment, memory_order_relaxed);
   const uint32_t old_w = (uint32_t)(old >> 32);
   const uint32_t old_l = (uint32_t)(old & 0xFFFFFFFFu);
-  const uint32_t new_w = old_w + (is_win ? 1u : 0u);
-  const uint32_t new_l = old_l + (is_win ? 0u : 1u);
-  const uint32_t old_min = (old_w < old_l) ? old_w : old_l;
-  const uint32_t new_min = (new_w < new_l) ? new_w : new_l;
-  if (new_min > old_min) {
-    {
-      int ll = target->leave_length;
-      if (ll < 0) ll = 0;
-      if (ll > 5) ll = 5;
-      atomic_fetch_add_explicit(&g_stratum_bumps_by_len[ll], 1,
-                                memory_order_relaxed);
-    }
+  const int32_t per_side = target->stratum_per_side;
+  // Stratum-by-length bump counters (kept for diagnostics — increment per
+  // side that crossed threshold).
+  int ll = target->leave_length;
+  if (ll < 0) ll = 0;
+  if (ll > 5) ll = 5;
+  // Was W previously below per-side target, and this credit advanced W?
+  if (inc_w && per_side > 0 && (int32_t)old_w < per_side) {
+    atomic_fetch_add_explicit(&g_stratum_bumps_by_len[ll], 1,
+                              memory_order_relaxed);
     force_table_decrement_target(table, target);
-  } else {
+  } else if (inc_w) {
+    atomic_fetch_add_explicit(&g_stratum_no_bump, 1, memory_order_relaxed);
+  }
+  if (inc_l && per_side > 0 && (int32_t)old_l < per_side) {
+    atomic_fetch_add_explicit(&g_stratum_bumps_by_len[ll], 1,
+                              memory_order_relaxed);
+    force_table_decrement_target(table, target);
+  } else if (inc_l) {
     atomic_fetch_add_explicit(&g_stratum_no_bump, 1, memory_order_relaxed);
   }
 }
@@ -698,7 +708,21 @@ ForceTable *force_table_create(const char *csv_path,
     t->subleave_count = 0;
     t->subleave_mls[0] = 0;
     t->subleave_mls[1] = 0;
-    atomic_store_explicit(&t->deficit, deficit, memory_order_relaxed);
+    // For STRATUM cells: reinterpret CSV `target` (column 8) as per-side
+    // threshold T. Cell needs total_wins >= T AND total_losses >= T.
+    // Initial in-memory deficit = 2T (one unit per side per event needed).
+    // Decrements 0/1/2 per credit depending on which sides were already
+    // satisfied. For non-STRATUM kinds: deficit/target semantics unchanged.
+    if (kind == FORCE_TARGET_STRATUM) {
+      int64_t target_total = strtoll(fields[7], NULL, 10);
+      if (target_total <= 0) target_total = deficit;
+      t->stratum_per_side = (int32_t)target_total;
+      atomic_store_explicit(&t->deficit, 2 * target_total,
+                            memory_order_relaxed);
+    } else {
+      t->stratum_per_side = 0;
+      atomic_store_explicit(&t->deficit, deficit, memory_order_relaxed);
+    }
     t->diff_min = diff_min;
     t->diff_max = diff_max;
     t->rarity_score = rarity_score;
@@ -916,16 +940,15 @@ ForceTable *force_table_create(const char *csv_path,
   atomic_store_explicit(&table->active_targets, table->num_targets,
                         memory_order_relaxed);
 
-  // Allocate per-target diff tallies for stratum-kind targets. Tile/pair
-  // targets keep tally=NULL since they use count-based decrement.
+  // Allocate per-cell W/L tallies for stratum-kind targets. Single packed
+  // (wins:32, losses:32) atomic counter per cell — no per-bucket
+  // subdivision. Tile/pair/bag targets keep tally=NULL (count-based).
   table->stratum_tallies = (StratumTally **)malloc_or_die(
       sizeof(StratumTally *) * table->num_targets);
   for (int i = 0; i < table->num_targets; i++) {
     if (table->targets[i].kind == FORCE_TARGET_STRATUM) {
       StratumTally *st = (StratumTally *)malloc_or_die(sizeof(StratumTally));
-      for (int b = 0; b < FORCE_DIFF_BUCKETS; b++) {
-        atomic_store_explicit(&st->buckets[b], 0, memory_order_relaxed);
-      }
+      atomic_store_explicit(&st->wl, 0, memory_order_relaxed);
       table->stratum_tallies[i] = st;
     } else {
       table->stratum_tallies[i] = NULL;
