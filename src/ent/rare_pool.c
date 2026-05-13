@@ -1,5 +1,6 @@
 #include "rare_pool.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -295,25 +296,41 @@ static uint64_t splitmix64(uint64_t *x) {
 
 int rare_pool_sample_deficit_aware(const RarePool *rp, uint64_t seed) {
   if (!rp || rp->num_racks == 0) return -1;
-  // Score = sum of inverse-cell-count weights over targets with deficit>0.
-  // Cells covered by few racks contribute more, so racks that hit rare
-  // (low-coverage) cells are preferred. Argmax (ties broken by reservoir).
-  // Granular comparison via int64 microweight to avoid float-equality
-  // pitfalls in the tied-reservoir step.
+  // Score = sum over covered cells of (remaining_deficit * 1/cell_count).
+  // The 1/cell_count weight is static (computed at pool load); cell_count
+  // is the number of pool-racks covering that cell. The remaining_deficit
+  // factor is read atomically per sample call so the sampler tracks the
+  // current force-table state.
+  // Why this formula:
+  //   - rare cells (few racks per cell) get high 1/cell_count -> the
+  //     few racks that cover them outscore racks covering common cells
+  //   - STRATUM cells (high coverage, large deficit) get proportional
+  //     attention via the deficit factor; without it they'd be starved
+  //     because 1/cell_count for STRATUM is tiny (~1/9000)
+  //   - drained cells (deficit==0) contribute zero, sampler auto-shifts
+  // Argmax with reservoir tie-break; int64 microunits avoid float-tie
+  // pitfalls.
   int64_t best_score = 0;
   int n_tied = 0;
   int picked = -1;
   uint64_t s = seed ^ 0xa1b2c3d4e5f60708ULL;
   for (int i = 0; i < rp->num_racks; i++) {
     const RareRack *r = &rp->racks[i];
-    float score = 0.0f;
+    double score = 0.0;
     for (int j = 0; j < r->num_targets; j++) {
-      if (r->targets[j]->deficit > 0) {
-        score += r->weights ? r->weights[j] : 1.0f;
+      const int64_t def = atomic_load_explicit(
+          &r->targets[j]->deficit, memory_order_relaxed);
+      if (def > 0) {
+        const float w = r->weights ? r->weights[j] : 1.0f;
+        score += (double)w * (double)def;
       }
     }
     // Discretize score to int64 microunits for stable tie comparison.
-    int64_t score_i = (int64_t)(score * 1000000.0f + 0.5f);
+    // Score can be large (deficit ~1M × weight ~1.0) so use double then
+    // scale + clamp.
+    double scaled = score * 1000.0;
+    if (scaled > (double)INT64_MAX) scaled = (double)INT64_MAX;
+    int64_t score_i = (int64_t)scaled;
     if (score_i > best_score) {
       best_score = score_i;
       n_tied = 1;
