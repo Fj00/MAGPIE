@@ -65,6 +65,24 @@ static _Atomic uint64_t g_eb_leaves_emitted = 0;
 static _Atomic uint64_t g_eb_annotate_cells_added = 0;
 static _Atomic uint64_t g_eb_dfs_cells_propagated = 0;
 static _Atomic uint64_t g_eb_emit_cells_credited = 0;
+// Per-kind STRATUM-added counter inside eb_annotate's collect scan.
+// Index = leave_length [0..5]; tracks how many length-N STRATUM cells
+// were added to slots by eb_annotate.
+static _Atomic uint64_t g_eb_annot_stratum_by_len[6] = {0};
+// Per-leave-length count of STRATUM slots SEEN in collect scan, regardless
+// of whether they pass predicates. If this is 0 for L>=3, the STRATUM cells
+// aren't even being iterated (bucket lookup issue or cap-eviction).
+static _Atomic uint64_t g_eb_stratum_seen_by_len[6] = {0};
+// Diagnose length-3+ filtering: count cells reaching the type check
+// at length>=3 (in collect scan), vs those that pass it.
+static _Atomic uint64_t g_eb_l3plus_type_check_hit = 0;
+static _Atomic uint64_t g_eb_l3plus_type_check_passed = 0;
+// Per-leaf-length-3+ enumeration count: how many length-3+ leaves get
+// to eb_annotate's outer loop at all?
+static _Atomic uint64_t g_eb_l3plus_outer_loop = 0;
+// Per-priority gate matched count at length>=3
+static _Atomic uint64_t g_eb_l3p_gate_match_by_prio[4] = {0};
+static _Atomic uint64_t g_eb_l3p_gate_iter_by_prio[4] = {0};
 
 typedef struct LeavegenSharedData {
   int num_gens;
@@ -2029,10 +2047,28 @@ void print_current_status(AutoplayWorker *autoplay_worker,
     const uint64_t emitc =
         atomic_exchange_explicit(&g_eb_emit_cells_credited, 0,
                                  memory_order_relaxed);
+    uint64_t s_cred[6], s_bump[6];
+    force_table_get_stratum_by_len(s_cred, s_bump);
+    force_table_reset_stratum_by_len();
+    uint64_t s_annot[6];
+    uint64_t s_seen[6];
+    for (int i = 0; i < 6; i++) {
+      s_annot[i] = atomic_exchange_explicit(&g_eb_annot_stratum_by_len[i], 0,
+                                            memory_order_relaxed);
+      s_seen[i] = atomic_exchange_explicit(&g_eb_stratum_seen_by_len[i], 0,
+                                           memory_order_relaxed);
+    }
     string_builder_add_formatted_string(
         status_sb,
         " counters: leaves=%llu annot=%llu prop=%llu emitc=%llu "
-        "credits=%llu landed=%llu zero=%llu stratum_nb=%llu retries=%llu.\n",
+        "credits=%llu landed=%llu zero=%llu stratum_nb=%llu retries=%llu "
+        "strat_cred_L0-5=%llu,%llu,%llu,%llu,%llu,%llu "
+        "strat_bump_L0-5=%llu,%llu,%llu,%llu,%llu,%llu "
+        "strat_annot_L0-5=%llu,%llu,%llu,%llu,%llu,%llu "
+        "strat_seen_L0-5=%llu,%llu,%llu,%llu,%llu,%llu "
+        "l3p_outer=%llu l3p_typehit=%llu l3p_typepass=%llu "
+        "l3p_iter[STRAT,TILE,PAIR]=%llu,%llu,%llu "
+        "l3p_match[STRAT,TILE,PAIR]=%llu,%llu,%llu.\n",
         (unsigned long long)leaves,
         (unsigned long long)annot,
         (unsigned long long)prop,
@@ -2041,7 +2077,37 @@ void print_current_status(AutoplayWorker *autoplay_worker,
         (unsigned long long)fc.decrements_landed,
         (unsigned long long)fc.noops_already_zero,
         (unsigned long long)fc.stratum_no_bump,
-        (unsigned long long)fc.cas_retries);
+        (unsigned long long)fc.cas_retries,
+        (unsigned long long)s_cred[0], (unsigned long long)s_cred[1],
+        (unsigned long long)s_cred[2], (unsigned long long)s_cred[3],
+        (unsigned long long)s_cred[4], (unsigned long long)s_cred[5],
+        (unsigned long long)s_bump[0], (unsigned long long)s_bump[1],
+        (unsigned long long)s_bump[2], (unsigned long long)s_bump[3],
+        (unsigned long long)s_bump[4], (unsigned long long)s_bump[5],
+        (unsigned long long)s_annot[0], (unsigned long long)s_annot[1],
+        (unsigned long long)s_annot[2], (unsigned long long)s_annot[3],
+        (unsigned long long)s_annot[4], (unsigned long long)s_annot[5],
+        (unsigned long long)s_seen[0], (unsigned long long)s_seen[1],
+        (unsigned long long)s_seen[2], (unsigned long long)s_seen[3],
+        (unsigned long long)s_seen[4], (unsigned long long)s_seen[5],
+        (unsigned long long)atomic_exchange_explicit(
+            &g_eb_l3plus_outer_loop, 0, memory_order_relaxed),
+        (unsigned long long)atomic_exchange_explicit(
+            &g_eb_l3plus_type_check_hit, 0, memory_order_relaxed),
+        (unsigned long long)atomic_exchange_explicit(
+            &g_eb_l3plus_type_check_passed, 0, memory_order_relaxed),
+        (unsigned long long)atomic_exchange_explicit(
+            &g_eb_l3p_gate_iter_by_prio[0], 0, memory_order_relaxed),
+        (unsigned long long)atomic_exchange_explicit(
+            &g_eb_l3p_gate_iter_by_prio[1], 0, memory_order_relaxed),
+        (unsigned long long)atomic_exchange_explicit(
+            &g_eb_l3p_gate_iter_by_prio[2], 0, memory_order_relaxed),
+        (unsigned long long)atomic_exchange_explicit(
+            &g_eb_l3p_gate_match_by_prio[0], 0, memory_order_relaxed),
+        (unsigned long long)atomic_exchange_explicit(
+            &g_eb_l3p_gate_match_by_prio[1], 0, memory_order_relaxed),
+        (unsigned long long)atomic_exchange_explicit(
+            &g_eb_l3p_gate_match_by_prio[2], 0, memory_order_relaxed));
   } else {
     string_builder_add_string(status_sb, "\n");
   }
@@ -2461,7 +2527,17 @@ static void eb_annotate_force_targets_to_slots(AutoplayWorker *w,
       // Gating scan: does this slot match ANY target at the current priority?
       bool gate_matched = false;
       const int eff_diff = cur_diff + score;
-      LeaveType cached_leave_type = (LeaveType)-1;
+      // BUG: must be plain int, not LeaveType. clang treats LeaveType as
+      // unsigned for the `< 0` comparison, so `(LeaveType)-1 < 0` is
+      // false and force_classify_leave is never called — leaves
+      // cached_leave_type at its sentinel, which then fails the type
+      // check against every cell's leave_type, silently rejecting ALL
+      // length>=3 force-table cells.
+      int cached_leave_type = -1;
+      if (leave_len >= 3 && priority >= 0 && priority <= 3) {
+        atomic_fetch_add_explicit(&g_eb_l3p_gate_iter_by_prio[priority], 1,
+                                   memory_order_relaxed);
+      }
       for (int t = 0; t < bucket_count; t++) {
         const uint32_t req = bitmaps[t];
         if ((leave_bm & req) != req) continue;
@@ -2480,6 +2556,10 @@ static void eb_annotate_force_targets_to_slots(AutoplayWorker *w,
         gate_matched = true;
         break;
       }
+      if (gate_matched && leave_len >= 3 && priority >= 0 && priority <= 3) {
+        atomic_fetch_add_explicit(&g_eb_l3p_gate_match_by_prio[priority], 1,
+                                   memory_order_relaxed);
+      }
       if (!gate_matched) continue;
       // Collect ALL matches for this slot's move (across all leave kinds)
       // for game-end credit. Mirrors eb_append_force_target_slots's
@@ -2491,6 +2571,15 @@ static void eb_annotate_force_targets_to_slots(AutoplayWorker *w,
         const uint32_t req = bitmaps[t];
         if ((leave_bm & req) != req) continue;
         ForceTargetSlot *fs = &bucket_slots[t];
+        // Diagnostic: count every STRATUM slot SEEN at this position,
+        // before any further predicate filtering.
+        if ((int)fs->kind == FORCE_TARGET_STRATUM) {
+          int ll = fs->leave_length;
+          if (ll < 0) ll = 0;
+          if (ll > 5) ll = 5;
+          atomic_fetch_add_explicit(&g_eb_stratum_seen_by_len[ll], 1,
+                                     memory_order_relaxed);
+        }
         if (fs->deficit <= 0) continue;
         if ((int)fs->kind != FORCE_TARGET_PAIR &&
             (int)fs->kind != FORCE_TARGET_TILE &&
@@ -2500,14 +2589,25 @@ static void eb_annotate_force_targets_to_slots(AutoplayWorker *w,
             fs->subleave_mls[0] == fs->subleave_mls[1] &&
             leave.array[fs->subleave_mls[0]] < 2) continue;
         if (fs->exchange == 0 && fs->leave_length >= 3) {
+          atomic_fetch_add_explicit(&g_eb_l3plus_type_check_hit, 1,
+                                     memory_order_relaxed);
           if (cached_leave_type < 0)
             cached_leave_type = force_classify_leave(&leave, ld);
           if ((LeaveType)cached_leave_type != (LeaveType)fs->leave_type)
             continue;
+          atomic_fetch_add_explicit(&g_eb_l3plus_type_check_passed, 1,
+                                     memory_order_relaxed);
         }
         gr->eb_force_targets_for_slot[s][n_matches++] = fs->cold;
         atomic_fetch_add_explicit(&g_eb_annotate_cells_added, 1,
                                    memory_order_relaxed);
+        if ((int)fs->kind == FORCE_TARGET_STRATUM) {
+          int ll = fs->leave_length;
+          if (ll < 0) ll = 0;
+          if (ll > 5) ll = 5;
+          atomic_fetch_add_explicit(&g_eb_annot_stratum_by_len[ll], 1,
+                                     memory_order_relaxed);
+        }
       }
       gr->eb_force_target_count_for_slot[s] = n_matches;
       used_slot[s] = true;
@@ -2862,7 +2962,6 @@ static bool inject_target_turn_rack_for_category(
 // 0.60). The four non-rare categories share equally in (1 - rare_frac).
 // Missing pools leave the natural rack for their slice.
 // Only fires when the on-turn player matches rare_target_player.
-__attribute__((unused))
 static void inject_target_turn_rack_by_category(
     AutoplayWorker *w, GameRunner *gr, uint64_t seed) {
   const int p = game_get_player_on_turn_index(gr->game);
@@ -2922,109 +3021,6 @@ static void inject_target_turn_rack_by_category(
   swap_player_rack(gr->game, p, target);
 }
 
-// Forward decls so the 5-way fork can call back into the DFS for
-// post-T6 playthrough, and play_eb_dfs can dispatch into the 5-way
-// fork at TARGET turn entry.
-static void play_eb_target_5way(AutoplayWorker *w, GameRunner *gr,
-                                uint64_t branch_id);
-static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
-                        uint64_t branch_id);
-
-// At TARGET turn entry, run the existing T6 fanout (pass + exch
-// subsets + play subsets) ONCE PER POOL CATEGORY {pass, exch, bingo,
-// rare, play}. Each branch:
-//   1. restores game+meta to TARGET-entry state
-//   2. injects its category's rack via swap_player_rack
-//   3. enumerates actions on that rack (pass/exch/play subsets)
-//   4. for each action: play it, recurse via play_eb_dfs to game-end
-// Net effect: 5 racks × ~32 actions × ~24 leaves emitted at T6 per
-// upstream-fork-path (vs the legacy 1 rack × ~32 actions). Drives
-// STRATUM bumps faster because every game contributes a rare-pool
-// rack instead of just 20% of games.
-static void play_eb_target_5way(AutoplayWorker *w, GameRunner *gr,
-                                uint64_t branch_id) {
-  EbMetaSave outer_saved_meta;
-  eb_meta_save(gr, &outer_saved_meta);
-  Game *outer_saved_game = game_duplicate(gr->game);
-
-  for (int cat = 0; cat < 5; cat++) {
-    if (cat > 0) {
-      game_copy(gr->game, outer_saved_game);
-      eb_meta_restore(gr, &outer_saved_meta);
-    }
-    const uint64_t cat_seed =
-        gr->seed ^ branch_id ^ ((uint64_t)cat * 0x9e3779b97f4a7c15ULL);
-    if (!inject_target_turn_rack_for_category(w, gr, cat, cat_seed)) {
-      continue;  // pool unset or draw failed
-    }
-    const uint64_t cat_branch_id =
-        (branch_id << 8) | (uint64_t)(cat + 1);
-
-    const int n_actions = eb_enumerate_actions(w, gr);
-    if (n_actions == 0) {
-      continue;  // no legal actions on this rack
-    }
-
-    // Snapshot enumerated actions and force-targets (same pattern as
-    // play_eb_dfs's action-subset fork).
-    Move local_actions[EB_MAX_ACTIONS];
-    bool local_present[EB_MAX_ACTIONS];
-    ForceTarget *local_force_targets[EB_MAX_ACTIONS]
-                                    [EB_MAX_LEAVE_TARGETS_PER_MOVE];
-    uint8_t local_force_target_count[EB_MAX_ACTIONS];
-    for (int s = 0; s < n_actions; s++) {
-      local_present[s] = gr->eb_action_present[s];
-      local_force_target_count[s] = gr->eb_force_target_count_for_slot[s];
-      for (uint8_t k = 0; k < local_force_target_count[s]; k++) {
-        local_force_targets[s][k] = gr->eb_force_targets_for_slot[s][k];
-      }
-      if (local_present[s]) {
-        move_copy(&local_actions[s], gr->eb_action_buf[s]);
-      }
-    }
-    const int fork_natural_slot = gr->eb_natural_slot;
-    EbMetaSave action_saved_meta;
-    eb_meta_save(gr, &action_saved_meta);
-    Game *action_saved_game = game_duplicate(gr->game);
-    const int fork_turn = action_saved_meta.n_snaps + 1;
-
-    for (int s = 0; s < n_actions; s++) {
-      if (!local_present[s]) continue;
-      gr->eb_forced_move = &local_actions[s];
-      gr->eb_natural_slot = fork_natural_slot;
-      gr->eb_divergence_turn = action_saved_meta.divergence_turn;
-      gr->eb_last_divergence_turn = action_saved_meta.last_divergence_turn;
-      gr->eb_n_divergences = action_saved_meta.n_divergences;
-      if (s != fork_natural_slot) {
-        if (gr->eb_divergence_turn == -1) {
-          gr->eb_divergence_turn = fork_turn;
-        }
-        gr->eb_last_divergence_turn = fork_turn;
-        gr->eb_n_divergences++;
-      }
-      if (fork_turn >= 1 && fork_turn <= 6) {
-        const uint8_t cnt = local_force_target_count[s];
-        gr->eb_snap_force_target_count[fork_turn] = cnt;
-        for (uint8_t k = 0; k < cnt; k++) {
-          gr->eb_snap_force_targets[fork_turn][k] =
-              local_force_targets[s][k];
-          atomic_fetch_add_explicit(&g_eb_dfs_cells_propagated, 1,
-                                     memory_order_relaxed);
-        }
-      }
-      game_runner_play_move(w, gr);
-      gr->eb_forced_move = NULL;
-      // Recurse via play_eb_dfs for post-T6 playthrough. eb_n_snaps
-      // is now == target_turn so the 5-way condition won't re-fire.
-      play_eb_dfs(w, gr, (cat_branch_id << 8) | (uint64_t)(s + 1));
-      game_copy(gr->game, action_saved_game);
-      eb_meta_restore(gr, &action_saved_meta);
-    }
-    game_destroy(action_saved_game);
-  }
-  game_destroy(outer_saved_game);
-}
-
 // Recursive DFS. Plays moves until a fork point or game-end. At a fork
 // point, enumerates K actions, recursively explores each, then returns.
 // At game-end, emits the leaf branch's records.
@@ -3035,11 +3031,11 @@ static void play_eb_target_5way(AutoplayWorker *w, GameRunner *gr,
 static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
                         uint64_t branch_id) {
   while (!game_runner_is_game_over(gr)) {
-    // At TARGET turn entry (board still empty), hand control to the
-    // 5-way category fork. It runs the existing T6 fanout (pass +
-    // exch subsets + play subsets) once per pool category and recurses
-    // through post-T6 turns to game-end inside each branch — when it
-    // returns the entire game has finished, so we exit play_eb_dfs.
+    // Target-turn source-mix injection: at the start of the target turn
+    // (eb_n_snaps == target_turn - 1, board still empty) pick a rack source
+    // uniformly from {pass, exch, bingo, rare, play} and inject a rack from
+    // the chosen source. Skips if no pools loaded or on-turn player isn't the
+    // rare_target_player.
     if (gr->eb_active &&
         gr->eb_n_snaps == w->shared_data->eb_target_turn - 1 &&
         board_get_tiles_played(game_get_board(gr->game)) == 0 &&
@@ -3048,8 +3044,7 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
          w->shared_data->bingo_pool != NULL ||
          w->shared_data->play_pool != NULL ||
          w->shared_data->rare_rack_cells != NULL)) {
-      play_eb_target_5way(w, gr, branch_id);
-      return;
+      inject_target_turn_rack_by_category(w, gr, gr->seed ^ branch_id);
     }
     const int n_actions = eb_enumerate_actions(w, gr);
     if (n_actions == 0) {

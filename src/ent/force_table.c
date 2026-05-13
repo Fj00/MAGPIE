@@ -22,6 +22,10 @@ static _Atomic uint64_t g_decrements_landed = 0;
 static _Atomic uint64_t g_noops_already_zero = 0;
 static _Atomic uint64_t g_stratum_no_bump = 0;
 static _Atomic uint64_t g_cas_retries = 0;
+// Per-length STRATUM credit counters — to investigate why length>=3
+// STRATUM cells never drain despite the run emitting millions of leaves.
+static _Atomic uint64_t g_stratum_credits_by_len[6] = {0};
+static _Atomic uint64_t g_stratum_bumps_by_len[6] = {0};
 
 void force_table_get_counters(ForceCounters *out) {
   out->credit_calls =
@@ -431,6 +435,14 @@ void force_table_credit_game(ForceTable *table, ForceTarget *target,
     force_table_decrement_target(table, target);
     return;
   }
+  // STRATUM credit — count by length for diagnosis.
+  {
+    int ll = target->leave_length;
+    if (ll < 0) ll = 0;
+    if (ll > 5) ll = 5;
+    atomic_fetch_add_explicit(&g_stratum_credits_by_len[ll], 1,
+                              memory_order_relaxed);
+  }
   // Ties don't change min(wins, losses). Treat them as a non-credit, but
   // still try to drain progress so a stratum with many ties doesn't stall.
   // A tie at the boundary (w == l) would have left min unchanged anyway, so
@@ -462,9 +474,34 @@ void force_table_credit_game(ForceTable *table, ForceTarget *target,
   const uint32_t old_min = (old_w < old_l) ? old_w : old_l;
   const uint32_t new_min = (new_w < new_l) ? new_w : new_l;
   if (new_min > old_min) {
+    {
+      int ll = target->leave_length;
+      if (ll < 0) ll = 0;
+      if (ll > 5) ll = 5;
+      atomic_fetch_add_explicit(&g_stratum_bumps_by_len[ll], 1,
+                                memory_order_relaxed);
+    }
     force_table_decrement_target(table, target);
   } else {
     atomic_fetch_add_explicit(&g_stratum_no_bump, 1, memory_order_relaxed);
+  }
+}
+
+void force_table_get_stratum_by_len(uint64_t credits[6], uint64_t bumps[6]) {
+  for (int i = 0; i < 6; i++) {
+    credits[i] = atomic_load_explicit(&g_stratum_credits_by_len[i],
+                                       memory_order_relaxed);
+    bumps[i] = atomic_load_explicit(&g_stratum_bumps_by_len[i],
+                                     memory_order_relaxed);
+  }
+}
+
+void force_table_reset_stratum_by_len(void) {
+  for (int i = 0; i < 6; i++) {
+    atomic_store_explicit(&g_stratum_credits_by_len[i], 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_stratum_bumps_by_len[i], 0,
+                          memory_order_relaxed);
   }
 }
 
