@@ -2114,6 +2114,24 @@ void print_current_status(AutoplayWorker *autoplay_worker,
   thread_control_print(autoplay_worker->args.thread_control,
                        string_builder_peek(status_sb));
   string_builder_destroy(status_sb);
+
+  // SIGUSR1-triggered mid-run dump: `kill -USR1 <pid>` sets a flag; this
+  // tick consumes it and writes a numbered snapshot next to the configured
+  // MAGPIE_FORCE_TABLE_DUMP path. Numbered .snapN suffix avoids overwriting
+  // the final exit dump.
+  if (shared_data->force_table &&
+      force_table_consume_dump_request()) {
+    static _Atomic int dump_seq = 0;
+    const char *base = getenv("MAGPIE_FORCE_TABLE_DUMP");
+    if (base && base[0] != '\0') {
+      int n = atomic_fetch_add_explicit(&dump_seq, 1, memory_order_relaxed);
+      char path[1024];
+      snprintf(path, sizeof(path), "%s.snap%d", base, n);
+      force_table_dump_remaining(shared_data->force_table, path,
+                                 shared_data->ld);
+      fprintf(stderr, "force_table: dumped snapshot to %s\n", path);
+    }
+  }
 }
 
 void autoplay_add_game(AutoplayWorker *autoplay_worker,

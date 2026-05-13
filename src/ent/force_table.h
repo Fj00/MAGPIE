@@ -211,6 +211,11 @@ void force_table_reset_stratum_by_len(void);
 void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
                                 const LetterDistribution *ld);
 
+// Test-and-clear the SIGUSR1 dump-request flag. Returns true if a dump was
+// requested since the previous call. Allows autoplay's progress hook to
+// honor `kill -USR1 <pid>` by writing a snapshot CSV.
+bool force_table_consume_dump_request(void);
+
 // Number of targets currently loaded (including satisfied ones).
 int force_table_num_targets(const ForceTable *table);
 

@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +27,22 @@ static _Atomic uint64_t g_cas_retries = 0;
 // STRATUM cells never drain despite the run emitting millions of leaves.
 static _Atomic uint64_t g_stratum_credits_by_len[6] = {0};
 static _Atomic uint64_t g_stratum_bumps_by_len[6] = {0};
+
+// SIGUSR1 flag: set by signal handler, consumed by autoplay's progress hook.
+// kill -USR1 <pid> requests a snapshot dump on the next progress tick.
+static _Atomic int g_dump_request = 0;
+
+static void force_table_sigusr1_handler(int sig) {
+  (void)sig;
+  atomic_store_explicit(&g_dump_request, 1, memory_order_relaxed);
+}
+
+bool force_table_consume_dump_request(void) {
+  int expected = 1;
+  return atomic_compare_exchange_strong_explicit(
+      &g_dump_request, &expected, 0, memory_order_relaxed,
+      memory_order_relaxed);
+}
 
 void force_table_get_counters(ForceCounters *out) {
   out->credit_calls =
@@ -954,6 +971,13 @@ ForceTable *force_table_create(const char *csv_path,
       table->stratum_tallies[i] = NULL;
     }
   }
+
+  // Register SIGUSR1 handler so `kill -USR1 <pid>` requests a mid-run dump
+  // via the periodic progress hook in autoplay.
+  struct sigaction sa = {0};
+  sa.sa_handler = force_table_sigusr1_handler;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGUSR1, &sa, NULL);
 
   fprintf(stderr, "force_table: loaded %d targets from %s (total deficit=%lld)\n",
           table->num_targets, csv_path,
