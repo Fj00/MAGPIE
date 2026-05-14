@@ -2976,11 +2976,16 @@ static bool inject_target_turn_rack_for_category(
     pass_cycle_sample_p1(w->shared_data->exch_pool, seed, &target);
   } else if (cat == 2 && w->shared_data->bingo_pool != NULL) {
     pass_cycle_sample_p1(w->shared_data->bingo_pool, seed, &target);
-  } else if (cat == 3 && w->shared_data->rare_rack_cells != NULL) {
-    const int idx = rare_pool_sample_deficit_aware(
-        w->shared_data->rare_rack_cells, seed);
-    if (idx >= 0) {
-      target = rare_pool_get_rack(w->shared_data->rare_rack_cells, idx);
+  } else if (cat == 3) {
+    if (w->shared_data->play_index != NULL) {
+      target = play_index_sample_rack_deficit_aware(
+          w->shared_data->play_index, seed);
+    } else if (w->shared_data->rare_rack_cells != NULL) {
+      const int idx = rare_pool_sample_deficit_aware(
+          w->shared_data->rare_rack_cells, seed);
+      if (idx >= 0) {
+        target = rare_pool_get_rack(w->shared_data->rare_rack_cells, idx);
+      }
     }
   } else if (cat == 4 && w->shared_data->play_pool != NULL) {
     pass_cycle_sample_p1(w->shared_data->play_pool, seed, &target);
@@ -3043,11 +3048,16 @@ static void inject_target_turn_rack_by_category(
     pass_cycle_sample_p1(w->shared_data->exch_pool, seed, &target);
   } else if (cat == 2 && w->shared_data->bingo_pool != NULL) {
     pass_cycle_sample_p1(w->shared_data->bingo_pool, seed, &target);
-  } else if (cat == 3 && w->shared_data->rare_rack_cells != NULL) {
-    const int idx = rare_pool_sample_deficit_aware(
-        w->shared_data->rare_rack_cells, seed);
-    if (idx >= 0) {
-      target = rare_pool_get_rack(w->shared_data->rare_rack_cells, idx);
+  } else if (cat == 3) {
+    if (w->shared_data->play_index != NULL) {
+      target = play_index_sample_rack_deficit_aware(
+          w->shared_data->play_index, seed);
+    } else if (w->shared_data->rare_rack_cells != NULL) {
+      const int idx = rare_pool_sample_deficit_aware(
+          w->shared_data->rare_rack_cells, seed);
+      if (idx >= 0) {
+        target = rare_pool_get_rack(w->shared_data->rare_rack_cells, idx);
+      }
     }
   } else if (cat == 4 && w->shared_data->play_pool != NULL) {
     pass_cycle_sample_p1(w->shared_data->play_pool, seed, &target);
@@ -3073,34 +3083,19 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     // rare_target_player.
     if (gr->eb_active &&
         gr->eb_n_snaps == w->shared_data->eb_target_turn - 1 &&
-        board_get_tiles_played(game_get_board(gr->game)) == 0) {
-      // Cell-driven path (preferred): pick rack via play_index
-      // deficit-aware top-K cell sampler. Falls back to the legacy
-      // 5-pool sampler when play_index isn't loaded.
-      if (w->shared_data->play_index != NULL) {
-        const int p = game_get_player_on_turn_index(gr->game);
-        if (p == w->shared_data->rare_target_player) {
-          const char *rack_str = play_index_sample_rack_deficit_aware(
-              w->shared_data->play_index, gr->seed ^ branch_id);
-          if (rack_str) {
-            // rack_str is from the mmap'd 8-byte arena; copy into a
-            // local NUL-terminated buffer for the bag-draw call.
-            char buf[RACK_SIZE + 2] = {0};
-            int n = 0;
-            while (n < RACK_SIZE && rack_str[n] != '\0') {
-              buf[n] = rack_str[n];
-              n++;
-            }
-            swap_player_rack(gr->game, p, buf);
-          }
-        }
-      } else if (w->shared_data->pass_pool != NULL ||
-                 w->shared_data->exch_pool != NULL ||
-                 w->shared_data->bingo_pool != NULL ||
-                 w->shared_data->play_pool != NULL ||
-                 w->shared_data->rare_rack_cells != NULL) {
-        inject_target_turn_rack_by_category(w, gr, gr->seed ^ branch_id);
-      }
+        board_get_tiles_played(game_get_board(gr->game)) == 0 &&
+        (w->shared_data->pass_pool != NULL ||
+         w->shared_data->exch_pool != NULL ||
+         w->shared_data->bingo_pool != NULL ||
+         w->shared_data->play_pool != NULL ||
+         w->shared_data->rare_rack_cells != NULL ||
+         w->shared_data->play_index != NULL)) {
+      // 5-way category sampler at TARGET turn. Slot 3 (rare) uses
+      // play_index when loaded (deficit-targeted), else rare_rack_cells.
+      // When only play_index is set, all 4 other slots fall through to
+      // the natural rack (since their pool fields are NULL) — equivalent
+      // to 100% play_index injection.
+      inject_target_turn_rack_by_category(w, gr, gr->seed ^ branch_id);
     }
     const int n_actions = eb_enumerate_actions(w, gr);
     if (n_actions == 0) {
