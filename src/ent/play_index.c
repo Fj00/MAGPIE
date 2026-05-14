@@ -29,14 +29,16 @@ typedef struct __attribute__((packed)) {
   float    rarity;
 } CellMeta;
 
-// Per-play header in plays.bin (12 bytes; <I B h B H H).
+// Per-play header in plays.bin (12 bytes; <I B h B H B B).
+// Fields packed, cell_ids and action_repr/leave_str follow.
 typedef struct __attribute__((packed)) {
   uint32_t rack_id;
   uint8_t  action_kind;
   int16_t  score;
   uint8_t  ar_len;
   uint16_t n_cells;
-  uint16_t _pad;
+  uint8_t  leave_len;
+  uint8_t  _pad;
 } PlayHeader;
 
 #define RACK_BYTES 8
@@ -81,6 +83,11 @@ struct PlayIndex {
   // from force_table, e.g. when the index was built against a
   // different force_targets layout).
   ForceTarget **cell_to_target;
+
+  // Per-cell supply weight = 1 / (cell_play_off[c+1] - cell_play_off[c]).
+  // Used for rarity-weighted scoring: rare-supply cells dominate.
+  // Computed once at load.
+  float *inv_supply;
 };
 
 // ---------- Helpers ----------
@@ -215,6 +222,14 @@ PlayIndex *play_index_create(const char *dir_path, ForceTable *force_table,
           "play_index: resolved %u/%u cells against force_table\n",
           resolved, idx->num_cells);
 
+  // Compute inv_supply per cell for rarity-weighted scoring.
+  idx->inv_supply = (float *)malloc(sizeof(float) * idx->num_cells);
+  if (!idx->inv_supply) { play_index_destroy(idx); return NULL; }
+  for (uint32_t c = 0; c < idx->num_cells; c++) {
+    uint64_t supply = idx->cell_play_off[c + 1] - idx->cell_play_off[c];
+    idx->inv_supply[c] = (supply > 0) ? (1.0f / (float)supply) : 0.0f;
+  }
+
   return idx;
 }
 
@@ -230,6 +245,7 @@ void play_index_destroy(PlayIndex *idx) {
   if (idx->cell_play_off)
     munmap((void *)idx->cell_play_off, idx->cell_idx_len);
   free(idx->cell_to_target);
+  free(idx->inv_supply);
   free(idx);
 }
 
@@ -257,22 +273,26 @@ bool play_index_get_play(const PlayIndex *idx, uint32_t play_id,
   out->score = hdr.score;
   out->ar_len = hdr.ar_len;
   out->n_cells = hdr.n_cells;
+  out->leave_len = hdr.leave_len;
   out->action_repr = (const char *)(p + sizeof(PlayHeader));
-  out->cell_ids = (const uint32_t *)(p + sizeof(PlayHeader) + hdr.ar_len);
+  out->leave_str = (const char *)(p + sizeof(PlayHeader) + hdr.ar_len);
+  out->cell_ids = (const uint32_t *)(p + sizeof(PlayHeader) + hdr.ar_len +
+                                     hdr.leave_len);
   return true;
 }
 
-// Score a play_id by Σ atomic_load(deficit) over its cell_ids. Returns 0
-// for plays that cover no still-active cells.
-static int64_t score_play(const PlayIndex *idx, uint32_t play_id) {
+// Score a play_id by Σ (deficit / supply) over its cell_ids — rarity
+// weighted. Returns 0.0 for plays covering only drained cells.
+static double score_play(const PlayIndex *idx, uint32_t play_id) {
   PlayRecord pr;
-  if (!play_index_get_play(idx, play_id, &pr)) return 0;
-  int64_t score = 0;
+  if (!play_index_get_play(idx, play_id, &pr)) return 0.0;
+  double score = 0.0;
   for (uint16_t i = 0; i < pr.n_cells; i++) {
-    ForceTarget *t = idx->cell_to_target[pr.cell_ids[i]];
+    uint32_t cid = pr.cell_ids[i];
+    ForceTarget *t = idx->cell_to_target[cid];
     if (!t) continue;
     int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
-    if (d > 0) score += d;
+    if (d > 0) score += (double)d * (double)idx->inv_supply[cid];
   }
   return score;
 }
@@ -280,35 +300,33 @@ static int64_t score_play(const PlayIndex *idx, uint32_t play_id) {
 // ---------- Min-heap of (deficit, cell_id) ----------
 
 typedef struct {
-  int64_t  deficit;
+  double   weight;   // deficit / supply
   uint32_t cell_id;
 } CellEntry;
 
 static void heap_push_or_replace(CellEntry *heap, int *size, int cap,
-                                  int64_t deficit, uint32_t cell_id) {
+                                  double weight, uint32_t cell_id) {
   if (*size < cap) {
     int i = (*size)++;
-    heap[i].deficit = deficit;
+    heap[i].weight = weight;
     heap[i].cell_id = cell_id;
-    // Sift up (min-heap by deficit)
     while (i > 0) {
       int parent = (i - 1) / 2;
-      if (heap[parent].deficit > heap[i].deficit) {
+      if (heap[parent].weight > heap[i].weight) {
         CellEntry tmp = heap[parent];
         heap[parent] = heap[i];
         heap[i] = tmp;
         i = parent;
       } else break;
     }
-  } else if (heap[0].deficit < deficit) {
-    heap[0].deficit = deficit;
+  } else if (heap[0].weight < weight) {
+    heap[0].weight = weight;
     heap[0].cell_id = cell_id;
-    // Sift down
     int i = 0;
     while (1) {
       int l = 2 * i + 1, r = 2 * i + 2, smallest = i;
-      if (l < cap && heap[l].deficit < heap[smallest].deficit) smallest = l;
-      if (r < cap && heap[r].deficit < heap[smallest].deficit) smallest = r;
+      if (l < cap && heap[l].weight < heap[smallest].weight) smallest = l;
+      if (r < cap && heap[r].weight < heap[smallest].weight) smallest = r;
       if (smallest != i) {
         CellEntry tmp = heap[smallest];
         heap[smallest] = heap[i];
@@ -322,8 +340,9 @@ static void heap_push_or_replace(CellEntry *heap, int *size, int cap,
 // ---------- Samplers ----------
 
 const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
-                                                  uint64_t seed) {
-  // 1) Find top-K cells by deficit.
+                                                  uint64_t seed,
+                                                  uint32_t *out_rack_id) {
+  // 1) Find top-K cells by rarity-weighted deficit (deficit * inv_supply).
   CellEntry heap[TOP_CELL_HEAP_K];
   int heap_size = 0;
   for (uint32_t cid = 0; cid < idx->num_cells; cid++) {
@@ -331,7 +350,8 @@ const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
     if (!t) continue;
     int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
     if (d <= 0) continue;
-    heap_push_or_replace(heap, &heap_size, TOP_CELL_HEAP_K, d, cid);
+    double w = (double)d * (double)idx->inv_supply[cid];
+    heap_push_or_replace(heap, &heap_size, TOP_CELL_HEAP_K, w, cid);
   }
   if (heap_size == 0) return NULL;
 
@@ -347,7 +367,7 @@ const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
     was; \
   })
 
-  int64_t best_score = 0;
+  double best_score = 0.0;
   uint32_t best_play = 0;
   bool have_best = false;
   uint64_t s = seed ^ 0xa1b2c3d4e5f60708ULL;
@@ -360,7 +380,6 @@ const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
     uint64_t scan = count;
     uint64_t start = 0;
     if (scan > MAX_PLAYS_PER_CELL_SCAN) {
-      // Sample a window of MAX_PLAYS_PER_CELL_SCAN starting at random.
       s = s * 0x9e3779b97f4a7c15ULL + 0x123456789abcdef0ULL;
       start = s % (count - MAX_PLAYS_PER_CELL_SCAN);
       scan = MAX_PLAYS_PER_CELL_SCAN;
@@ -368,7 +387,7 @@ const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
     for (uint64_t i = 0; i < scan; i++) {
       uint32_t pid = idx->plays_by_cell[off_lo + start + i];
       if (VISIT_MARK(pid)) continue;
-      int64_t sc = score_play(idx, pid);
+      double sc = score_play(idx, pid);
       if (sc > best_score ||
           (sc == best_score && have_best && (s ^ pid) & 1)) {
         best_score = sc;
@@ -378,32 +397,31 @@ const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
     }
   }
 
-  if (!have_best || best_score <= 0) return NULL;
+  if (!have_best || best_score <= 0.0) return NULL;
   PlayRecord pr;
   if (!play_index_get_play(idx, best_play, &pr)) return NULL;
+  if (out_rack_id) *out_rack_id = pr.rack_id;
   return idx->racks + (size_t)pr.rack_id * RACK_BYTES;
 }
 
-// Pick top-N play_ids for the given rack_id by deficit-coverage score.
-// Insertion-sort into a fixed-size descending list.
+// Pick top-N play_ids for the given rack_id by rarity-weighted score
+// >= threshold. Insertion-sort into a fixed-size descending list.
 int play_index_pick_targeted_plays(const PlayIndex *idx,
-                                   uint32_t rack_id, int max_n,
-                                   uint32_t *out_play_ids) {
+                                   uint32_t rack_id, double threshold,
+                                   int max_n, uint32_t *out_play_ids) {
   if (rack_id >= idx->num_racks || max_n <= 0) return 0;
   uint64_t lo = idx->rack_first_play[rack_id];
   uint64_t hi = idx->rack_first_play[rack_id + 1];
 
-  int64_t best_scores[max_n];
+  double best_scores[max_n];
   uint32_t best_pids[max_n];
   int n = 0;
   for (uint64_t pid = lo; pid < hi; pid++) {
-    int64_t sc = score_play(idx, (uint32_t)pid);
-    if (sc <= 0) continue;
-    // Insertion sort into best_scores[]
+    double sc = score_play(idx, (uint32_t)pid);
+    if (sc < threshold) continue;
     int pos = n;
     while (pos > 0 && best_scores[pos - 1] < sc) pos--;
     if (pos < max_n) {
-      // Shift
       int last = (n < max_n) ? n : max_n - 1;
       for (int j = last; j > pos; j--) {
         best_scores[j] = best_scores[j - 1];

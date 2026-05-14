@@ -41,17 +41,20 @@ int play_index_num_plays(const PlayIndex *idx);
 int play_index_num_cells(const PlayIndex *idx);
 
 // Pick a rack via top-K cell-driven scoring. Returns NULL if no cell
-// has any remaining deficit (force-table exhausted) or no covered
-// play exists.
+// has any remaining deficit or no covered play exists. When non-NULL,
+// also writes the picked rack's rack_id to *out_rack_id so the caller
+// can pass it to play_index_pick_targeted_plays in the same call site.
 const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
-                                                  uint64_t seed);
+                                                  uint64_t seed,
+                                                  uint32_t *out_rack_id);
 
 // Pick up to `max_n` distinct play_ids for the given rack_id, ranked
-// by deficit-coverage. Writes play_ids into `out`. Returns the number
-// written (<= max_n). Plays with score-coverage of zero are skipped.
+// by deficit-coverage rarity (Σ deficit[c] / supply[c]). Only plays
+// scoring above `threshold` are included. Writes play_ids into `out`.
+// Returns the number written (<= max_n).
 int play_index_pick_targeted_plays(const PlayIndex *idx,
-                                   uint32_t rack_id, int max_n,
-                                   uint32_t *out_play_ids);
+                                   uint32_t rack_id, double threshold,
+                                   int max_n, uint32_t *out_play_ids);
 
 // Resolve a rack string to its rack_id (linear scan; for the rare case
 // of needing the rack_id from outside the sample path).
@@ -66,7 +69,9 @@ typedef struct {
   int16_t  score;
   uint8_t  ar_len;
   uint16_t n_cells;
+  uint8_t  leave_len;
   const char *action_repr;
+  const char *leave_str;       // ≤ 7 chars, not NUL-terminated
   const uint32_t *cell_ids;
 } PlayRecord;
 
