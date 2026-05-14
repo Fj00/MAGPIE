@@ -23,6 +23,7 @@
 #include "../ent/empty_board_strata.h"
 #include "../ent/opening_pass.h"
 #include "../ent/pass_cycle.h"
+#include "../ent/play_index.h"
 #include "../ent/rare_pool.h"
 #include "../ent/inference_args.h"
 #include "../ent/inference_results.h"
@@ -143,6 +144,11 @@ typedef struct AutoplaySharedData {
   PassCycleTable *bingo_pool;
   PassCycleTable *play_pool;
   RarePool *rare_rack_cells;
+  // T6 cell-driven (rack, play) index. When set via MAGPIE_PLAY_INDEX_DIR
+  // the deficit-aware rack sampler in play_index.c replaces the 5-pool
+  // category sampler at the recording turn. The 5 pool fields above are
+  // ignored when play_index is loaded.
+  PlayIndex *play_index;
   // 0 = P1 receives the T6 inject (recording), 1 = P2. Set by
   // MAGPIE_EB_RARE_TARGET=p1|p2. Default p2 (T6 is P2's turn in the
   // canonical EB cycle).
@@ -621,6 +627,7 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   shared_data->exch_pool = NULL;
   shared_data->bingo_pool = NULL;
   shared_data->play_pool = NULL;
+  shared_data->play_index = NULL;
   shared_data->rare_rack_cells = NULL;
   // Parse target turn first; rare_target_player is derived from its parity.
   shared_data->eb_target_turn = 6;
@@ -711,6 +718,15 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
       shared_data->rare_rack_cells = rare_pool_create(
           bag_rare_pool, shared_data->force_table, shared_data->ld);
     }
+  }
+  // Cell-driven (rack, play) index. When set, supersedes the 5-pool
+  // sampler at the recording turn (rack picked via deficit-aware
+  // top-K cell scan; existing fanout consumes the chosen rack as
+  // before).
+  const char *play_index_dir = getenv("MAGPIE_PLAY_INDEX_DIR");
+  if (play_index_dir && play_index_dir[0] != '\0' && shared_data->force_table) {
+    shared_data->play_index = play_index_create(
+        play_index_dir, shared_data->force_table, shared_data->ld);
   }
   if (shared_data->pass_pool || shared_data->exch_pool ||
       shared_data->bingo_pool || shared_data->play_pool ||
@@ -817,6 +833,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   pass_cycle_table_destroy(shared_data->bingo_pool);
   pass_cycle_table_destroy(shared_data->play_pool);
   rare_pool_destroy(shared_data->rare_rack_cells);
+  play_index_destroy(shared_data->play_index);
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
   free(shared_data);
@@ -3056,13 +3073,34 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     // rare_target_player.
     if (gr->eb_active &&
         gr->eb_n_snaps == w->shared_data->eb_target_turn - 1 &&
-        board_get_tiles_played(game_get_board(gr->game)) == 0 &&
-        (w->shared_data->pass_pool != NULL ||
-         w->shared_data->exch_pool != NULL ||
-         w->shared_data->bingo_pool != NULL ||
-         w->shared_data->play_pool != NULL ||
-         w->shared_data->rare_rack_cells != NULL)) {
-      inject_target_turn_rack_by_category(w, gr, gr->seed ^ branch_id);
+        board_get_tiles_played(game_get_board(gr->game)) == 0) {
+      // Cell-driven path (preferred): pick rack via play_index
+      // deficit-aware top-K cell sampler. Falls back to the legacy
+      // 5-pool sampler when play_index isn't loaded.
+      if (w->shared_data->play_index != NULL) {
+        const int p = game_get_player_on_turn_index(gr->game);
+        if (p == w->shared_data->rare_target_player) {
+          const char *rack_str = play_index_sample_rack_deficit_aware(
+              w->shared_data->play_index, gr->seed ^ branch_id);
+          if (rack_str) {
+            // rack_str is from the mmap'd 8-byte arena; copy into a
+            // local NUL-terminated buffer for the bag-draw call.
+            char buf[RACK_SIZE + 2] = {0};
+            int n = 0;
+            while (n < RACK_SIZE && rack_str[n] != '\0') {
+              buf[n] = rack_str[n];
+              n++;
+            }
+            swap_player_rack(gr->game, p, buf);
+          }
+        }
+      } else if (w->shared_data->pass_pool != NULL ||
+                 w->shared_data->exch_pool != NULL ||
+                 w->shared_data->bingo_pool != NULL ||
+                 w->shared_data->play_pool != NULL ||
+                 w->shared_data->rare_rack_cells != NULL) {
+        inject_target_turn_rack_by_category(w, gr, gr->seed ^ branch_id);
+      }
     }
     const int n_actions = eb_enumerate_actions(w, gr);
     if (n_actions == 0) {
