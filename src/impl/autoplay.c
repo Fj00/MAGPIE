@@ -3037,8 +3037,22 @@ static bool inject_target_turn_rack_for_category(
   } else if (cat == 3) {
     if (w->shared_data->play_index != NULL) {
       uint32_t rid = 0;
+      // Linear K growth: 64 at completion=0 → 1024 at completion=1.
+      // Bigger heap late in the run → broader candidate pool, drains
+      // long-tail stuck cells the top-64 would have starved.
+      int top_k = 64;
+      if (w->shared_data->force_table &&
+          w->shared_data->initial_total_deficit > 0) {
+        const int64_t cur =
+            force_table_total_remaining(w->shared_data->force_table);
+        double comp = 1.0 - ((double)cur /
+                             (double)w->shared_data->initial_total_deficit);
+        if (comp < 0.0) comp = 0.0;
+        if (comp > 1.0) comp = 1.0;
+        top_k = (int)(64.0 + (1024.0 - 64.0) * comp);
+      }
       target = play_index_sample_rack_deficit_aware(
-          w->shared_data->play_index, seed, &rid);
+          w->shared_data->play_index, seed, top_k, &rid);
       if (target) gr->eb_target_rack_id = (int64_t)rid;
     } else if (w->shared_data->rare_rack_cells != NULL) {
       const int idx = rare_pool_sample_deficit_aware(
@@ -3111,8 +3125,22 @@ static void inject_target_turn_rack_by_category(
   } else if (cat == 3) {
     if (w->shared_data->play_index != NULL) {
       uint32_t rid = 0;
+      // Linear K growth: 64 at completion=0 → 1024 at completion=1.
+      // Bigger heap late in the run → broader candidate pool, drains
+      // long-tail stuck cells the top-64 would have starved.
+      int top_k = 64;
+      if (w->shared_data->force_table &&
+          w->shared_data->initial_total_deficit > 0) {
+        const int64_t cur =
+            force_table_total_remaining(w->shared_data->force_table);
+        double comp = 1.0 - ((double)cur /
+                             (double)w->shared_data->initial_total_deficit);
+        if (comp < 0.0) comp = 0.0;
+        if (comp > 1.0) comp = 1.0;
+        top_k = (int)(64.0 + (1024.0 - 64.0) * comp);
+      }
       target = play_index_sample_rack_deficit_aware(
-          w->shared_data->play_index, seed, &rid);
+          w->shared_data->play_index, seed, top_k, &rid);
       if (target) gr->eb_target_rack_id = (int64_t)rid;
     } else if (w->shared_data->rare_rack_cells != NULL) {
       const int idx = rare_pool_sample_deficit_aware(

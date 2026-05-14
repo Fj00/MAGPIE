@@ -44,8 +44,12 @@ int play_index_num_cells(const PlayIndex *idx);
 // has any remaining deficit or no covered play exists. When non-NULL,
 // also writes the picked rack's rack_id to *out_rack_id so the caller
 // can pass it to play_index_pick_targeted_plays in the same call site.
+// `top_k` controls how many top-weighted cells seed the rack search;
+// higher values include more candidate cells (better tail coverage)
+// at higher per-pick cost. Clamped to [16, 4096] internally.
 const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
                                                   uint64_t seed,
+                                                  int top_k,
                                                   uint32_t *out_rack_id);
 
 // Pick up to `max_n` distinct play_ids for the given rack_id, ranked

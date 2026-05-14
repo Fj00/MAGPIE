@@ -44,7 +44,8 @@ typedef struct __attribute__((packed)) {
 #define RACK_BYTES 8
 
 // Sampler tunables.
-#define TOP_CELL_HEAP_K 64
+#define TOP_CELL_HEAP_K_MIN 16
+#define TOP_CELL_HEAP_K_MAX 4096
 #define MAX_PLAYS_PER_CELL_SCAN 2000
 
 struct PlayIndex {
@@ -341,9 +342,12 @@ static void heap_push_or_replace(CellEntry *heap, int *size, int cap,
 
 const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
                                                   uint64_t seed,
+                                                  int top_k,
                                                   uint32_t *out_rack_id) {
+  if (top_k < TOP_CELL_HEAP_K_MIN) top_k = TOP_CELL_HEAP_K_MIN;
+  if (top_k > TOP_CELL_HEAP_K_MAX) top_k = TOP_CELL_HEAP_K_MAX;
   // 1) Find top-K cells by rarity-weighted deficit (deficit * inv_supply).
-  CellEntry heap[TOP_CELL_HEAP_K];
+  CellEntry heap[TOP_CELL_HEAP_K_MAX];
   int heap_size = 0;
   for (uint32_t cid = 0; cid < idx->num_cells; cid++) {
     ForceTarget *t = idx->cell_to_target[cid];
@@ -351,7 +355,7 @@ const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
     int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
     if (d <= 0) continue;
     double w = (double)d * (double)idx->inv_supply[cid];
-    heap_push_or_replace(heap, &heap_size, TOP_CELL_HEAP_K, w, cid);
+    heap_push_or_replace(heap, &heap_size, top_k, w, cid);
   }
   if (heap_size == 0) return NULL;
 
