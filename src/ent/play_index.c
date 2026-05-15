@@ -450,16 +450,17 @@ int play_index_pick_targeted_plays(const PlayIndex *idx,
 // Phase 3 outcome-aware play scoring. For each cell c the play covers:
 //   util[c] = inv_supply[c] * (deficit[c] + lambda * align[c])
 //   align[c] = (need_W[c] * P(W) + need_L[c] * P(L)) / target_per_side
+// where target_per_side = t->stratum_per_side (per-cell W and L target).
 // Bucket miss → align = 0 (graceful fall-through to deficit-only).
+// Non-STRATUM cells (stratum_per_side == 0) skip the align term.
 static double score_play_outcome(const PlayIndex *idx,
                                   const OutcomePriors *op,
-                                  double lambda, int target_per_side,
-                                  uint32_t play_id) {
+                                  double lambda, uint32_t play_id) {
   PlayRecord pr;
   if (!play_index_get_play(idx, play_id, &pr)) return 0.0;
   float p_w = 0.0f, p_l = 0.0f, p_t = 0.0f;
   bool have_prior = false;
-  if (op && lambda > 0.0 && target_per_side > 0) {
+  if (op && lambda > 0.0) {
     OptionFKey k;
     if (outcome_priors_compute_key(&pr, &k)) {
       have_prior = outcome_priors_lookup(op, &k, &p_w, &p_l, &p_t);
@@ -473,15 +474,13 @@ static double score_play_outcome(const PlayIndex *idx,
     int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
     if (d <= 0) continue;
     double base = (double)d;
-    if (have_prior) {
+    if (have_prior && t->stratum_per_side > 0) {
       uint32_t obs_w = 0, obs_l = 0;
       force_table_get_stratum_wl_by_ptr(idx->force_table, t, &obs_w, &obs_l);
-      double need_w = (double)target_per_side - (double)obs_w;
-      if (need_w < 0.0) need_w = 0.0;
-      double need_l = (double)target_per_side - (double)obs_l;
-      if (need_l < 0.0) need_l = 0.0;
-      double align = (need_w * (double)p_w + need_l * (double)p_l) /
-                     (double)target_per_side;
+      double tps = (double)t->stratum_per_side;
+      double need_w = tps - (double)obs_w; if (need_w < 0.0) need_w = 0.0;
+      double need_l = tps - (double)obs_l; if (need_l < 0.0) need_l = 0.0;
+      double align = (need_w * (double)p_w + need_l * (double)p_l) / tps;
       base += lambda * align;
     }
     score += base * (double)idx->inv_supply[cid];
@@ -492,13 +491,12 @@ static double score_play_outcome(const PlayIndex *idx,
 const char *play_index_sample_rack_outcome_aware(const PlayIndex *idx,
                                                   const OutcomePriors *op,
                                                   double lambda,
-                                                  int target_per_side,
                                                   uint64_t seed,
                                                   int top_k,
                                                   uint32_t *out_rack_id) {
   // When priors are absent or lambda = 0, fall through to existing
   // deficit-only sampler (bit-for-bit compatible with prior behavior).
-  if (!op || lambda <= 0.0 || target_per_side <= 0) {
+  if (!op || lambda <= 0.0) {
     return play_index_sample_rack_deficit_aware(idx, seed, top_k,
                                                  out_rack_id);
   }
@@ -546,7 +544,7 @@ const char *play_index_sample_rack_outcome_aware(const PlayIndex *idx,
     for (uint64_t i = 0; i < scan; i++) {
       uint32_t pid = idx->plays_by_cell[off_lo + start + i];
       if (OA_VISIT_MARK(pid)) continue;
-      double sc = score_play_outcome(idx, op, lambda, target_per_side, pid);
+      double sc = score_play_outcome(idx, op, lambda, pid);
       if (sc > best_score ||
           (sc == best_score && have_best && (s ^ pid) & 1)) {
         best_score = sc;

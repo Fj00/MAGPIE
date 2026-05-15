@@ -23,6 +23,7 @@
 #include "../ent/empty_board_strata.h"
 #include "../ent/opening_pass.h"
 #include "../ent/pass_cycle.h"
+#include "../ent/outcome_priors.h"
 #include "../ent/play_index.h"
 #include "../ent/rare_pool.h"
 #include "../ent/t6_baseline.h"
@@ -150,6 +151,12 @@ typedef struct AutoplaySharedData {
   // category sampler at the recording turn. The 5 pool fields above are
   // ignored when play_index is loaded.
   PlayIndex *play_index;
+  // Phase 3: outcome-aware sampler. When MAGPIE_OUTCOME_PRIORS_PATH is
+  // set, play_index_sample_rack_outcome_aware blends per-bucket P(W/L)
+  // priors with deficit coverage. lambda controls the blend weight
+  // (0 = pure deficit, default 1.0).
+  OutcomePriors *outcome_priors;
+  double outcome_priors_lambda;
 
   // Phase 0 capture: when MAGPIE_PRE_T6_CAPTURE=path is set, write one
   // CSV row per game at T6 entry: P1's rack + bag tiles. Used to build
@@ -743,6 +750,26 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
         play_index_dir, shared_data->force_table, shared_data->ld);
   }
 
+  // Phase 3: outcome-aware sampler priors. Loaded only when both the
+  // priors path is set AND play_index is loaded (priors only have effect
+  // through the play_index outcome-aware sampler).
+  shared_data->outcome_priors = NULL;
+  shared_data->outcome_priors_lambda = 1.0;
+  const char *priors_path = getenv("MAGPIE_OUTCOME_PRIORS_PATH");
+  if (priors_path && priors_path[0] != '\0' && shared_data->play_index) {
+    shared_data->outcome_priors = outcome_priors_load(priors_path);
+  }
+  const char *priors_lambda_env = getenv("MAGPIE_EB_PRIOR_LAMBDA");
+  if (priors_lambda_env && priors_lambda_env[0] != '\0') {
+    shared_data->outcome_priors_lambda = atof(priors_lambda_env);
+  }
+  if (shared_data->outcome_priors) {
+    fprintf(stderr,
+            "outcome_priors: %d buckets loaded, lambda=%.3f\n",
+            outcome_priors_num_buckets(shared_data->outcome_priors),
+            shared_data->outcome_priors_lambda);
+  }
+
   // Phase 2 baseline: task-driven T6-from-scratch mode.
   shared_data->t6_baseline = NULL;
   const char *t6_task = getenv("MAGPIE_T6_BASELINE_TASK_FILE");
@@ -882,6 +909,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   pass_cycle_table_destroy(shared_data->play_pool);
   rare_pool_destroy(shared_data->rare_rack_cells);
   play_index_destroy(shared_data->play_index);
+  outcome_priors_destroy(shared_data->outcome_priors);
   if (shared_data->pre_t6_capture_file) {
     fclose(shared_data->pre_t6_capture_file);
   }
@@ -3121,8 +3149,16 @@ static bool inject_target_turn_rack_for_category(
         if (comp > 1.0) comp = 1.0;
         top_k = (int)(64.0 + (1024.0 - 64.0) * comp);
       }
-      target = play_index_sample_rack_deficit_aware(
-          w->shared_data->play_index, seed, top_k, &rid);
+      if (w->shared_data->outcome_priors != NULL) {
+        target = play_index_sample_rack_outcome_aware(
+            w->shared_data->play_index,
+            w->shared_data->outcome_priors,
+            w->shared_data->outcome_priors_lambda,
+            seed, top_k, &rid);
+      } else {
+        target = play_index_sample_rack_deficit_aware(
+            w->shared_data->play_index, seed, top_k, &rid);
+      }
       if (target) gr->eb_target_rack_id = (int64_t)rid;
     } else if (w->shared_data->rare_rack_cells != NULL) {
       const int idx = rare_pool_sample_deficit_aware(
@@ -3209,8 +3245,16 @@ static void inject_target_turn_rack_by_category(
         if (comp > 1.0) comp = 1.0;
         top_k = (int)(64.0 + (1024.0 - 64.0) * comp);
       }
-      target = play_index_sample_rack_deficit_aware(
-          w->shared_data->play_index, seed, top_k, &rid);
+      if (w->shared_data->outcome_priors != NULL) {
+        target = play_index_sample_rack_outcome_aware(
+            w->shared_data->play_index,
+            w->shared_data->outcome_priors,
+            w->shared_data->outcome_priors_lambda,
+            seed, top_k, &rid);
+      } else {
+        target = play_index_sample_rack_deficit_aware(
+            w->shared_data->play_index, seed, top_k, &rid);
+      }
       if (target) gr->eb_target_rack_id = (int64_t)rid;
     } else if (w->shared_data->rare_rack_cells != NULL) {
       const int idx = rare_pool_sample_deficit_aware(

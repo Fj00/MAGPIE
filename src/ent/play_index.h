@@ -58,14 +58,14 @@ const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
 // at each covered cell:
 //   util(play) = Σ inv_supply[c] * (deficit[c] + lambda * align[c])
 // where align[c] = (need_W[c] * P(W) + need_L[c] * P(L)) / target_per_side
-// and need_W/L = max(0, target_per_side - obs_w/l[c]).
+// and target_per_side = ForceTarget.stratum_per_side (per-cell W and L
+// target), need_W/L = max(0, target_per_side - obs_w/l[c]).
 // `op` may be NULL (falls through to deficit-only), in which case
 // behavior is identical to play_index_sample_rack_deficit_aware.
 typedef struct OutcomePriors OutcomePriors;
 const char *play_index_sample_rack_outcome_aware(const PlayIndex *idx,
                                                   const OutcomePriors *op,
                                                   double lambda,
-                                                  int target_per_side,
                                                   uint64_t seed,
                                                   int top_k,
                                                   uint32_t *out_rack_id);
