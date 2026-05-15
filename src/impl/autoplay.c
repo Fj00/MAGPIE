@@ -25,6 +25,7 @@
 #include "../ent/pass_cycle.h"
 #include "../ent/play_index.h"
 #include "../ent/rare_pool.h"
+#include "../ent/t6_baseline.h"
 #include "../ent/inference_args.h"
 #include "../ent/inference_results.h"
 #include "../ent/klv.h"
@@ -155,6 +156,13 @@ typedef struct AutoplaySharedData {
   // the pre_t6_pool.csv distribution for skip-pre-T6 game setup.
   FILE *pre_t6_capture_file;
   cpthread_mutex_t pre_t6_capture_mutex;
+
+  // Phase 2: when MAGPIE_T6_BASELINE_TASK_FILE and
+  // MAGPIE_T6_BASELINE_OUT_FILE are both set, the worker loop
+  // switches to baseline-mode: pulls (target_rack, opp_rack,
+  // action_repr, n_games) tasks from the task file, runs each as a
+  // T6-from-scratch batch, writes aggregated outcomes to out file.
+  T6BaselineState *t6_baseline;
   // 0 = P1 receives the T6 inject (recording), 1 = P2. Set by
   // MAGPIE_EB_RARE_TARGET=p1|p2. Default p2 (T6 is P2's turn in the
   // canonical EB cycle).
@@ -735,6 +743,18 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
         play_index_dir, shared_data->force_table, shared_data->ld);
   }
 
+  // Phase 2 baseline: task-driven T6-from-scratch mode.
+  shared_data->t6_baseline = NULL;
+  const char *t6_task = getenv("MAGPIE_T6_BASELINE_TASK_FILE");
+  const char *t6_out = getenv("MAGPIE_T6_BASELINE_OUT_FILE");
+  if (t6_task && t6_task[0] && t6_out && t6_out[0]) {
+    shared_data->t6_baseline = t6_baseline_state_create(t6_task, t6_out);
+    if (shared_data->t6_baseline) {
+      fprintf(stderr,
+              "t6_baseline: tasks=%s out=%s\n", t6_task, t6_out);
+    }
+  }
+
   // Phase 0 capture: pre-T6 P1 rack + bag snapshot file.
   shared_data->pre_t6_capture_file = NULL;
   cpthread_mutex_init(&shared_data->pre_t6_capture_mutex);
@@ -860,6 +880,9 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   play_index_destroy(shared_data->play_index);
   if (shared_data->pre_t6_capture_file) {
     fclose(shared_data->pre_t6_capture_file);
+  }
+  if (shared_data->t6_baseline) {
+    t6_baseline_state_destroy(shared_data->t6_baseline);
   }
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
