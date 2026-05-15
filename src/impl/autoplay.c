@@ -3216,7 +3216,9 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     // rare_target_player.
     // Phase 0 capture: P1's rack and bag at T6 entry, before any rack
     // injection. Once-per-game (only fires when on-turn matches the
-    // recording player so each game emits exactly one row).
+    // recording player so each game emits exactly one row). After
+    // capture we mark the game over so we don't waste cycles playing
+    // out post-T6 (Phase 0 only needs the snapshot).
     if (gr->eb_active &&
         gr->eb_n_snaps == w->shared_data->eb_target_turn - 1 &&
         board_get_tiles_played(game_get_board(gr->game)) == 0 &&
@@ -3232,6 +3234,9 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
       fprintf(w->shared_data->pre_t6_capture_file, "%s,%s\n",
               p1_rack_buf, bag_buf);
       cpthread_mutex_unlock(&w->shared_data->pre_t6_capture_mutex);
+      // End the game immediately — Phase 0 doesn't need the playout.
+      game_set_game_end_reason(gr->game, GAME_END_REASON_STANDARD);
+      return;
     }
 
     if (gr->eb_active &&
