@@ -3698,12 +3698,97 @@ void init_sim_args_for_player(AutoplayWorker *autoplay_worker,
   sim_args->inference_results = autoplay_worker->inference_results;
 }
 
+// Phase 2 baseline worker loop. Runs T6-from-scratch task batches:
+// for each task, set both racks, force the target's first move, play
+// out the rest with HastyBot, accumulate per-batch (W, L, T) outcome.
+// One result row per task.
+//
+// Naming convention: in the offline/baseline frame, "target" = offline
+// player 0 = the rack we're characterizing (= live P2 at T6).
+// "opp" = offline player 1 = the opponent rack from pre_t6_pool (=
+// live P1 at T6).
+static void t6_baseline_run_worker(AutoplayWorker *worker, GameRunner *gr) {
+  T6BaselineState *state = worker->shared_data->t6_baseline;
+  ThreadControl *thread_control = worker->args.thread_control;
+  T6BaselineTask task;
+  while (
+      thread_control_get_status(thread_control) !=
+          THREAD_CONTROL_STATUS_USER_INTERRUPT &&
+      t6_baseline_get_next_task(state, &task)) {
+    int n_W = 0, n_L = 0, n_T = 0;
+    int64_t target_score_sum = 0, opp_score_sum = 0;
+    for (int g = 0; g < task.n_games; g++) {
+      // Reset to fresh game state.
+      game_reset(gr->game);
+      gr->eb_active = false;  // disable EB recorder/branching
+      gr->pass_cycle_active = false;
+      gr->eb_forced_move = NULL;
+      // After game_reset player_on_turn_index = 0. Set both racks.
+      // swap_player_rack expects on-turn player: temporarily set turn
+      // to each player to swap racks.
+      // Player 0 (target/live-P2) — already on turn after reset.
+      if (!swap_player_rack(gr->game, 0, task.target_rack)) {
+        continue;  // unable to draw target rack from full bag (impossible
+                   // with valid input); skip this game
+      }
+      // Player 1 (opp/live-P1).
+      if (!swap_player_rack(gr->game, 1, task.opp_rack)) {
+        continue;
+      }
+      // Parse the action_repr into a Move via validated_moves_create.
+      // Player 0 is on-turn at offline T1.
+      ErrorStack *es = error_stack_create();
+      ValidatedMoves *vms = validated_moves_create(
+          gr->game, 0, task.action_repr, true, true, es);
+      if (!error_stack_is_empty(es) ||
+          validated_moves_get_number_of_moves(vms) == 0) {
+        validated_moves_destroy(vms);
+        error_stack_destroy(es);
+        continue;
+      }
+      const Move *forced = validated_moves_get_move(vms, 0);
+      // game_runner_play_move's eb_forced_move path copies the move
+      // into a per-worker spare slot, so it's safe to point to vms's
+      // internal move and destroy vms after the play_move call.
+      gr->eb_forced_move = (Move *)forced;
+      game_runner_play_move(worker, gr);
+      gr->eb_forced_move = NULL;
+      validated_moves_destroy(vms);
+      error_stack_destroy(es);
+      // Continue with natural HastyBot for the rest of the game.
+      while (!game_runner_is_game_over(gr)) {
+        game_runner_play_move(worker, gr);
+      }
+      const int s0 = equity_to_int(
+          player_get_score(game_get_player(gr->game, 0)));
+      const int s1 = equity_to_int(
+          player_get_score(game_get_player(gr->game, 1)));
+      target_score_sum += s0;
+      opp_score_sum += s1;
+      if (s0 > s1) n_W++;
+      else if (s0 < s1) n_L++;
+      else n_T++;
+    }
+    t6_baseline_record_result(state, &task, n_W, n_L, n_T,
+                              target_score_sum, opp_score_sum);
+  }
+}
+
 void *autoplay_worker(void *uncasted_autoplay_worker) {
   AutoplayWorker *autoplay_worker = (AutoplayWorker *)uncasted_autoplay_worker;
   const AutoplayArgs *args = &autoplay_worker->args;
   GameRunner *game_runner1 = game_runner_create(autoplay_worker);
   init_sim_args_for_player(autoplay_worker, 0);
   init_sim_args_for_player(autoplay_worker, 1);
+
+  // Phase 2 baseline mode: run task-driven loop instead of normal
+  // autoplay. Returns when task file exhausted.
+  if (autoplay_worker->shared_data->t6_baseline != NULL) {
+    t6_baseline_run_worker(autoplay_worker, game_runner1);
+    game_runner_destroy(game_runner1);
+    return NULL;
+  }
+
   GameRunner *game_runner2 = NULL;
   switch (args->type) {
   case AUTOPLAY_TYPE_DEFAULT:
