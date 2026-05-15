@@ -3731,15 +3731,39 @@ static void t6_baseline_run_worker(AutoplayWorker *worker, GameRunner *gr) {
     int task_score = 0;
     bool meta_captured = false;
     for (int g = 0; g < task.n_games; g++) {
-      game_seed += 0x9e3779b97f4a7c15ULL;
-      const char *opp_rack = t6_baseline_sample_opp(state, game_seed);
-      if (!opp_rack) continue;
       game_reset(gr->game);
-      gr->eb_active = false;
+      // Reset GameRunner fields normally cleared by game_runner_start (we
+      // bypass that path). Without these, turn_number / pass_cycle_* /
+      // eb_* state from a previous task can poison this game.
+      gr->turn_number = 0;
+      gr->force_draw = false;
+      gr->force_triggered = false;
+      gr->pending_force_target = NULL;
+      gr->pending_force_diff = 0;
+      gr->pending_force_player_index = 0;
       gr->pass_cycle_active = false;
+      gr->pass_cycle_abandoned = false;
+      gr->pass_cycle_n_moves = 0;
+      gr->eb_active = false;
       gr->eb_forced_move = NULL;
+      gr->eb_n_snaps = 0;
+      gr->eb_actions_p0[0] = '\0';
+      gr->eb_actions_p0_off = 0;
+      gr->eb_actions_p1[0] = '\0';
+      gr->eb_actions_p1_off = 0;
       if (!swap_player_rack(gr->game, 0, task.target_rack)) continue;
-      if (!swap_player_rack(gr->game, 1, opp_rack)) continue;
+      // Retry opp_rack sampling: pool racks may share scarce tiles with
+      // the target (e.g. target with 2 Ys leaves none in the bag for opp).
+      // Resample until swap_player_rack succeeds; cap at 64 attempts to
+      // guard against pathological cases where almost no pool rack fits.
+      bool opp_set = false;
+      for (int retry = 0; retry < 64; retry++) {
+        game_seed += 0x9e3779b97f4a7c15ULL;
+        const char *opp_rack = t6_baseline_sample_opp(state, game_seed);
+        if (!opp_rack) break;
+        if (swap_player_rack(gr->game, 1, opp_rack)) { opp_set = true; break; }
+      }
+      if (!opp_set) continue;
       ErrorStack *es = error_stack_create();
       ValidatedMoves *vms = validated_moves_create(
           gr->game, 0, task.action_repr, true, true, es);
