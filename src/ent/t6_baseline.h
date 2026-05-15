@@ -58,6 +58,8 @@ bool t6_baseline_get_next_task(T6BaselineState *state, T6BaselineTask *out);
 
 void t6_baseline_record_result(T6BaselineState *state,
                                const T6BaselineTask *task,
+                               const char *leave_str, int blanks_used,
+                               int score,
                                int n_games_run, int n_W, int n_L, int n_T,
                                int64_t target_score_sum,
                                int64_t opp_score_sum);

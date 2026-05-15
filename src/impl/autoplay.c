@@ -3723,12 +3723,17 @@ static void t6_baseline_run_worker(AutoplayWorker *worker, GameRunner *gr) {
     int n_W = 0, n_L = 0, n_T = 0;
     int n_games_run = 0;
     int64_t target_score_sum = 0, opp_score_sum = 0;
+    // Per-task move metadata (leave, blanks_used, score) — derived
+    // from the first successful parse + play, then reused for the
+    // result record.
+    char leave_str[RACK_SIZE + 2] = {0};
+    int blanks_used = 0;
+    int task_score = 0;
+    bool meta_captured = false;
     for (int g = 0; g < task.n_games; g++) {
-      // Sample a fresh opp rack from the pool per-game.
       game_seed += 0x9e3779b97f4a7c15ULL;
       const char *opp_rack = t6_baseline_sample_opp(state, game_seed);
       if (!opp_rack) continue;
-      // Reset to fresh game state.
       game_reset(gr->game);
       gr->eb_active = false;
       gr->pass_cycle_active = false;
@@ -3745,6 +3750,28 @@ static void t6_baseline_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         continue;
       }
       const Move *forced = validated_moves_get_move(vms, 0);
+      // Capture per-task metadata once.
+      if (!meta_captured) {
+        const LetterDistribution *ld = game_get_ld(gr->game);
+        const uint16_t ld_size = ld_get_size(ld);
+        Rack tmp_leave;
+        rack_set_dist_size(&tmp_leave, ld_size);
+        rack_reset(&tmp_leave);
+        get_leave_for_move(forced, gr->game, &tmp_leave);
+        eb_render_leave(&tmp_leave, ld, leave_str, sizeof(leave_str));
+        // Count blanks played: tiles where get_is_blanked is true (=
+        // blank-as-letter), plus exact BLANK_MACHINE_LETTER tiles.
+        const int n_tiles = move_get_tiles_length(forced);
+        int b = 0;
+        for (int t = 0; t < n_tiles; t++) {
+          MachineLetter ml = move_get_tile(forced, t);
+          if (ml == PLAYED_THROUGH_MARKER) continue;
+          if (ml == BLANK_MACHINE_LETTER || get_is_blanked(ml)) b++;
+        }
+        blanks_used = b;
+        task_score = equity_to_int(move_get_score(forced));
+        meta_captured = true;
+      }
       gr->eb_forced_move = (Move *)forced;
       game_runner_play_move(worker, gr);
       gr->eb_forced_move = NULL;
@@ -3764,7 +3791,8 @@ static void t6_baseline_run_worker(AutoplayWorker *worker, GameRunner *gr) {
       else n_T++;
       n_games_run++;
     }
-    t6_baseline_record_result(state, &task, n_games_run, n_W, n_L, n_T,
+    t6_baseline_record_result(state, &task, leave_str, blanks_used,
+                              task_score, n_games_run, n_W, n_L, n_T,
                               target_score_sum, opp_score_sum);
   }
 }

@@ -87,7 +87,8 @@ T6BaselineState *t6_baseline_state_create(const char *task_path,
     return NULL;
   }
   fprintf(s->out_file,
-          "target_rack,action_repr,n_games_run,n_W,n_L,n_T,"
+          "target_rack,action_repr,leave,blanks_used,score,"
+          "n_games_run,n_W,n_L,n_T,"
           "target_score_sum,opp_score_sum\n");
   fflush(s->out_file);
   cpthread_mutex_init(&s->task_mutex);
@@ -183,13 +184,16 @@ const char *t6_baseline_sample_opp(const T6BaselineState *state,
 
 void t6_baseline_record_result(T6BaselineState *state,
                                const T6BaselineTask *task,
+                               const char *leave_str, int blanks_used,
+                               int score,
                                int n_games_run, int n_W, int n_L, int n_T,
                                int64_t target_score_sum,
                                int64_t opp_score_sum) {
   cpthread_mutex_lock(&state->out_mutex);
   fprintf(state->out_file,
-          "%s,%s,%d,%d,%d,%d,%lld,%lld\n",
+          "%s,%s,%s,%d,%d,%d,%d,%d,%d,%lld,%lld\n",
           task->target_rack, task->action_repr,
+          leave_str ? leave_str : "", blanks_used, score,
           n_games_run, n_W, n_L, n_T,
           (long long)target_score_sum, (long long)opp_score_sum);
   cpthread_mutex_unlock(&state->out_mutex);
