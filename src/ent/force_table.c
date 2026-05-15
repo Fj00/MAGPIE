@@ -514,6 +514,19 @@ void force_table_credit_game(ForceTable *table, ForceTarget *target,
   }
 }
 
+void force_table_get_stratum_wl(const ForceTable *table, int target_idx,
+                                uint32_t *out_w, uint32_t *out_l) {
+  *out_w = 0;
+  *out_l = 0;
+  if (!table || target_idx < 0 || target_idx >= table->num_targets) return;
+  if (table->stratum_tallies == NULL) return;
+  StratumTally *st = table->stratum_tallies[target_idx];
+  if (!st) return;
+  uint64_t packed = atomic_load_explicit(&st->wl, memory_order_relaxed);
+  *out_w = (uint32_t)(packed >> 32);
+  *out_l = (uint32_t)(packed & 0xFFFFFFFFu);
+}
+
 void force_table_get_stratum_by_len(uint64_t credits[6], uint64_t bumps[6]) {
   for (int i = 0; i < 6; i++) {
     credits[i] = atomic_load_explicit(&g_stratum_credits_by_len[i],

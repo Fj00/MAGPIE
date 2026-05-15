@@ -216,6 +216,13 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
 // honor `kill -USR1 <pid>` by writing a snapshot CSV.
 bool force_table_consume_dump_request(void);
 
+// Per-cell W and L counts for STRATUM cells (other kinds return 0/0).
+// Reads the packed atomic with relaxed ordering — values may be stale by
+// a few games but bounded by atomic semantics. The scheduler uses this
+// to identify which cells are W- or L-deficient.
+void force_table_get_stratum_wl(const ForceTable *table, int target_idx,
+                                uint32_t *out_w, uint32_t *out_l);
+
 // Number of targets currently loaded (including satisfied ones).
 int force_table_num_targets(const ForceTable *table);
 
