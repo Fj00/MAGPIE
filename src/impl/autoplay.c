@@ -747,11 +747,15 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   shared_data->t6_baseline = NULL;
   const char *t6_task = getenv("MAGPIE_T6_BASELINE_TASK_FILE");
   const char *t6_out = getenv("MAGPIE_T6_BASELINE_OUT_FILE");
-  if (t6_task && t6_task[0] && t6_out && t6_out[0]) {
-    shared_data->t6_baseline = t6_baseline_state_create(t6_task, t6_out);
+  const char *t6_pool = getenv("MAGPIE_T6_BASELINE_POOL_FILE");
+  if (t6_task && t6_task[0] && t6_out && t6_out[0] &&
+      t6_pool && t6_pool[0]) {
+    shared_data->t6_baseline =
+        t6_baseline_state_create(t6_task, t6_out, t6_pool);
     if (shared_data->t6_baseline) {
       fprintf(stderr,
-              "t6_baseline: tasks=%s out=%s\n", t6_task, t6_out);
+              "t6_baseline: tasks=%s out=%s pool=%s\n",
+              t6_task, t6_out, t6_pool);
     }
   }
 
@@ -3711,32 +3715,26 @@ static void t6_baseline_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   T6BaselineState *state = worker->shared_data->t6_baseline;
   ThreadControl *thread_control = worker->args.thread_control;
   T6BaselineTask task;
+  uint64_t game_seed = (uint64_t)worker->worker_index * 0x9e3779b97f4a7c15ULL;
   while (
       thread_control_get_status(thread_control) !=
           THREAD_CONTROL_STATUS_USER_INTERRUPT &&
       t6_baseline_get_next_task(state, &task)) {
     int n_W = 0, n_L = 0, n_T = 0;
+    int n_games_run = 0;
     int64_t target_score_sum = 0, opp_score_sum = 0;
     for (int g = 0; g < task.n_games; g++) {
+      // Sample a fresh opp rack from the pool per-game.
+      game_seed += 0x9e3779b97f4a7c15ULL;
+      const char *opp_rack = t6_baseline_sample_opp(state, game_seed);
+      if (!opp_rack) continue;
       // Reset to fresh game state.
       game_reset(gr->game);
-      gr->eb_active = false;  // disable EB recorder/branching
+      gr->eb_active = false;
       gr->pass_cycle_active = false;
       gr->eb_forced_move = NULL;
-      // After game_reset player_on_turn_index = 0. Set both racks.
-      // swap_player_rack expects on-turn player: temporarily set turn
-      // to each player to swap racks.
-      // Player 0 (target/live-P2) — already on turn after reset.
-      if (!swap_player_rack(gr->game, 0, task.target_rack)) {
-        continue;  // unable to draw target rack from full bag (impossible
-                   // with valid input); skip this game
-      }
-      // Player 1 (opp/live-P1).
-      if (!swap_player_rack(gr->game, 1, task.opp_rack)) {
-        continue;
-      }
-      // Parse the action_repr into a Move via validated_moves_create.
-      // Player 0 is on-turn at offline T1.
+      if (!swap_player_rack(gr->game, 0, task.target_rack)) continue;
+      if (!swap_player_rack(gr->game, 1, opp_rack)) continue;
       ErrorStack *es = error_stack_create();
       ValidatedMoves *vms = validated_moves_create(
           gr->game, 0, task.action_repr, true, true, es);
@@ -3747,15 +3745,11 @@ static void t6_baseline_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         continue;
       }
       const Move *forced = validated_moves_get_move(vms, 0);
-      // game_runner_play_move's eb_forced_move path copies the move
-      // into a per-worker spare slot, so it's safe to point to vms's
-      // internal move and destroy vms after the play_move call.
       gr->eb_forced_move = (Move *)forced;
       game_runner_play_move(worker, gr);
       gr->eb_forced_move = NULL;
       validated_moves_destroy(vms);
       error_stack_destroy(es);
-      // Continue with natural HastyBot for the rest of the game.
       while (!game_runner_is_game_over(gr)) {
         game_runner_play_move(worker, gr);
       }
@@ -3768,8 +3762,9 @@ static void t6_baseline_run_worker(AutoplayWorker *worker, GameRunner *gr) {
       if (s0 > s1) n_W++;
       else if (s0 < s1) n_L++;
       else n_T++;
+      n_games_run++;
     }
-    t6_baseline_record_result(state, &task, n_W, n_L, n_T,
+    t6_baseline_record_result(state, &task, n_games_run, n_W, n_L, n_T,
                               target_score_sum, opp_score_sum);
   }
 }
