@@ -527,6 +527,18 @@ void force_table_get_stratum_wl(const ForceTable *table, int target_idx,
   *out_l = (uint32_t)(packed & 0xFFFFFFFFu);
 }
 
+void force_table_get_stratum_wl_by_ptr(const ForceTable *table,
+                                       const ForceTarget *t,
+                                       uint32_t *out_w, uint32_t *out_l) {
+  *out_w = 0;
+  *out_l = 0;
+  if (!table || !t) return;
+  // ForceTargets are allocated as a contiguous array in table->targets;
+  // pointer subtraction yields the index used by the stratum tally array.
+  ptrdiff_t idx = t - table->targets;
+  force_table_get_stratum_wl(table, (int)idx, out_w, out_l);
+}
+
 void force_table_get_stratum_by_len(uint64_t credits[6], uint64_t bumps[6]) {
   for (int i = 0; i < 6; i++) {
     credits[i] = atomic_load_explicit(&g_stratum_credits_by_len[i],

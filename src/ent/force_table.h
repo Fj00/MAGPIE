@@ -223,6 +223,13 @@ bool force_table_consume_dump_request(void);
 void force_table_get_stratum_wl(const ForceTable *table, int target_idx,
                                 uint32_t *out_w, uint32_t *out_l);
 
+// Same as above but addresses the target by pointer (e.g. resolved via
+// force_table_lookup_target_by_key and stored downstream). Phase 3 hot
+// path uses this to avoid a redundant index lookup.
+void force_table_get_stratum_wl_by_ptr(const ForceTable *table,
+                                       const ForceTarget *t,
+                                       uint32_t *out_w, uint32_t *out_l);
+
 // Number of targets currently loaded (including satisfied ones).
 int force_table_num_targets(const ForceTable *table);
 

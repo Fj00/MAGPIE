@@ -52,6 +52,24 @@ const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
                                                   int top_k,
                                                   uint32_t *out_rack_id);
 
+// Phase 3: outcome-aware variant. Same shape as the deficit-aware
+// sampler above, but per-play utility blends deficit coverage with
+// the prior's W/L alignment to which side (wins or losses) is short
+// at each covered cell:
+//   util(play) = Σ inv_supply[c] * (deficit[c] + lambda * align[c])
+// where align[c] = (need_W[c] * P(W) + need_L[c] * P(L)) / target_per_side
+// and need_W/L = max(0, target_per_side - obs_w/l[c]).
+// `op` may be NULL (falls through to deficit-only), in which case
+// behavior is identical to play_index_sample_rack_deficit_aware.
+typedef struct OutcomePriors OutcomePriors;
+const char *play_index_sample_rack_outcome_aware(const PlayIndex *idx,
+                                                  const OutcomePriors *op,
+                                                  double lambda,
+                                                  int target_per_side,
+                                                  uint64_t seed,
+                                                  int top_k,
+                                                  uint32_t *out_rack_id);
+
 // Pick up to `max_n` distinct play_ids for the given rack_id, ranked
 // by deficit-coverage rarity (Σ deficit[c] / supply[c]). Only plays
 // scoring above `threshold` are included. Writes play_ids into `out`.

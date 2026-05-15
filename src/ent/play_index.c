@@ -11,6 +11,7 @@
 
 #include "../def/letter_distribution_defs.h"
 #include "../util/io_util.h"
+#include "outcome_priors.h"
 
 // Per-cell metadata layout in cells.bin (24 bytes; matches the Python
 // builder's struct.pack format: <BBBBBBBB iiI f).
@@ -89,6 +90,11 @@ struct PlayIndex {
   // Used for rarity-weighted scoring: rare-supply cells dominate.
   // Computed once at load.
   float *inv_supply;
+
+  // Held reference to the force_table that resolved cell_to_target.
+  // Phase 3 outcome-aware sampler uses this to read per-cell W/L tallies.
+  // Borrowed pointer; not owned.
+  ForceTable *force_table;
 };
 
 // ---------- Helpers ----------
@@ -155,6 +161,7 @@ PlayIndex *play_index_create(const char *dir_path, ForceTable *force_table,
                               const LetterDistribution *ld) {
   PlayIndex *idx = (PlayIndex *)calloc(1, sizeof(PlayIndex));
   if (!idx) return NULL;
+  idx->force_table = force_table;
 
   char path[1024];
 
@@ -438,6 +445,123 @@ int play_index_pick_targeted_plays(const PlayIndex *idx,
   }
   for (int i = 0; i < n; i++) out_play_ids[i] = best_pids[i];
   return n;
+}
+
+// Phase 3 outcome-aware play scoring. For each cell c the play covers:
+//   util[c] = inv_supply[c] * (deficit[c] + lambda * align[c])
+//   align[c] = (need_W[c] * P(W) + need_L[c] * P(L)) / target_per_side
+// Bucket miss → align = 0 (graceful fall-through to deficit-only).
+static double score_play_outcome(const PlayIndex *idx,
+                                  const OutcomePriors *op,
+                                  double lambda, int target_per_side,
+                                  uint32_t play_id) {
+  PlayRecord pr;
+  if (!play_index_get_play(idx, play_id, &pr)) return 0.0;
+  float p_w = 0.0f, p_l = 0.0f, p_t = 0.0f;
+  bool have_prior = false;
+  if (op && lambda > 0.0 && target_per_side > 0) {
+    OptionFKey k;
+    if (outcome_priors_compute_key(&pr, &k)) {
+      have_prior = outcome_priors_lookup(op, &k, &p_w, &p_l, &p_t);
+    }
+  }
+  double score = 0.0;
+  for (uint16_t i = 0; i < pr.n_cells; i++) {
+    uint32_t cid = pr.cell_ids[i];
+    ForceTarget *t = idx->cell_to_target[cid];
+    if (!t) continue;
+    int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
+    if (d <= 0) continue;
+    double base = (double)d;
+    if (have_prior) {
+      uint32_t obs_w = 0, obs_l = 0;
+      force_table_get_stratum_wl_by_ptr(idx->force_table, t, &obs_w, &obs_l);
+      double need_w = (double)target_per_side - (double)obs_w;
+      if (need_w < 0.0) need_w = 0.0;
+      double need_l = (double)target_per_side - (double)obs_l;
+      if (need_l < 0.0) need_l = 0.0;
+      double align = (need_w * (double)p_w + need_l * (double)p_l) /
+                     (double)target_per_side;
+      base += lambda * align;
+    }
+    score += base * (double)idx->inv_supply[cid];
+  }
+  return score;
+}
+
+const char *play_index_sample_rack_outcome_aware(const PlayIndex *idx,
+                                                  const OutcomePriors *op,
+                                                  double lambda,
+                                                  int target_per_side,
+                                                  uint64_t seed,
+                                                  int top_k,
+                                                  uint32_t *out_rack_id) {
+  // When priors are absent or lambda = 0, fall through to existing
+  // deficit-only sampler (bit-for-bit compatible with prior behavior).
+  if (!op || lambda <= 0.0 || target_per_side <= 0) {
+    return play_index_sample_rack_deficit_aware(idx, seed, top_k,
+                                                 out_rack_id);
+  }
+  if (top_k < TOP_CELL_HEAP_K_MIN) top_k = TOP_CELL_HEAP_K_MIN;
+  if (top_k > TOP_CELL_HEAP_K_MAX) top_k = TOP_CELL_HEAP_K_MAX;
+
+  // Same top-K cell heap as the deficit-only path.
+  CellEntry heap[TOP_CELL_HEAP_K_MAX];
+  int heap_size = 0;
+  for (uint32_t cid = 0; cid < idx->num_cells; cid++) {
+    ForceTarget *t = idx->cell_to_target[cid];
+    if (!t) continue;
+    int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
+    if (d <= 0) continue;
+    double w = (double)d * (double)idx->inv_supply[cid];
+    heap_push_or_replace(heap, &heap_size, top_k, w, cid);
+  }
+  if (heap_size == 0) return NULL;
+
+  uint64_t visited_bitset[16] = {0};
+  #define OA_VISIT_MARK(pid) ({ \
+    uint32_t k = (pid) & 1023; \
+    bool was = (visited_bitset[k>>6] >> (k & 63)) & 1ULL; \
+    visited_bitset[k>>6] |= (1ULL << (k & 63)); \
+    was; \
+  })
+
+  double best_score = 0.0;
+  uint32_t best_play = 0;
+  bool have_best = false;
+  uint64_t s = seed ^ 0xa1b2c3d4e5f60708ULL;
+
+  for (int h = 0; h < heap_size; h++) {
+    uint32_t cid = heap[h].cell_id;
+    uint64_t off_lo = idx->cell_play_off[cid];
+    uint64_t off_hi = idx->cell_play_off[cid + 1];
+    uint64_t count = off_hi - off_lo;
+    uint64_t scan = count;
+    uint64_t start = 0;
+    if (scan > MAX_PLAYS_PER_CELL_SCAN) {
+      s = s * 0x9e3779b97f4a7c15ULL + 0x123456789abcdef0ULL;
+      start = s % (count - MAX_PLAYS_PER_CELL_SCAN);
+      scan = MAX_PLAYS_PER_CELL_SCAN;
+    }
+    for (uint64_t i = 0; i < scan; i++) {
+      uint32_t pid = idx->plays_by_cell[off_lo + start + i];
+      if (OA_VISIT_MARK(pid)) continue;
+      double sc = score_play_outcome(idx, op, lambda, target_per_side, pid);
+      if (sc > best_score ||
+          (sc == best_score && have_best && (s ^ pid) & 1)) {
+        best_score = sc;
+        best_play = pid;
+        have_best = true;
+      }
+    }
+  }
+  #undef OA_VISIT_MARK
+
+  if (!have_best || best_score <= 0.0) return NULL;
+  PlayRecord pr;
+  if (!play_index_get_play(idx, best_play, &pr)) return NULL;
+  if (out_rack_id) *out_rack_id = pr.rack_id;
+  return idx->racks + (size_t)pr.rack_id * RACK_BYTES;
 }
 
 int play_index_lookup_rack_id(const PlayIndex *idx, const char *rack_str) {
