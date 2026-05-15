@@ -149,6 +149,12 @@ typedef struct AutoplaySharedData {
   // category sampler at the recording turn. The 5 pool fields above are
   // ignored when play_index is loaded.
   PlayIndex *play_index;
+
+  // Phase 0 capture: when MAGPIE_PRE_T6_CAPTURE=path is set, write one
+  // CSV row per game at T6 entry: P1's rack + bag tiles. Used to build
+  // the pre_t6_pool.csv distribution for skip-pre-T6 game setup.
+  FILE *pre_t6_capture_file;
+  cpthread_mutex_t pre_t6_capture_mutex;
   // 0 = P1 receives the T6 inject (recording), 1 = P2. Set by
   // MAGPIE_EB_RARE_TARGET=p1|p2. Default p2 (T6 is P2's turn in the
   // canonical EB cycle).
@@ -728,6 +734,24 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
     shared_data->play_index = play_index_create(
         play_index_dir, shared_data->force_table, shared_data->ld);
   }
+
+  // Phase 0 capture: pre-T6 P1 rack + bag snapshot file.
+  shared_data->pre_t6_capture_file = NULL;
+  cpthread_mutex_init(&shared_data->pre_t6_capture_mutex);
+  const char *pre_t6_capture = getenv("MAGPIE_PRE_T6_CAPTURE");
+  if (pre_t6_capture && pre_t6_capture[0] != '\0') {
+    shared_data->pre_t6_capture_file = fopen(pre_t6_capture, "w");
+    if (shared_data->pre_t6_capture_file) {
+      fprintf(shared_data->pre_t6_capture_file, "p1_rack,bag\n");
+      fflush(shared_data->pre_t6_capture_file);
+      fprintf(stderr,
+              "pre_t6_capture: writing per-game P1-rack+bag to %s\n",
+              pre_t6_capture);
+    } else {
+      fprintf(stderr,
+              "pre_t6_capture: cannot open %s for write\n", pre_t6_capture);
+    }
+  }
   if (shared_data->pass_pool || shared_data->exch_pool ||
       shared_data->bingo_pool || shared_data->play_pool ||
       shared_data->rare_rack_cells) {
@@ -834,6 +858,9 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   pass_cycle_table_destroy(shared_data->play_pool);
   rare_pool_destroy(shared_data->rare_rack_cells);
   play_index_destroy(shared_data->play_index);
+  if (shared_data->pre_t6_capture_file) {
+    fclose(shared_data->pre_t6_capture_file);
+  }
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
   free(shared_data);
@@ -2190,6 +2217,22 @@ void autoplay_add_game(AutoplayWorker *autoplay_worker,
 // Encode a player's current rack as ASCII chars (e.g. "AEINRST", "?ABDIJ").
 // out must have room for RACK_SIZE+1 bytes; the LD's first ld_ml_to_hl byte
 // is used per machine letter (English Scrabble = single ASCII char per tile).
+// Stringify a player's rack into `out`. Sorted alphabetic, blanks
+// (machine letter 0) appear first as '?'. Up to RACK_SIZE chars + null.
+static void stringify_bag_into(const Game *game, char *out, int max_len) {
+  const LetterDistribution *ld = game_get_ld(game);
+  const Bag *bag = game_get_bag(game);
+  const uint16_t dist_size = ld_get_size(ld);
+  int n = 0;
+  for (uint16_t i = 0; i < dist_size && n < max_len - 1; i++) {
+    const int c = bag_get_letter(bag, i);
+    for (int k = 0; k < c && n < max_len - 1; k++) {
+      out[n++] = ld->ld_ml_to_hl[i][0];
+    }
+  }
+  out[n] = '\0';
+}
+
 static void pass_cycle_stringify_rack(const Game *game, int player_index,
                                       char *out) {
   const LetterDistribution *ld = game_get_ld(game);
@@ -3171,6 +3214,26 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     // uniformly from {pass, exch, bingo, rare, play} and inject a rack from
     // the chosen source. Skips if no pools loaded or on-turn player isn't the
     // rare_target_player.
+    // Phase 0 capture: P1's rack and bag at T6 entry, before any rack
+    // injection. Once-per-game (only fires when on-turn matches the
+    // recording player so each game emits exactly one row).
+    if (gr->eb_active &&
+        gr->eb_n_snaps == w->shared_data->eb_target_turn - 1 &&
+        board_get_tiles_played(game_get_board(gr->game)) == 0 &&
+        w->shared_data->pre_t6_capture_file != NULL &&
+        game_get_player_on_turn_index(gr->game) ==
+            w->shared_data->rare_target_player) {
+      const int p1_idx = 1 - w->shared_data->rare_target_player;
+      char p1_rack_buf[RACK_SIZE + 2] = {0};
+      char bag_buf[256] = {0};
+      pass_cycle_stringify_rack(gr->game, p1_idx, p1_rack_buf);
+      stringify_bag_into(gr->game, bag_buf, sizeof(bag_buf));
+      cpthread_mutex_lock(&w->shared_data->pre_t6_capture_mutex);
+      fprintf(w->shared_data->pre_t6_capture_file, "%s,%s\n",
+              p1_rack_buf, bag_buf);
+      cpthread_mutex_unlock(&w->shared_data->pre_t6_capture_mutex);
+    }
+
     if (gr->eb_active &&
         gr->eb_n_snaps == w->shared_data->eb_target_turn - 1 &&
         board_get_tiles_played(game_get_board(gr->game)) == 0 &&
