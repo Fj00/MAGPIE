@@ -422,9 +422,7 @@ const char *play_index_sample_rack_deficit_aware(const PlayIndex *idx,
 }
 
 // Pick top-N play_ids for the given rack_id by rarity-weighted score
-// strictly > threshold. Insertion-sort into a fixed-size descending list.
-// Caller passes threshold=0.0 to skip score=0 plays (cover only drained
-// cells) while including every play touching at least one active cell.
+// >= threshold. Insertion-sort into a fixed-size descending list.
 int play_index_pick_targeted_plays(const PlayIndex *idx,
                                    uint32_t rack_id, double threshold,
                                    int max_n, uint32_t *out_play_ids) {
@@ -437,7 +435,7 @@ int play_index_pick_targeted_plays(const PlayIndex *idx,
   int n = 0;
   for (uint64_t pid = lo; pid < hi; pid++) {
     double sc = score_play(idx, (uint32_t)pid);
-    if (sc <= threshold) continue;
+    if (sc < threshold) continue;
     int pos = n;
     while (pos > 0 && best_scores[pos - 1] < sc) pos--;
     if (pos < max_n) {
