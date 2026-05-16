@@ -448,6 +448,8 @@ bool force_table_decrement_target(ForceTable *table, ForceTarget *target) {
 void force_table_credit_game(ForceTable *table, ForceTarget *target,
                              int diff, bool is_win, bool is_tie) {
   atomic_fetch_add_explicit(&g_credit_calls, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&target->credit_attempts, 1,
+                            memory_order_relaxed);
   // Tile/pair: count-based semantics (one matched game = one credit).
   if (target->kind != FORCE_TARGET_STRATUM) {
     force_table_decrement_target(table, target);
@@ -1019,7 +1021,7 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
   }
   fprintf(f, "kind,bag,length,type,exchange,subleave,current,target,deficit,"
              "forced_games_estimate,diff_min,diff_max,rarity_score,"
-             "obs_w,obs_l,stratum_per_side\n");
+             "obs_w,obs_l,stratum_per_side,credit_attempts\n");
   const char *kind_names[] = {"stratum", "tile", "pair", "bag_tile"};
   const char *type_names[] = {"all", "cons", "mixed", "vowel"};
   int rows_written = 0;
@@ -1054,11 +1056,14 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
       force_table_get_stratum_wl(table, i, &obs_w, &obs_l);
       per_side = t->stratum_per_side;
     }
-    fprintf(f, "%s,%d,%d,%s,%d,%s,0,0,%lld,0,%d,%d,%.6e,%u,%u,%d\n",
+    uint64_t cred_attempts = atomic_load_explicit(
+        &t->credit_attempts, memory_order_relaxed);
+    fprintf(f, "%s,%d,%d,%s,%d,%s,0,0,%lld,0,%d,%d,%.6e,%u,%u,%d,%llu\n",
             kind_names[t->kind], t->bag, t->leave_length,
             type_names[t->leave_type], t->exchange, subleave,
             (long long)t->deficit, t->diff_min, t->diff_max,
-            t->rarity_score, obs_w, obs_l, per_side);
+            t->rarity_score, obs_w, obs_l, per_side,
+            (unsigned long long)cred_attempts);
     rows_written++;
   }
   fclose(f);

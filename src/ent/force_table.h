@@ -79,6 +79,10 @@ typedef struct ForceTarget {
   // deficit hits 0 (= both sides reached T). For non-STRATUM kinds this
   // field is unused.
   int32_t stratum_per_side;
+  // Diagnostic: count of force_table_credit_game calls that landed on
+  // this cell. Lets us distinguish orphan-by-no-match (counter==0) from
+  // orphan-by-credit-failure (counter>0 but deficit unchanged).
+  _Atomic uint64_t credit_attempts;
 } ForceTarget;
 
 // Compact per-target hot data co-located with bucket pointer for cache-
