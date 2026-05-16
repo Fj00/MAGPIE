@@ -83,6 +83,10 @@ typedef struct ForceTarget {
   // this cell. Lets us distinguish orphan-by-no-match (counter==0) from
   // orphan-by-credit-failure (counter>0 but deficit unchanged).
   _Atomic uint64_t credit_attempts;
+  // Original deficit at load time. Used by the per-cell priority scorer
+  // as `base = remaining_deficit / original_deficit` (1.0 untouched,
+  // 0 drained).
+  int64_t original_deficit;
 } ForceTarget;
 
 // Compact per-target hot data co-located with bucket pointer for cache-

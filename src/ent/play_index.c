@@ -1,6 +1,7 @@
 #include "play_index.h"
 
 #include <fcntl.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,6 +91,14 @@ struct PlayIndex {
   // Used for rarity-weighted scoring: rare-supply cells dominate.
   // Computed once at load.
   float *inv_supply;
+
+  // Per-cell normalized rarity in [0,1]:
+  // rarity[c] = log(max_supply / supply[c]) / log(max_supply).
+  // Rarest cell (supply=1) → 1.0; most-common cell → 0.0.
+  // Used by cell_priority for the boost scorer (puts rarity on
+  // a comparable scale to base/skew, both already 0-1).
+  float *rarity;
+  float log_max_supply;
 
   // Held reference to the force_table that resolved cell_to_target.
   // Phase 3 outcome-aware sampler uses this to read per-cell W/L tallies.
@@ -233,9 +242,26 @@ PlayIndex *play_index_create(const char *dir_path, ForceTable *force_table,
   // Compute inv_supply per cell for rarity-weighted scoring.
   idx->inv_supply = (float *)malloc(sizeof(float) * idx->num_cells);
   if (!idx->inv_supply) { play_index_destroy(idx); return NULL; }
+  uint64_t max_supply = 1;
   for (uint32_t c = 0; c < idx->num_cells; c++) {
     uint64_t supply = idx->cell_play_off[c + 1] - idx->cell_play_off[c];
     idx->inv_supply[c] = (supply > 0) ? (1.0f / (float)supply) : 0.0f;
+    if (supply > max_supply) max_supply = supply;
+  }
+  // Compute normalized rarity per cell: log(max/supply) / log(max),
+  // mapping rarest cell to 1.0 and most-common cell to 0.0.
+  idx->rarity = (float *)malloc(sizeof(float) * idx->num_cells);
+  if (!idx->rarity) { play_index_destroy(idx); return NULL; }
+  idx->log_max_supply = (float)log((double)max_supply);
+  for (uint32_t c = 0; c < idx->num_cells; c++) {
+    uint64_t supply = idx->cell_play_off[c + 1] - idx->cell_play_off[c];
+    if (supply == 0 || idx->log_max_supply <= 0.0f) {
+      idx->rarity[c] = 0.0f;
+    } else {
+      double r = log((double)max_supply / (double)supply) /
+                 (double)idx->log_max_supply;
+      idx->rarity[c] = (float)r;
+    }
   }
 
   return idx;
@@ -254,6 +280,7 @@ void play_index_destroy(PlayIndex *idx) {
     munmap((void *)idx->cell_play_off, idx->cell_idx_len);
   free(idx->cell_to_target);
   free(idx->inv_supply);
+  free(idx->rarity);
   free(idx);
 }
 
@@ -289,18 +316,49 @@ bool play_index_get_play(const PlayIndex *idx, uint32_t play_id,
   return true;
 }
 
-// Score a play_id by Σ (deficit / supply) over its cell_ids — rarity
-// weighted. Returns 0.0 for plays covering only drained cells.
+// Per-cell priority for the boost-based scorer. All components in [0,1].
+//
+// STRATUM cells:    cell_priority = (base + skew + rarity) / 3   // additive
+//   base   = remaining_deficit / original_deficit   (1=untouched, 0=drained)
+//   skew   = |W - L| / stratum_per_side             (0=balanced, 1=fully skewed)
+//   rarity = log(max_supply / supply) / log(max_supply)
+//
+// Non-STRATUM cells: cell_priority = base × rarity                // multiplicative
+//   base   = remaining_deficit / original_deficit
+//   rarity = same as above
+//   (no skew — non-STRATUM cells don't track W/L separately)
+//
+// Non-STRATUM priority is strictly smaller in magnitude (max product
+// 1.0 vs additive average that typically exceeds 0.3), so STRATUM cells
+// naturally dominate the per-rack ranking.
+static double cell_priority(const PlayIndex *idx, uint32_t cid) {
+  ForceTarget *t = idx->cell_to_target[cid];
+  if (!t) return 0.0;
+  int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
+  if (d <= 0) return 0.0;
+  double base = (t->original_deficit > 0)
+      ? (double)d / (double)t->original_deficit : 1.0;
+  double rarity = (double)idx->rarity[cid];
+  if (t->kind == FORCE_TARGET_STRATUM && t->stratum_per_side > 0) {
+    uint32_t obs_w = 0, obs_l = 0;
+    force_table_get_stratum_wl_by_ptr(idx->force_table, t, &obs_w, &obs_l);
+    int w = (int)obs_w, l = (int)obs_l;
+    int diff = w > l ? (w - l) : (l - w);
+    if (diff > t->stratum_per_side) diff = t->stratum_per_side;
+    double skew = (double)diff / (double)t->stratum_per_side;
+    return (base + skew + rarity) / 3.0;
+  }
+  return base * rarity;
+}
+
+// Score a play_id by Σ cell_priority over its cell_ids.
+// Returns 0.0 for plays covering only drained cells.
 static double score_play(const PlayIndex *idx, uint32_t play_id) {
   PlayRecord pr;
   if (!play_index_get_play(idx, play_id, &pr)) return 0.0;
   double score = 0.0;
   for (uint16_t i = 0; i < pr.n_cells; i++) {
-    uint32_t cid = pr.cell_ids[i];
-    ForceTarget *t = idx->cell_to_target[cid];
-    if (!t) continue;
-    int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
-    if (d > 0) score += (double)d * (double)idx->inv_supply[cid];
+    score += cell_priority(idx, pr.cell_ids[i]);
   }
   return score;
 }
@@ -447,12 +505,13 @@ int play_index_pick_targeted_plays(const PlayIndex *idx,
   return n;
 }
 
-// Phase 3 outcome-aware play scoring. For each cell c the play covers:
-//   util[c] = inv_supply[c] * (deficit[c] + lambda * align[c])
-//   align[c] = (need_W[c] * P(W) + need_L[c] * P(L)) / target_per_side
-// where target_per_side = t->stratum_per_side (per-cell W and L target).
-// Bucket miss → align = 0 (graceful fall-through to deficit-only).
-// Non-STRATUM cells (stratum_per_side == 0) skip the align term.
+// Phase 3 outcome-aware play scoring with the boost-based cell priority.
+// Per cell c covered by the play:
+//   util[c] = cell_priority(c) + lambda * align[c]
+//   align[c] = (need_W * P(W) + need_L * P(L)) / target_per_side    // STRATUM
+// Bucket miss or non-STRATUM → align = 0 (graceful fall-through to
+// cell_priority alone). Default lambda = 1.0 since cell_priority and
+// align are both in [0,1].
 static double score_play_outcome(const PlayIndex *idx,
                                   const OutcomePriors *op,
                                   double lambda, uint32_t play_id) {
@@ -469,21 +528,22 @@ static double score_play_outcome(const PlayIndex *idx,
   double score = 0.0;
   for (uint16_t i = 0; i < pr.n_cells; i++) {
     uint32_t cid = pr.cell_ids[i];
-    ForceTarget *t = idx->cell_to_target[cid];
-    if (!t) continue;
-    int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
-    if (d <= 0) continue;
-    double base = (double)d;
-    if (have_prior && t->stratum_per_side > 0) {
-      uint32_t obs_w = 0, obs_l = 0;
-      force_table_get_stratum_wl_by_ptr(idx->force_table, t, &obs_w, &obs_l);
-      double tps = (double)t->stratum_per_side;
-      double need_w = tps - (double)obs_w; if (need_w < 0.0) need_w = 0.0;
-      double need_l = tps - (double)obs_l; if (need_l < 0.0) need_l = 0.0;
-      double align = (need_w * (double)p_w + need_l * (double)p_l) / tps;
-      base += lambda * align;
+    double prio = cell_priority(idx, cid);
+    if (prio <= 0.0) continue;
+    double util = prio;
+    if (have_prior) {
+      ForceTarget *t = idx->cell_to_target[cid];
+      if (t && t->kind == FORCE_TARGET_STRATUM && t->stratum_per_side > 0) {
+        uint32_t obs_w = 0, obs_l = 0;
+        force_table_get_stratum_wl_by_ptr(idx->force_table, t, &obs_w, &obs_l);
+        double tps = (double)t->stratum_per_side;
+        double need_w = tps - (double)obs_w; if (need_w < 0.0) need_w = 0.0;
+        double need_l = tps - (double)obs_l; if (need_l < 0.0) need_l = 0.0;
+        double align = (need_w * (double)p_w + need_l * (double)p_l) / tps;
+        util += lambda * align;
+      }
     }
-    score += base * (double)idx->inv_supply[cid];
+    score += util;
   }
   return score;
 }
