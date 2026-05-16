@@ -611,6 +611,15 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
     shared_data->force_table =
         force_table_create(ft_path, args->game_args->ld);
   }
+  // Optional resume: replay W/L state from a prior run's
+  // force_remaining.csv dump. Cross-session iteration without losing
+  // drain progress.
+  const char *resume_path = getenv("MAGPIE_FORCE_TABLE_RESUME");
+  if (resume_path && resume_path[0] != '\0' &&
+      shared_data->force_table != NULL) {
+    force_table_resume_from_dump(shared_data->force_table, resume_path,
+                                  args->game_args->ld);
+  }
   shared_data->stop_on_force_exhaust =
       shared_data->force_table != NULL &&
       getenv("MAGPIE_FORCE_STOP_ON_EXHAUST") != NULL;

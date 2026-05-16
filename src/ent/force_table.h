@@ -115,6 +115,19 @@ ForceTable *force_table_create(const char *csv_path,
 
 void force_table_destroy(ForceTable *table);
 
+// Resume from a previous run's state. Replays per-cell W/L (for STRATUM)
+// and deficit (for non-STRATUM) from a force_remaining.csv produced by
+// force_table_dump_remaining. Cells matched by key (kind, bag, length,
+// type, exchange, subleave, diff_min, diff_max) get their state replayed
+// via the normal credit_game / decrement paths so deficit stays
+// consistent with the credit semantics. Cells in the resume file but not
+// in the current table are silently skipped. Cells in the table not
+// mentioned in the resume file keep their fresh-load state.
+//
+// Returns the number of cells restored. Logs a summary to stderr.
+int force_table_resume_from_dump(ForceTable *table, const char *csv_path,
+                                 const LetterDistribution *ld);
+
 // Returns the array of targets at the given bag count, and sets *count.
 // Returned pointer is owned by the table and valid until force_table_destroy.
 // NULL is returned and *count set to 0 if no targets exist for the bag.

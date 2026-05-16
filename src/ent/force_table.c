@@ -1074,6 +1074,166 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
           rows_written, csv_path);
 }
 
+// Resume from a prior run's force_remaining.csv dump. Replays per-cell
+// state without re-running games — used for cross-session iteration
+// without losing drained-cell progress.
+//
+// Schema of the dump (with the recent column extensions):
+//   kind,bag,length,type,exchange,subleave,current,target,deficit,
+//   forced_games_estimate,diff_min,diff_max,rarity_score,
+//   obs_w,obs_l,stratum_per_side,credit_attempts
+//
+// For STRATUM cells: replay (obs_w, obs_l) by calling the credit logic
+// inline so deficit ends up consistent with the runtime semantics
+// (deficit decremented for each side-crossing).
+//
+// For non-STRATUM cells: set deficit to the dumped value directly
+// (count-based, no per-side breakdown).
+int force_table_resume_from_dump(ForceTable *table, const char *csv_path,
+                                 const LetterDistribution *ld) {
+  FILE *f = fopen(csv_path, "r");
+  if (!f) {
+    fprintf(stderr, "force_table_resume: cannot open %s\n", csv_path);
+    return 0;
+  }
+  char line[2048];
+  if (!fgets(line, sizeof(line), f)) {  // header
+    fclose(f);
+    return 0;
+  }
+  int n_restored = 0;
+  int n_skipped = 0;
+  int n_strata = 0;
+  int n_other = 0;
+  while (fgets(line, sizeof(line), f)) {
+    char *fields[20];
+    int nf = split_csv(line, fields, 20);
+    if (nf < 13) continue;  // need at least through rarity_score
+    // Parse cell key fields
+    ForceTargetKind kind = parse_kind(fields[0]);
+    if (kind < 0) continue;
+    int bag = atoi(fields[1]);
+    int length = atoi(fields[2]);
+    LeaveType type = parse_leave_type(fields[3]);
+    if (type < 0) continue;
+    int exchange = atoi(fields[4]);
+    const char *subleave = fields[5];
+    int64_t deficit = strtoll(fields[8], NULL, 10);
+    int diff_min = atoi(fields[10]);
+    int diff_max = atoi(fields[11]);
+    // Optional new columns (only present if dump was made by the
+    // post-Phase-1a magpie with W/L tracking).
+    uint64_t obs_w = (nf > 13) ? strtoull(fields[13], NULL, 10) : 0;
+    uint64_t obs_l = (nf > 14) ? strtoull(fields[14], NULL, 10) : 0;
+    // Decode subleave_mls per the dump's encoding (matches the dump's
+    // own subleave-rendering logic in force_table_dump_remaining).
+    MachineLetter sub_ml0 = 0, sub_ml1 = 0;
+    int subleave_count = 0;
+    if (kind == FORCE_TARGET_BAG_TILE) {
+      // Format: "<TILE>_free"
+      if (subleave[0]) {
+        sub_ml0 = (subleave[0] == '?') ? 0 : char_to_ml(ld, subleave[0]);
+        subleave_count = 1;
+      }
+    } else {
+      if (subleave[0]) {
+        sub_ml0 = (subleave[0] == '?') ? 0 : char_to_ml(ld, subleave[0]);
+        subleave_count = 1;
+      }
+      if (subleave[0] && subleave[1]) {
+        sub_ml1 = (subleave[1] == '?') ? 0 : char_to_ml(ld, subleave[1]);
+        subleave_count = 2;
+      }
+    }
+    if (sub_ml0 == (MachineLetter)0xFF || sub_ml1 == (MachineLetter)0xFF) {
+      n_skipped++;
+      continue;
+    }
+    // Look up the cell by key. Use diff_min as the diff lookup value
+    // (force_table_lookup_target_by_key checks `diff_min <= diff <= diff_max`).
+    ForceTarget *t = force_table_lookup_target_by_key(
+        table, bag, length, type, kind, exchange,
+        sub_ml0, sub_ml1, subleave_count, diff_min);
+    if (!t) {
+      n_skipped++;
+      continue;
+    }
+    if (kind == FORCE_TARGET_STRATUM) {
+      // Replay W and L credits inline. Each side credit increments the
+      // tally and decrements deficit if the side was below per_side.
+      if (table->stratum_tallies && obs_w + obs_l > 0) {
+        const int idx = (int)(t - table->targets);
+        StratumTally *st = table->stratum_tallies[idx];
+        if (st) {
+          uint64_t packed = ((obs_w & 0xFFFFFFFFULL) << 32) |
+                            (obs_l & 0xFFFFFFFFULL);
+          atomic_store_explicit(&st->wl, packed, memory_order_relaxed);
+          // Adjust deficit: subtract one per side-credit that lands
+          // below per_side. Same logic as credit_game but in bulk.
+          int per_side = t->stratum_per_side;
+          int eff_w = (int)(obs_w < (uint64_t)per_side ? obs_w : per_side);
+          int eff_l = (int)(obs_l < (uint64_t)per_side ? obs_l : per_side);
+          int decrements = eff_w + eff_l;
+          if (decrements > 0) {
+            int64_t cur = atomic_load_explicit(&t->deficit,
+                                                memory_order_relaxed);
+            int64_t new_def = cur - decrements;
+            if (new_def < 0) new_def = 0;
+            atomic_store_explicit(&t->deficit, new_def,
+                                  memory_order_relaxed);
+            if (new_def == 0) {
+              atomic_fetch_sub_explicit(&table->active_targets, 1,
+                                         memory_order_relaxed);
+              pthread_mutex_lock(&table->bucket_mutex);
+              swap_to_back_bag(table, t);
+              swap_to_back_shape(table, t);
+              pthread_mutex_unlock(&table->bucket_mutex);
+            } else {
+              // Mirror slot cache.
+              const int L = t->leave_length;
+              const int ex = t->exchange ? 1 : 0;
+              if (table->by_shape_slots[t->bag][L][ex] &&
+                  t->by_shape_idx >= 0) {
+                table->by_shape_slots[t->bag][L][ex][t->by_shape_idx]
+                    .deficit = (int32_t)new_def;
+              }
+            }
+          }
+        }
+      }
+      n_strata++;
+    } else {
+      // Non-STRATUM: set deficit directly to the dumped value.
+      int64_t cur = atomic_load_explicit(&t->deficit, memory_order_relaxed);
+      atomic_store_explicit(&t->deficit, deficit, memory_order_relaxed);
+      // Mirror slot cache.
+      const int L = t->leave_length;
+      const int ex = t->exchange ? 1 : 0;
+      if (table->by_shape_slots[t->bag][L][ex] && t->by_shape_idx >= 0) {
+        table->by_shape_slots[t->bag][L][ex][t->by_shape_idx].deficit =
+            (int32_t)deficit;
+      }
+      if (deficit == 0 && cur > 0) {
+        atomic_fetch_sub_explicit(&table->active_targets, 1,
+                                   memory_order_relaxed);
+        pthread_mutex_lock(&table->bucket_mutex);
+        swap_to_back_bag(table, t);
+        swap_to_back_shape(table, t);
+        pthread_mutex_unlock(&table->bucket_mutex);
+      }
+      n_other++;
+    }
+    n_restored++;
+  }
+  fclose(f);
+  fprintf(stderr,
+          "force_table_resume: restored %d cells (%d STRATUM, %d "
+          "non-STRATUM), skipped %d unmatched, total deficit now %lld\n",
+          n_restored, n_strata, n_other, n_skipped,
+          (long long)force_table_total_remaining(table));
+  return n_restored;
+}
+
 void force_table_destroy(ForceTable *table) {
   if (!table) {
     return;
