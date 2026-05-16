@@ -83,6 +83,12 @@ typedef struct ForceTarget {
   // this cell. Lets us distinguish orphan-by-no-match (counter==0) from
   // orphan-by-credit-failure (counter>0 but deficit unchanged).
   _Atomic uint64_t credit_attempts;
+  // Original deficit at load time. Used by the slot-builder scorer to
+  // multiply by (current_deficit / original_deficit) so cells that have
+  // never been credited (ratio = 1) get higher priority than partly-
+  // drained cells (ratio < 1). Smooths the orphan-cell starvation
+  // without a binary cliff.
+  int64_t original_deficit;
 } ForceTarget;
 
 // Compact per-target hot data co-located with bucket pointer for cache-
