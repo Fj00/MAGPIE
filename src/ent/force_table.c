@@ -1018,7 +1018,8 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
     return;
   }
   fprintf(f, "kind,bag,length,type,exchange,subleave,current,target,deficit,"
-             "forced_games_estimate,diff_min,diff_max,rarity_score\n");
+             "forced_games_estimate,diff_min,diff_max,rarity_score,"
+             "obs_w,obs_l,stratum_per_side\n");
   const char *kind_names[] = {"stratum", "tile", "pair", "bag_tile"};
   const char *type_names[] = {"all", "cons", "mixed", "vowel"};
   int rows_written = 0;
@@ -1045,11 +1046,19 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
     // current/target/forced_games_estimate aren't tracked precisely after
     // runtime; emit 0 placeholders except deficit (the reliable field).
     // Diff range and rarity_score echoed back as-loaded.
-    fprintf(f, "%s,%d,%d,%s,%d,%s,0,0,%lld,0,%d,%d,%.6e\n",
+    // For STRATUM cells also emit per-cell W/L tally and per-side target
+    // (Phase 3 diagnostic — shows whether stuck cells are W- or L-skewed).
+    uint32_t obs_w = 0, obs_l = 0;
+    int per_side = 0;
+    if (t->kind == FORCE_TARGET_STRATUM) {
+      force_table_get_stratum_wl(table, i, &obs_w, &obs_l);
+      per_side = t->stratum_per_side;
+    }
+    fprintf(f, "%s,%d,%d,%s,%d,%s,0,0,%lld,0,%d,%d,%.6e,%u,%u,%d\n",
             kind_names[t->kind], t->bag, t->leave_length,
             type_names[t->leave_type], t->exchange, subleave,
             (long long)t->deficit, t->diff_min, t->diff_max,
-            t->rarity_score);
+            t->rarity_score, obs_w, obs_l, per_side);
     rows_written++;
   }
   fclose(f);
