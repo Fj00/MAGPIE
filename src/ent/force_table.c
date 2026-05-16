@@ -214,14 +214,13 @@ LeaveType force_classify_leave(const Rack *leave,
 }
 
 bool force_target_matches(const ForceTarget *target, const Rack *leave,
-                          int score, int diff) {
+                          int is_exchange, int diff) {
   if (atomic_load_explicit(&target->deficit, memory_order_relaxed) <= 0) {
     return false;
   }
   if (leave->number_of_letters != target->leave_length) {
     return false;
   }
-  int is_exchange = (score == 0) ? 1 : 0;
   if (is_exchange != target->exchange) {
     return false;
   }
@@ -276,7 +275,7 @@ static inline uint32_t required_bitmap_for_target(const ForceTarget *target) {
 bool force_target_matches_bag(const ForceTarget *target,
                               const Rack *pre_move_rack,
                               int leave_length, LeaveType leave_type,
-                              int score, int diff,
+                              int is_exchange, int diff,
                               const LetterDistribution *ld) {
   if (atomic_load_explicit(&target->deficit, memory_order_relaxed) <= 0) {
     return false;
@@ -287,7 +286,6 @@ bool force_target_matches_bag(const ForceTarget *target,
   if (leave_length != target->leave_length) {
     return false;
   }
-  int is_exchange = (score == 0) ? 1 : 0;
   if (is_exchange != target->exchange) {
     return false;
   }

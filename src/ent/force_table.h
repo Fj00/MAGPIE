@@ -164,18 +164,21 @@ uint32_t *force_table_lookup_bitmaps_by_shape(ForceTable *table, int bag,
 // for type classification, but counted as a distinct tile '?' for subleave
 // matching).
 bool force_target_matches(const ForceTarget *target, const Rack *leave,
-                          int score, int diff);
+                          int is_exchange, int diff);
 
 // BAG_TILE matcher: checks whether the player's pre-move RACK satisfies
 // the target's `_free` predicate (rack lacks at least one of the target's
 // tile, so unseen_tile > 0). Same (leave_length, exchange, type, diff)
 // gates as `force_target_matches`; uses the leave's classification (passed
 // by caller via the leave's length and the LeaveType pre-classified).
-// `ld` is needed to look up TILE_BAG[tile] for the count check.
+// `is_exchange` is the caller's authoritative exchange flag (derived
+// from action_kind, not score) — a 0-scoring play (e.g. 2 blanks for 0
+// points) must still match exchange=0 cells. `ld` is needed to look up
+// TILE_BAG[tile] for the count check.
 bool force_target_matches_bag(const ForceTarget *target,
                               const Rack *pre_move_rack,
                               int leave_length, LeaveType leave_type,
-                              int score, int diff,
+                              int is_exchange, int diff,
                               const LetterDistribution *ld);
 
 // Decrement a target's deficit. If the deficit transitions from 1 to 0,

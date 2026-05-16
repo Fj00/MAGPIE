@@ -2080,7 +2080,7 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
             continue;
           }
           if (force_target_matches_bag(s->cold, player_rack, leave_len,
-                                       ltype_snap, snap_score, eff_diff_snap,
+                                       ltype_snap, is_exch_snap, eff_diff_snap,
                                        ld_eb)) {
             game_runner->eb_snap_bag_targets[slot][bag_n++] = s->cold;
           }
