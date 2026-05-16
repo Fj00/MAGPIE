@@ -1030,9 +1030,6 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
   int rows_written = 0;
   for (int i = 0; i < table->num_targets; i++) {
     const ForceTarget *t = &table->targets[i];
-    if (t->deficit <= 0) {
-      continue;
-    }
     char subleave[8] = {0};  // up to "<TILE>_free" = 6 + null
     if (t->kind == FORCE_TARGET_BAG_TILE) {
       const char tile_ch = (t->subleave_mls[0] == 0)
