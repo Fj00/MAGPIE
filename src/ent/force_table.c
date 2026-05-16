@@ -764,11 +764,9 @@ ForceTable *force_table_create(const char *csv_path,
       t->stratum_per_side = (int32_t)target_total;
       atomic_store_explicit(&t->deficit, 2 * target_total,
                             memory_order_relaxed);
-      t->original_deficit = 2 * target_total;
     } else {
       t->stratum_per_side = 0;
       atomic_store_explicit(&t->deficit, deficit, memory_order_relaxed);
-      t->original_deficit = deficit;
     }
     t->diff_min = diff_min;
     t->diff_max = diff_max;

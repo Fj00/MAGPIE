@@ -289,11 +289,8 @@ bool play_index_get_play(const PlayIndex *idx, uint32_t play_id,
   return true;
 }
 
-// Score a play_id by Σ (deficit / supply) × (deficit / original_deficit)
-// over its cell_ids. Rarity-weighted with a deficit-progress multiplier
-// so cells with no drain yet (ratio = 1.0) outrank partly-drained cells
-// (ratio < 1.0). Smooths the orphan-cell starvation without a binary
-// cliff. Returns 0.0 for plays covering only drained cells.
+// Score a play_id by Σ (deficit / supply) over its cell_ids — rarity
+// weighted. Returns 0.0 for plays covering only drained cells.
 static double score_play(const PlayIndex *idx, uint32_t play_id) {
   PlayRecord pr;
   if (!play_index_get_play(idx, play_id, &pr)) return 0.0;
@@ -303,10 +300,7 @@ static double score_play(const PlayIndex *idx, uint32_t play_id) {
     ForceTarget *t = idx->cell_to_target[cid];
     if (!t) continue;
     int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
-    if (d <= 0) continue;
-    double progress = (t->original_deficit > 0)
-        ? (double)d / (double)t->original_deficit : 1.0;
-    score += (double)d * (double)idx->inv_supply[cid] * progress;
+    if (d > 0) score += (double)d * (double)idx->inv_supply[cid];
   }
   return score;
 }
@@ -479,9 +473,7 @@ static double score_play_outcome(const PlayIndex *idx,
     if (!t) continue;
     int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
     if (d <= 0) continue;
-    double progress = (t->original_deficit > 0)
-        ? (double)d / (double)t->original_deficit : 1.0;
-    double base = (double)d * progress;
+    double base = (double)d;
     if (have_prior && t->stratum_per_side > 0) {
       uint32_t obs_w = 0, obs_l = 0;
       force_table_get_stratum_wl_by_ptr(idx->force_table, t, &obs_w, &obs_l);
