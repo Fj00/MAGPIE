@@ -2842,51 +2842,17 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
     int n_sigs = 0;
     int slot = 1;
 
-    // Targeted-play fanout: build a set of sigs that the play_index
-    // says are deficit-rich for this rack at the current threshold.
-    // Plays whose sig is in this set are added to the fanout in
-    // addition to all exchanges + the top-equity play. Plays not in
-    // the set (and not top-equity) are skipped — that's the savings.
-    enum { MAX_TARGETED = 32 };
-    static _Thread_local char targeted_sig[MAX_TARGETED][SIG_LEN];
-    int n_targeted = 0;
-    bool targeted_filter_active = false;
-    if (w->shared_data->play_index != NULL && gr->eb_target_rack_id >= 0) {
-      const PlayIndex *pi = w->shared_data->play_index;
-      const ForceTable *ft = w->shared_data->force_table;
-      // Linear threshold decay: 0.01 at completion=0, 0.0 at completion=1.
-      double thr = 0.01;
-      if (ft && w->shared_data->initial_total_deficit > 0) {
-        const int64_t cur = force_table_total_remaining(ft);
-        double comp = 1.0 - ((double)cur /
-                             (double)w->shared_data->initial_total_deficit);
-        if (comp < 0.0) comp = 0.0;
-        if (comp > 1.0) comp = 1.0;
-        thr = 0.01 * (1.0 - comp);
-      }
-      uint32_t pids[MAX_TARGETED];
-      int npicked = play_index_pick_targeted_plays(
-          pi, (uint32_t)gr->eb_target_rack_id, thr, MAX_TARGETED, pids);
-      for (int t = 0; t < npicked && n_targeted < MAX_TARGETED; t++) {
-        PlayRecord pr;
-        if (!play_index_get_play(pi, pids[t], &pr)) continue;
-        if (pr.action_kind != 2) continue;  // play moves only
-        char leave_buf[RACK_SIZE + 2] = {0};
-        int ll = (pr.leave_len < RACK_SIZE) ? pr.leave_len : RACK_SIZE;
-        memcpy(leave_buf, pr.leave_str, ll);
-        snprintf(targeted_sig[n_targeted], SIG_LEN, "P%d|%s",
-                 pr.score, leave_buf);
-        n_targeted++;
-      }
-      targeted_filter_active = true;
-    }
+    // Targeted-play fanout REMOVED — every distinct (action_type, score,
+    // leave) play now enters the slot list (capped only by EB_MAX_ACTIONS).
+    // Was: top-32 by deficit-coverage score, which left ~800 force-table
+    // cells permanently unmatched because their plays didn't bubble into
+    // any rack's top-32.
 
     for (int phase = 0; phase < 2 && slot < EB_MAX_ACTIONS; phase++) {
       const game_event_t kind = (phase == 0)
           ? GAME_EVENT_EXCHANGE
           : GAME_EVENT_TILE_PLACEMENT_MOVE;
       if (kind == GAME_EVENT_TILE_PLACEMENT_MOVE && !has_play) continue;
-      bool first_play_added = false;
       for (int m = 0; m < n_moves && slot < EB_MAX_ACTIONS; m++) {
         Move *cand = move_list_get_move(ml, m);
         if (move_get_type(cand) != kind) continue;
@@ -2903,23 +2869,18 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
           if (strcmp(slot_sig[k], sig) == 0) { dup = true; break; }
         }
         if (dup) continue;
-        // For TILE_PLACEMENT plays under the play_index targeted filter:
-        // include only the first distinct play (top-equity) PLUS plays
-        // whose sig matches the targeted set. Skip everything else.
-        if (kind == GAME_EVENT_TILE_PLACEMENT_MOVE &&
-            targeted_filter_active && first_play_added) {
-          bool match = false;
-          for (int k = 0; k < n_targeted; k++) {
-            if (strcmp(targeted_sig[k], sig) == 0) { match = true; break; }
-          }
-          if (!match) continue;
-        }
+        // Targeted-play filter REMOVED: include every distinct
+        // (action_type, score, leave) play. The previous top-32 cap
+        // caused ~800 force-table cells to never be matched at runtime
+        // because their plays didn't bubble into per-rack top-32 by
+        // deficit-coverage score. Slot count rises from ~32 to ~166
+        // (per the empirical max comment above) — ~5x compute hit at
+        // TARGET turn but every active cell gets a matching play.
         memcpy(slot_sig[n_sigs++], sig, SIG_LEN);
         move_copy(gr->eb_action_buf[slot], cand);
         gr->eb_action_present[slot] = true;
         if (kind == GAME_EVENT_TILE_PLACEMENT_MOVE) {
           if (play_slot < 0) play_slot = slot;
-          first_play_added = true;
         }
         if (slot > max_slot) max_slot = slot;
         slot++;
