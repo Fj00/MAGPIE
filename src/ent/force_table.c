@@ -752,6 +752,7 @@ ForceTable *force_table_create(const char *csv_path,
     t->subleave_count = 0;
     t->subleave_mls[0] = 0;
     t->subleave_mls[1] = 0;
+    atomic_store_explicit(&t->credit_attempts, 0, memory_order_relaxed);
     // For STRATUM cells: reinterpret CSV `target` (column 8) as per-side
     // threshold T. Cell needs total_wins >= T AND total_losses >= T.
     // Initial in-memory deficit = 2T (one unit per side per event needed).
