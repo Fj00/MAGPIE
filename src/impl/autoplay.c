@@ -2853,20 +2853,12 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
     bool targeted_filter_active = false;
     if (w->shared_data->play_index != NULL && gr->eb_target_rack_id >= 0) {
       const PlayIndex *pi = w->shared_data->play_index;
-      const ForceTable *ft = w->shared_data->force_table;
-      // Linear threshold decay: 0.01 at completion=0, 0.0 at completion=1.
-      double thr = 0.01;
-      if (ft && w->shared_data->initial_total_deficit > 0) {
-        const int64_t cur = force_table_total_remaining(ft);
-        double comp = 1.0 - ((double)cur /
-                             (double)w->shared_data->initial_total_deficit);
-        if (comp < 0.0) comp = 0.0;
-        if (comp > 1.0) comp = 1.0;
-        thr = 0.01 * (1.0 - comp);
-      }
+      // Threshold = strictly positive: skip score=0 plays (cover only
+      // drained cells) but include every play touching at least one
+      // active cell. Top-MAX_TARGETED cap still limits compute.
       uint32_t pids[MAX_TARGETED];
       int npicked = play_index_pick_targeted_plays(
-          pi, (uint32_t)gr->eb_target_rack_id, thr, MAX_TARGETED, pids);
+          pi, (uint32_t)gr->eb_target_rack_id, 0.0, MAX_TARGETED, pids);
       for (int t = 0; t < npicked && n_targeted < MAX_TARGETED; t++) {
         PlayRecord pr;
         if (!play_index_get_play(pi, pids[t], &pr)) continue;
