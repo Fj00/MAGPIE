@@ -190,6 +190,10 @@ typedef struct AutoplaySharedData {
   // Cached at startup from force_table_total_remaining; the denominator
   // for the completion ratio. Stays constant once set.
   int64_t initial_total_deficit;
+  // Phase 4: late-stage targeted scheduler. When true, EB target-turn
+  // injection skips category sampling and calls
+  // play_index_pick_starved_rack instead. Set via MAGPIE_EB_LATE_STAGE=1.
+  bool eb_late_stage;
   EmptyBoardRecorder *empty_board_recorder;
   EmptyBoardStrataRecorder *empty_board_strata_recorder;
   // Slice 2: K-way fork branching at empty-board cycle-alive turns. Activated
@@ -777,6 +781,19 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
             "outcome_priors: %d buckets loaded, lambda=%.3f\n",
             outcome_priors_num_buckets(shared_data->outcome_priors),
             shared_data->outcome_priors_lambda);
+  }
+
+  // Phase 4: late-stage targeted scheduler flag. Requires play_index.
+  shared_data->eb_late_stage = false;
+  const char *late_stage_env = getenv("MAGPIE_EB_LATE_STAGE");
+  if (late_stage_env && late_stage_env[0] == '1') {
+    if (shared_data->play_index) {
+      shared_data->eb_late_stage = true;
+      fprintf(stderr, "eb_late_stage: ON (cell-driven targeted picker)\n");
+    } else {
+      fprintf(stderr,
+              "eb_late_stage: requested but play_index not loaded; ignoring\n");
+    }
   }
 
   // Phase 2 baseline: task-driven T6-from-scratch mode.
@@ -3195,6 +3212,21 @@ static void inject_target_turn_rack_by_category(
     AutoplayWorker *w, GameRunner *gr, uint64_t seed) {
   const int p = game_get_player_on_turn_index(gr->game);
   if (p != w->shared_data->rare_target_player) return;
+
+  // Phase 4: late-stage targeted mode bypasses the category sampler
+  // entirely. Pick a starved cell, then a rack reaching it. DFS at
+  // the recording turn enumerates plays via play_index_pick_targeted_plays
+  // which includes the starved cell's play since deficit>0.
+  if (w->shared_data->eb_late_stage && w->shared_data->play_index) {
+    uint32_t rid = 0;
+    const char *target = play_index_pick_starved_rack(
+        w->shared_data->play_index, seed, &rid);
+    if (target) {
+      gr->eb_target_rack_id = (int64_t)rid;
+      swap_player_rack(gr->game, p, target);
+    }
+    return;
+  }
 
   // Compute current rare_frac via the adaptive ramp. Reading the deficit
   // is O(num_targets) and runs once per recorded T6 game (~1/game) — a

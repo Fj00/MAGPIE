@@ -622,6 +622,74 @@ const char *play_index_sample_rack_outcome_aware(const PlayIndex *idx,
   return idx->racks + (size_t)pr.rack_id * RACK_BYTES;
 }
 
+// Phase 4: pick a starved cell weighted by deficit (+ STRATUM skew
+// bonus), then return the rack of a uniformly-chosen play that covers
+// it. Single linear pass over cells plus one bounded read; ~µs/call.
+const char *play_index_pick_starved_rack(const PlayIndex *idx,
+                                          uint64_t seed,
+                                          uint32_t *out_rack_id) {
+  // 1) Cumulative-weight pass to pick a cell. Weight =
+  //      deficit * (1 + |W-L|/per_side)  for STRATUM
+  //      deficit                          otherwise
+  double total_w = 0.0;
+  for (uint32_t cid = 0; cid < idx->num_cells; cid++) {
+    ForceTarget *t = idx->cell_to_target[cid];
+    if (!t) continue;
+    int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
+    if (d <= 0) continue;
+    double w = (double)d;
+    if (t->kind == FORCE_TARGET_STRATUM && t->stratum_per_side > 0) {
+      uint32_t obs_w = 0, obs_l = 0;
+      force_table_get_stratum_wl_by_ptr(idx->force_table, t, &obs_w, &obs_l);
+      int diff = (int)obs_w - (int)obs_l;
+      if (diff < 0) diff = -diff;
+      if (diff > t->stratum_per_side) diff = t->stratum_per_side;
+      w *= 1.0 + (double)diff / (double)t->stratum_per_side;
+    }
+    total_w += w;
+  }
+  if (total_w <= 0.0) return NULL;
+
+  uint64_t h = seed * 0x9e3779b97f4a7c15ULL + 0xc6bc279692b5c323ULL;
+  double r = ((double)(h >> 11)) / (double)(1ULL << 53);  // [0,1)
+  double pick = r * total_w;
+
+  uint32_t picked_cid = UINT32_MAX;
+  double acc = 0.0;
+  for (uint32_t cid = 0; cid < idx->num_cells; cid++) {
+    ForceTarget *t = idx->cell_to_target[cid];
+    if (!t) continue;
+    int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
+    if (d <= 0) continue;
+    double w = (double)d;
+    if (t->kind == FORCE_TARGET_STRATUM && t->stratum_per_side > 0) {
+      uint32_t obs_w = 0, obs_l = 0;
+      force_table_get_stratum_wl_by_ptr(idx->force_table, t, &obs_w, &obs_l);
+      int diff = (int)obs_w - (int)obs_l;
+      if (diff < 0) diff = -diff;
+      if (diff > t->stratum_per_side) diff = t->stratum_per_side;
+      w *= 1.0 + (double)diff / (double)t->stratum_per_side;
+    }
+    acc += w;
+    if (acc >= pick) { picked_cid = cid; break; }
+  }
+  if (picked_cid == UINT32_MAX) return NULL;
+
+  // 2) Uniform-random play from plays_by_cell[picked_cid] for the rack.
+  uint64_t lo = idx->cell_play_off[picked_cid];
+  uint64_t hi = idx->cell_play_off[picked_cid + 1];
+  uint64_t cnt = hi - lo;
+  if (cnt == 0) return NULL;
+  uint64_t h2 = h * 0xbf58476d1ce4e5b9ULL + 0x94d049bb133111ebULL;
+  uint64_t i = h2 % cnt;
+  uint32_t pid = idx->plays_by_cell[lo + i];
+
+  PlayRecord pr;
+  if (!play_index_get_play(idx, pid, &pr)) return NULL;
+  if (out_rack_id) *out_rack_id = pr.rack_id;
+  return idx->racks + (size_t)pr.rack_id * RACK_BYTES;
+}
+
 int play_index_lookup_rack_id(const PlayIndex *idx, const char *rack_str) {
   // Linear scan. Racks are not sorted in racks.bin (insertion order
   // from per-shard merge). Cold path; not perf-critical.
