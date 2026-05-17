@@ -299,12 +299,21 @@ bool force_target_matches_bag(const ForceTarget *target,
       return false;
     }
   }
-  // _free predicate: rack lacks at least one of target's tile.
-  // rack.count(t) < TILE_BAG[t] ⇒ unseen > 0 ⇒ bag_exp_t > 0.
+  // BAG_TILE predicate is split by subleave_mls[1]:
+  //   0       → "_free": rack.count(t) < TILE_BAG[t]
+  //   1..N+1  → exact count: rack.count(t) == (subleave_mls[1] - 1)
   const MachineLetter t = target->subleave_mls[0];
-  const int tile_bag_count = ld_get_dist(ld, t);
-  if (pre_move_rack->array[t] >= tile_bag_count) {
-    return false;
+  const int count_marker = target->subleave_mls[1];
+  if (count_marker == 0) {
+    const int tile_bag_count = ld_get_dist(ld, t);
+    if (pre_move_rack->array[t] >= tile_bag_count) {
+      return false;
+    }
+  } else {
+    const int required_count = count_marker - 1;
+    if (pre_move_rack->array[t] != required_count) {
+      return false;
+    }
   }
   return true;
 }
@@ -631,6 +640,11 @@ ForceTarget *force_table_lookup_target_by_key(
     if (t->subleave_count != subleave_count) continue;
     if (subleave_count >= 1 && t->subleave_mls[0] != sub_ml0) continue;
     if (subleave_count >= 2 && t->subleave_mls[1] != sub_ml1) continue;
+    // For BAG_TILE cells, subleave_mls[1] encodes the count marker
+    // (0 = "_free", N+1 = exact count N). Match it even though
+    // subleave_count is 1 for bag_tile.
+    if (kind == FORCE_TARGET_BAG_TILE &&
+        t->subleave_mls[1] != sub_ml1) continue;
     if (diff < t->diff_min || diff > t->diff_max) continue;
     return t;
   }
@@ -802,21 +816,24 @@ ForceTable *force_table_create(const char *csv_path,
         continue;
       }
     } else if (kind == FORCE_TARGET_BAG_TILE) {
-      // Expected format: "<TILE>_free" — single tile char + "_free" suffix.
-      // The "_free" semantics: cell credits when the rack LACKS at least
-      // one of this tile (unseen > 0). The "_held" complement is not
-      // needed (handled by bucket merging when impossible, dominant by
-      // default when possible).
+      // Subleave format: "<TILE>_free" OR "<TILE>_<N>" where N is a digit.
+      //   "<TILE>_free" — fires when rack LACKS at least one of this tile
+      //                   (unseen > 0). Predicate: rack.count(t) < TILE_BAG[t].
+      //   "<TILE>_<N>"  — fires when rack has exactly N of this tile.
+      //                   Used for V-model bag_eq_t_c indicators (TILE_BAG=2
+      //                   tiles, primarily blank). Predicate: rack.count(t)==N.
+      //
+      // Encoding: subleave_mls[0] = tile ML. subleave_mls[1] encodes the
+      // count requirement:
+      //   subleave_mls[1] == 0  → "_free" (any count below TILE_BAG[t])
+      //   subleave_mls[1] >= 1  → exact count = (subleave_mls[1] - 1)
+      // (Old data with sub_ml1 = 0 is interpreted as "_free", which is
+      // backward-compatible: no existing bag_tile cell ever set sub_ml1.)
       const size_t sl_len = strlen(subleave);
-      if (sl_len < 6 || strcmp(subleave + sl_len - 5, "_free") != 0) {
+      // Require "<X>_<something>" with at least 3 chars total.
+      if (sl_len < 3 || subleave[1] != '_') {
         log_warn("force_table: bad bag_tile subleave %s on line %d "
-                 "(expected '<TILE>_free')", subleave, line_no);
-        table->num_targets--;
-        continue;
-      }
-      if (sl_len != 6) { // single tile char + "_free"
-        log_warn("force_table: bag_tile subleave %s must be 1 tile char + "
-                 "'_free' on line %d", subleave, line_no);
+                 "(expected '<TILE>_free' or '<TILE>_<N>')", subleave, line_no);
         table->num_targets--;
         continue;
       }
@@ -825,6 +842,25 @@ ForceTable *force_table_create(const char *csv_path,
       if (t->subleave_mls[0] == 0xFF) {
         log_warn("force_table: unknown bag_tile %s on line %d", subleave,
                  line_no);
+        table->num_targets--;
+        continue;
+      }
+      const char *suffix = subleave + 2;  // after "X_"
+      if (strcmp(suffix, "free") == 0) {
+        t->subleave_mls[1] = 0;  // "free" semantics
+      } else if (suffix[0] >= '0' && suffix[0] <= '9' && suffix[1] == '\0') {
+        int n = suffix[0] - '0';
+        if (n > 6) {
+          log_warn("force_table: bag_tile count %d out of range on line %d",
+                   n, line_no);
+          table->num_targets--;
+          continue;
+        }
+        t->subleave_mls[1] = (MachineLetter)(n + 1);  // encode as N+1
+      } else {
+        log_warn("force_table: bad bag_tile subleave %s on line %d "
+                 "(expected '<TILE>_free' or '<TILE>_<digit>')",
+                 subleave, line_no);
         table->num_targets--;
         continue;
       }
