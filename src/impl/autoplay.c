@@ -198,10 +198,10 @@ typedef struct AutoplaySharedData {
   // worker reads stay safe across the one-shot transition.
   _Atomic bool eb_late_stage;
   // Auto-switch threshold: when (credits_landed_per_window / window_size)
-  // < threshold, flip eb_late_stage on. 0.05 = 5K credits per 100K games
-  // (broad is producing less than 1 useful credit per 20 games — late-
-  // stage's targeted picker gives ~9.5 credits/game by construction).
-  // 0.0 disables auto-switch. Override via MAGPIE_EB_AUTO_LATE_THRESHOLD.
+  // < threshold, flip eb_late_stage on. 0.0 disables auto-switch (C
+  // default). Set via MAGPIE_EB_AUTO_LATE_THRESHOLD — the launcher
+  // script `launch_eb_run.sh` owns the policy (default 1.0 = trip when
+  // broad falls to about late-stage's own per-game credit rate).
   double eb_auto_late_threshold;
   EmptyBoardRecorder *empty_board_recorder;
   EmptyBoardStrataRecorder *empty_board_strata_recorder;
@@ -795,7 +795,10 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   // Phase 4: late-stage targeted scheduler flag. Requires play_index.
   atomic_store_explicit(&shared_data->eb_late_stage, false,
                         memory_order_relaxed);
-  shared_data->eb_auto_late_threshold = 0.05;  // default trigger
+  // Threshold policy lives in the launcher (launch_eb_run.sh sets
+  // MAGPIE_EB_AUTO_LATE_THRESHOLD). C default = 0 (disabled). When run
+  // bare without the launcher, no auto-switch unless the env var is set.
+  shared_data->eb_auto_late_threshold = 0.0;
   const char *late_stage_env = getenv("MAGPIE_EB_LATE_STAGE");
   if (late_stage_env && late_stage_env[0] == '1') {
     if (shared_data->play_index) {
