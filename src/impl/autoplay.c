@@ -192,8 +192,17 @@ typedef struct AutoplaySharedData {
   int64_t initial_total_deficit;
   // Phase 4: late-stage targeted scheduler. When true, EB target-turn
   // injection skips category sampling and calls
-  // play_index_pick_starved_rack instead. Set via MAGPIE_EB_LATE_STAGE=1.
-  bool eb_late_stage;
+  // play_index_pick_starved_rack instead. Set via MAGPIE_EB_LATE_STAGE=1
+  // (force-on at startup) or flipped by the auto-switch trigger when
+  // broad efficiency drops below eb_auto_late_threshold. Atomic so
+  // worker reads stay safe across the one-shot transition.
+  _Atomic bool eb_late_stage;
+  // Auto-switch threshold: when (credits_landed_per_window / window_size)
+  // < threshold, flip eb_late_stage on. 0.05 = 5K credits per 100K games
+  // (broad is producing less than 1 useful credit per 20 games — late-
+  // stage's targeted picker gives ~9.5 credits/game by construction).
+  // 0.0 disables auto-switch. Override via MAGPIE_EB_AUTO_LATE_THRESHOLD.
+  double eb_auto_late_threshold;
   EmptyBoardRecorder *empty_board_recorder;
   EmptyBoardStrataRecorder *empty_board_strata_recorder;
   // Slice 2: K-way fork branching at empty-board cycle-alive turns. Activated
@@ -784,16 +793,31 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   }
 
   // Phase 4: late-stage targeted scheduler flag. Requires play_index.
-  shared_data->eb_late_stage = false;
+  atomic_store_explicit(&shared_data->eb_late_stage, false,
+                        memory_order_relaxed);
+  shared_data->eb_auto_late_threshold = 0.05;  // default trigger
   const char *late_stage_env = getenv("MAGPIE_EB_LATE_STAGE");
   if (late_stage_env && late_stage_env[0] == '1') {
     if (shared_data->play_index) {
-      shared_data->eb_late_stage = true;
+      atomic_store_explicit(&shared_data->eb_late_stage, true,
+                            memory_order_relaxed);
       fprintf(stderr, "eb_late_stage: ON (cell-driven targeted picker)\n");
     } else {
       fprintf(stderr,
               "eb_late_stage: requested but play_index not loaded; ignoring\n");
     }
+  }
+  const char *auto_thr_env = getenv("MAGPIE_EB_AUTO_LATE_THRESHOLD");
+  if (auto_thr_env && auto_thr_env[0] != '\0') {
+    shared_data->eb_auto_late_threshold = atof(auto_thr_env);
+  }
+  if (shared_data->play_index &&
+      !atomic_load_explicit(&shared_data->eb_late_stage,
+                            memory_order_relaxed) &&
+      shared_data->eb_auto_late_threshold > 0.0) {
+    fprintf(stderr,
+            "eb_auto_late_switch: armed (threshold=%.4f credits/game)\n",
+            shared_data->eb_auto_late_threshold);
   }
 
   // Phase 2 baseline: task-driven T6-from-scratch mode.
@@ -2165,6 +2189,29 @@ void print_current_status(AutoplayWorker *autoplay_worker,
     ForceCounters fc;
     force_table_get_counters(&fc);
     force_table_reset_counters();
+
+    // Phase 4 auto-switch: if broad efficiency drops below threshold,
+    // flip eb_late_stage on. One-shot — once on, never off. Requires
+    // play_index loaded (late-stage picker needs it).
+    if (shared_data->play_index &&
+        shared_data->eb_auto_late_threshold > 0.0 &&
+        shared_data->print_interval > 0 &&
+        !atomic_load_explicit(&shared_data->eb_late_stage,
+                              memory_order_relaxed)) {
+      const double window_games = (double)shared_data->print_interval;
+      const double broad_eff = (double)fc.decrements_landed / window_games;
+      if (broad_eff < shared_data->eb_auto_late_threshold) {
+        atomic_store_explicit(&shared_data->eb_late_stage, true,
+                              memory_order_release);
+        fprintf(stderr,
+                "eb_auto_late_switch: TRIGGERED at game %llu — "
+                "broad_eff=%.4f credits/game < %.4f threshold; "
+                "switching to cell-driven targeted picker\n",
+                (unsigned long long)iter_completed_output->iter_count_completed,
+                broad_eff,
+                shared_data->eb_auto_late_threshold);
+      }
+    }
     const uint64_t leaves =
         atomic_exchange_explicit(&g_eb_leaves_emitted, 0,
                                  memory_order_relaxed);
@@ -3217,7 +3264,9 @@ static void inject_target_turn_rack_by_category(
   // entirely. Pick a starved cell, then a rack reaching it. DFS at
   // the recording turn enumerates plays via play_index_pick_targeted_plays
   // which includes the starved cell's play since deficit>0.
-  if (w->shared_data->eb_late_stage && w->shared_data->play_index) {
+  if (atomic_load_explicit(&w->shared_data->eb_late_stage,
+                           memory_order_relaxed) &&
+      w->shared_data->play_index) {
     uint32_t rid = 0;
     const char *target = play_index_pick_starved_rack(
         w->shared_data->play_index, seed, &rid);
