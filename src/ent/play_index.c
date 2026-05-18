@@ -336,8 +336,22 @@ static double cell_priority(const PlayIndex *idx, uint32_t cid) {
   if (!t) return 0.0;
   int64_t d = atomic_load_explicit(&t->deficit, memory_order_relaxed);
   if (d <= 0) return 0.0;
-  double base = (t->original_deficit > 0)
+  // Active-cell floor: ANY cell with deficit > 0 gets a fixed baseline
+  // priority so the downstream score_play() ranking can SEE it. Without
+  // this, target-size-dependent ratios (deficit/original_deficit) hide
+  // near-drained cells under the picker's threshold — e.g. a PAIR cell
+  // at deficit=2 of original=100 (N=10) had base=0.02, low enough that
+  // its play never made the DFS top-32 from the forced rack, so the cell
+  // never got credited in late-stage. Phase 4's N=10 run stalled with 468
+  // deficit because of this. Floor of 0.5 ensures any active cell's play
+  // beats any all-drained play, regardless of how close to drained it is.
+  // Fine-grained differentiation between active cells is still preserved
+  // by the additive `base * 0.5` term below (a deficit=100 cell scores
+  // 0.5 + 0.5 = 1.0; deficit=2 of 100 scores 0.5 + 0.01 = 0.51).
+  double base_ratio = (t->original_deficit > 0)
       ? (double)d / (double)t->original_deficit : 1.0;
+  if (base_ratio > 1.0) base_ratio = 1.0;
+  double base = 0.5 + 0.5 * base_ratio;  // [0.5, 1.0] for any active cell
   double rarity = (double)idx->rarity[cid];
   if (t->kind == FORCE_TARGET_STRATUM && t->stratum_per_side > 0) {
     uint32_t obs_w = 0, obs_l = 0;
