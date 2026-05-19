@@ -1066,9 +1066,20 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
     const ForceTarget *t = &table->targets[i];
     char subleave[8] = {0};  // up to "<TILE>_free" = 6 + null
     if (t->kind == FORCE_TARGET_BAG_TILE) {
+      // subleave_mls[1] encoding (see load path):
+      //   0       → "_free" (rack lacks the tile)
+      //   N+1     → exact count = N (V-model bag_eq_t_N indicators)
+      // Must round-trip both forms; emitting "_free" for per-count cells
+      // collapses X_0/X_1/X_2 into X_free at resume, reverting drained
+      // per-count cells to their full N×EPV target.
       const char tile_ch = (t->subleave_mls[0] == 0)
                                ? '?' : ld->ld_ml_to_hl[t->subleave_mls[0]][0];
-      snprintf(subleave, sizeof(subleave), "%c_free", tile_ch);
+      if (t->subleave_mls[1] == 0) {
+        snprintf(subleave, sizeof(subleave), "%c_free", tile_ch);
+      } else {
+        snprintf(subleave, sizeof(subleave), "%c_%d", tile_ch,
+                 t->subleave_mls[1] - 1);
+      }
     } else {
       if (t->subleave_count >= 1) {
         subleave[0] = (t->subleave_mls[0] == 0) ? '?' :
@@ -1161,10 +1172,22 @@ int force_table_resume_from_dump(ForceTable *table, const char *csv_path,
     MachineLetter sub_ml0 = 0, sub_ml1 = 0;
     int subleave_count = 0;
     if (kind == FORCE_TARGET_BAG_TILE) {
-      // Format: "<TILE>_free"
+      // Format: "<TILE>_free" OR "<TILE>_<N>" (single digit). Mirror the
+      // load-time encoding in force_table_create: sub_ml1 == 0 for "_free",
+      // sub_ml1 == N+1 for exact count N. subleave_count stays 1.
       if (subleave[0]) {
         sub_ml0 = (subleave[0] == '?') ? 0 : char_to_ml(ld, subleave[0]);
         subleave_count = 1;
+        const size_t sl_len = strlen(subleave);
+        if (sl_len >= 3 && subleave[1] == '_') {
+          const char *suffix = subleave + 2;
+          if (strcmp(suffix, "free") == 0) {
+            sub_ml1 = 0;
+          } else if (suffix[0] >= '0' && suffix[0] <= '9' &&
+                     suffix[1] == '\0') {
+            sub_ml1 = (MachineLetter)((suffix[0] - '0') + 1);
+          }
+        }
       }
     } else {
       if (subleave[0]) {
