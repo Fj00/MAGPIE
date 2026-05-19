@@ -14,11 +14,17 @@ typedef enum {
   FORCE_TARGET_STRATUM = 0,
   FORCE_TARGET_TILE = 1,
   FORCE_TARGET_PAIR = 2,
-  // BAG_TILE: cell credits when the player's pre-move RACK lacks at least
-  // one of the target's tile (rack.count(tile) < TILE_BAG[tile]). Drives
-  // the V model's `bag_exp_<tile>` feature variation in skewed buckets.
-  // CSV `subleave` field uses "<TILE>_free" format (e.g. "Z_free").
-  // Count-based decrement at game-end (same path as TILE/PAIR).
+  // BAG_TILE: cell credits when the BAG composition matches a predicate
+  // on the target's tile, defined relative to the player's pre-move rack:
+  //   "<TILE>_free"  → bag has ≥1 of tile  (= rack.count < TILE_BAG[tile])
+  //   "<TILE>_b<N>"  → bag has exactly N of tile (= rack.count ==
+  //                    TILE_BAG[tile] − N).  TILE_BAG=2 tiles only;
+  //                    drives the V model's `bag_eq_<TILE>_b<N>`
+  //                    indicator features.
+  // Drives the V model's `bag_exp_<tile>` continuous feature variation in
+  // skewed buckets (via _free cells) and the `bag_eq_*` indicator
+  // features (via _b<N> cells). Count-based decrement at game-end (same
+  // path as TILE/PAIR).
   FORCE_TARGET_BAG_TILE = 3,
 } ForceTargetKind;
 
@@ -167,10 +173,12 @@ bool force_target_matches(const ForceTarget *target, const Rack *leave,
                           int is_exchange, int diff);
 
 // BAG_TILE matcher: checks whether the player's pre-move RACK satisfies
-// the target's `_free` predicate (rack lacks at least one of the target's
-// tile, so unseen_tile > 0). Same (leave_length, exchange, type, diff)
-// gates as `force_target_matches`; uses the leave's classification (passed
-// by caller via the leave's length and the LeaveType pre-classified).
+// the target's predicate (bag-perspective):
+//   `_free`  → bag has ≥1 of tile (= rack lacks ≥1 of tile)
+//   `_b<N>`  → bag has exactly N of tile (= rack.count == TILE_BAG[t] - N)
+// Same (leave_length, exchange, type, diff) gates as
+// `force_target_matches`; uses the leave's classification (passed by
+// caller via the leave's length and the LeaveType pre-classified).
 // `is_exchange` is the caller's authoritative exchange flag (derived
 // from action_kind, not score) — a 0-scoring play (e.g. 2 blanks for 0
 // points) must still match exchange=0 cells. `ld` is needed to look up

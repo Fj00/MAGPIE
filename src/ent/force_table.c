@@ -299,19 +299,21 @@ bool force_target_matches_bag(const ForceTarget *target,
       return false;
     }
   }
-  // BAG_TILE predicate is split by subleave_mls[1]:
-  //   0       → "_free": rack.count(t) < TILE_BAG[t]
-  //   1..N+1  → exact count: rack.count(t) == (subleave_mls[1] - 1)
+  // BAG_TILE predicate is split by subleave_mls[1] (bag-perspective):
+  //   0       → "_free": bag has ≥1 of t  (= rack.count(t) < TILE_BAG[t])
+  //   1..N+1  → bag has exactly N of t   (= rack.count(t) ==
+  //             TILE_BAG[t] - N, where N = subleave_mls[1] - 1)
   const MachineLetter t = target->subleave_mls[0];
   const int count_marker = target->subleave_mls[1];
+  const int tile_bag_count = ld_get_dist(ld, t);
   if (count_marker == 0) {
-    const int tile_bag_count = ld_get_dist(ld, t);
     if (pre_move_rack->array[t] >= tile_bag_count) {
       return false;
     }
   } else {
-    const int required_count = count_marker - 1;
-    if (pre_move_rack->array[t] != required_count) {
+    const int required_bag_count = count_marker - 1;
+    const int required_rack_count = tile_bag_count - required_bag_count;
+    if (pre_move_rack->array[t] != required_rack_count) {
       return false;
     }
   }
@@ -816,24 +818,27 @@ ForceTable *force_table_create(const char *csv_path,
         continue;
       }
     } else if (kind == FORCE_TARGET_BAG_TILE) {
-      // Subleave format: "<TILE>_free" OR "<TILE>_<N>" where N is a digit.
-      //   "<TILE>_free" — fires when rack LACKS at least one of this tile
-      //                   (unseen > 0). Predicate: rack.count(t) < TILE_BAG[t].
-      //   "<TILE>_<N>"  — fires when rack has exactly N of this tile.
-      //                   Used for V-model bag_eq_t_c indicators (TILE_BAG=2
-      //                   tiles, primarily blank). Predicate: rack.count(t)==N.
+      // Subleave format (bag-perspective):
+      //   "<TILE>_free"  — fires when the BAG has ≥1 of TILE
+      //                    (= rack.count(t) < TILE_BAG[t]).
+      //   "<TILE>_b<N>"  — fires when the BAG has exactly N of TILE
+      //                    (= rack.count(t) == TILE_BAG[t] - N).
+      //                    Used for V-model bag_eq_t_bN indicators
+      //                    (TILE_BAG=2 tiles).
       //
       // Encoding: subleave_mls[0] = tile ML. subleave_mls[1] encodes the
-      // count requirement:
-      //   subleave_mls[1] == 0  → "_free" (any count below TILE_BAG[t])
-      //   subleave_mls[1] >= 1  → exact count = (subleave_mls[1] - 1)
-      // (Old data with sub_ml1 = 0 is interpreted as "_free", which is
-      // backward-compatible: no existing bag_tile cell ever set sub_ml1.)
+      // bag-count requirement:
+      //   subleave_mls[1] == 0  → "_free"
+      //   subleave_mls[1] >= 1  → bag count == (subleave_mls[1] - 1)
+      //
+      // The old rack-perspective format "<TILE>_<N>" (no 'b' marker) is
+      // intentionally rejected: any stale CSV must be regenerated with
+      // the current scripts to avoid silent semantic flip.
       const size_t sl_len = strlen(subleave);
       // Require "<X>_<something>" with at least 3 chars total.
       if (sl_len < 3 || subleave[1] != '_') {
         log_warn("force_table: bad bag_tile subleave %s on line %d "
-                 "(expected '<TILE>_free' or '<TILE>_<N>')", subleave, line_no);
+                 "(expected '<TILE>_free' or '<TILE>_b<N>')", subleave, line_no);
         table->num_targets--;
         continue;
       }
@@ -848,10 +853,11 @@ ForceTable *force_table_create(const char *csv_path,
       const char *suffix = subleave + 2;  // after "X_"
       if (strcmp(suffix, "free") == 0) {
         t->subleave_mls[1] = 0;  // "free" semantics
-      } else if (suffix[0] >= '0' && suffix[0] <= '9' && suffix[1] == '\0') {
-        int n = suffix[0] - '0';
+      } else if (suffix[0] == 'b' && suffix[1] >= '0' && suffix[1] <= '9'
+                 && suffix[2] == '\0') {
+        int n = suffix[1] - '0';
         if (n > 6) {
-          log_warn("force_table: bag_tile count %d out of range on line %d",
+          log_warn("force_table: bag_tile bag-count %d out of range on line %d",
                    n, line_no);
           table->num_targets--;
           continue;
@@ -859,7 +865,8 @@ ForceTable *force_table_create(const char *csv_path,
         t->subleave_mls[1] = (MachineLetter)(n + 1);  // encode as N+1
       } else {
         log_warn("force_table: bad bag_tile subleave %s on line %d "
-                 "(expected '<TILE>_free' or '<TILE>_<digit>')",
+                 "(expected '<TILE>_free' or '<TILE>_b<digit>'; the old "
+                 "rack-perspective '<TILE>_<N>' format is no longer accepted)",
                  subleave, line_no);
         table->num_targets--;
         continue;
@@ -1066,18 +1073,19 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
     const ForceTarget *t = &table->targets[i];
     char subleave[8] = {0};  // up to "<TILE>_free" = 6 + null
     if (t->kind == FORCE_TARGET_BAG_TILE) {
-      // subleave_mls[1] encoding (see load path):
-      //   0       → "_free" (rack lacks the tile)
-      //   N+1     → exact count = N (V-model bag_eq_t_N indicators)
-      // Must round-trip both forms; emitting "_free" for per-count cells
-      // collapses X_0/X_1/X_2 into X_free at resume, reverting drained
-      // per-count cells to their full N×EPV target.
+      // subleave_mls[1] encoding (see load path; bag-perspective):
+      //   0       → "_free" (bag has ≥1 of tile)
+      //   N+1     → bag has exactly N of tile (V-model bag_eq_t_bN
+      //             indicators)
+      // Round-trip via the "b<N>" text form so any stale CSV with the
+      // old rack-perspective "<N>" format gets rejected at re-load
+      // instead of silently swapping semantics.
       const char tile_ch = (t->subleave_mls[0] == 0)
                                ? '?' : ld->ld_ml_to_hl[t->subleave_mls[0]][0];
       if (t->subleave_mls[1] == 0) {
         snprintf(subleave, sizeof(subleave), "%c_free", tile_ch);
       } else {
-        snprintf(subleave, sizeof(subleave), "%c_%d", tile_ch,
+        snprintf(subleave, sizeof(subleave), "%c_b%d", tile_ch,
                  t->subleave_mls[1] - 1);
       }
     } else {
@@ -1172,9 +1180,11 @@ int force_table_resume_from_dump(ForceTable *table, const char *csv_path,
     MachineLetter sub_ml0 = 0, sub_ml1 = 0;
     int subleave_count = 0;
     if (kind == FORCE_TARGET_BAG_TILE) {
-      // Format: "<TILE>_free" OR "<TILE>_<N>" (single digit). Mirror the
-      // load-time encoding in force_table_create: sub_ml1 == 0 for "_free",
-      // sub_ml1 == N+1 for exact count N. subleave_count stays 1.
+      // Format (bag-perspective): "<TILE>_free" OR "<TILE>_b<N>". Mirror
+      // the load-time encoding in force_table_create: sub_ml1 == 0 for
+      // "_free", sub_ml1 == N+1 for bag count N. subleave_count stays 1.
+      // Old rack-perspective "<TILE>_<N>" (no 'b') is silently dropped
+      // here too — only "free" or "b<digit>" parse.
       if (subleave[0]) {
         sub_ml0 = (subleave[0] == '?') ? 0 : char_to_ml(ld, subleave[0]);
         subleave_count = 1;
@@ -1183,9 +1193,9 @@ int force_table_resume_from_dump(ForceTable *table, const char *csv_path,
           const char *suffix = subleave + 2;
           if (strcmp(suffix, "free") == 0) {
             sub_ml1 = 0;
-          } else if (suffix[0] >= '0' && suffix[0] <= '9' &&
-                     suffix[1] == '\0') {
-            sub_ml1 = (MachineLetter)((suffix[0] - '0') + 1);
+          } else if (suffix[0] == 'b' && suffix[1] >= '0' &&
+                     suffix[1] <= '9' && suffix[2] == '\0') {
+            sub_ml1 = (MachineLetter)((suffix[1] - '0') + 1);
           }
         }
       }
