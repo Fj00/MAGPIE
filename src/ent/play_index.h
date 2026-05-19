@@ -79,19 +79,20 @@ int play_index_pick_targeted_plays(const PlayIndex *idx,
                                    int max_n, uint32_t *out_play_ids);
 
 // Phase 4: late-stage targeted sampler. Picks a starved cell weighted
-// by remaining deficit (+ STRATUM skew bonus), then returns the rack
-// from a uniformly-chosen play in plays_by_cell[cell]. The DFS at the
-// recording turn enumerates plays from this rack via
-// play_index_pick_targeted_plays, which includes the play touching
-// the starved cell since its deficit>0. Result: ≥1 guaranteed credit
-// per game for the targeted cell + collateral for any other remaining
-// cells the rack happens to cover.
+// by remaining deficit (+ STRATUM skew bonus), then picks a uniform-
+// random play from plays_by_cell[cell] that covers it. Returns the rack
+// of that play and writes the picked play_id to *out_play_id so the
+// caller can force-include it in the DFS fanout set (otherwise the
+// score_play / cell_priority scoring at the recording turn can drop
+// the targeted play under sum-aggregation bias).
 //
 // Returns NULL when no cell has deficit>0 or the picked cell has no
-// plays. Writes the rack_id to *out_rack_id when non-NULL.
+// plays. Writes the rack_id to *out_rack_id and the play_id to
+// *out_play_id when non-NULL.
 const char *play_index_pick_starved_rack(const PlayIndex *idx,
                                           uint64_t seed,
-                                          uint32_t *out_rack_id);
+                                          uint32_t *out_rack_id,
+                                          uint32_t *out_play_id);
 
 // Resolve a rack string to its rack_id (linear scan; for the rare case
 // of needing the rack_id from outside the sample path).

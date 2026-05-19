@@ -641,7 +641,8 @@ const char *play_index_sample_rack_outcome_aware(const PlayIndex *idx,
 // it. Single linear pass over cells plus one bounded read; ~µs/call.
 const char *play_index_pick_starved_rack(const PlayIndex *idx,
                                           uint64_t seed,
-                                          uint32_t *out_rack_id) {
+                                          uint32_t *out_rack_id,
+                                          uint32_t *out_play_id) {
   // 1) Cumulative-weight pass to pick a cell. Weight =
   //      deficit * (1 + |W-L|/per_side)  for STRATUM
   //      deficit                          otherwise
@@ -701,6 +702,7 @@ const char *play_index_pick_starved_rack(const PlayIndex *idx,
   PlayRecord pr;
   if (!play_index_get_play(idx, pid, &pr)) return NULL;
   if (out_rack_id) *out_rack_id = pr.rack_id;
+  if (out_play_id) *out_play_id = pid;
   return idx->racks + (size_t)pr.rack_id * RACK_BYTES;
 }
 

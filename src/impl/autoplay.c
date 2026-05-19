@@ -1083,6 +1083,14 @@ typedef struct GameRunner {
   // when not from play_index). Consumed in eb_enumerate_actions to
   // build the targeted-play fanout slots.
   int64_t eb_target_rack_id;
+  // play_index play_id of the specific play picked by
+  // play_index_pick_starved_rack alongside the rack (or -1 when not in
+  // late-stage mode). Consumed in eb_enumerate_actions to force-include
+  // this play's sig in the fanout set so the scheduler's intent
+  // (drain this specific starved cell) survives the sum-aggregated
+  // score_play scoring that would otherwise drop it under bias toward
+  // plays covering many small-deficit cells.
+  int64_t eb_target_play_id;
   // Natural slot at the most recent enumerate_actions call: which slot
   // index HastyBot or force-pass would have chosen without DFS forcing.
   // -1 = no fork at this turn (or pass-cycle / opp-pass / etc. — non-fork).
@@ -1155,6 +1163,7 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
   game_runner->eb_p2_rack_source = 0;
   game_runner->eb_p2_force_kind = 0;
   game_runner->eb_target_rack_id = -1;
+  game_runner->eb_target_play_id = -1;
   game_runner->eb_natural_slot = -1;
   game_runner->eb_divergence_turn = -1;
   game_runner->eb_last_divergence_turn = -1;
@@ -2954,6 +2963,32 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
                  pr.score, leave_buf);
         n_targeted++;
       }
+      // Force-include the play picked by play_index_pick_starved_rack.
+      // pick_targeted_plays uses score_play's sum-of-cell_priority
+      // ranking, which at N=100 can drop a play covering a high-target
+      // stuck cell (low priority differential under the [0.5, 1.0]
+      // floor) below plays covering many small-deficit cells. Inserting
+      // the picked sig directly guarantees the scheduler's intent
+      // reaches the fanout. Pass/exchange targets are already in the
+      // fanout unconditionally, so we only handle action_kind==2.
+      if (gr->eb_target_play_id >= 0 && n_targeted < MAX_TARGETED) {
+        PlayRecord pr;
+        if (play_index_get_play(pi, (uint32_t)gr->eb_target_play_id,
+                                &pr) && pr.action_kind == 2) {
+          char leave_buf[RACK_SIZE + 2] = {0};
+          int ll = (pr.leave_len < RACK_SIZE) ? pr.leave_len : RACK_SIZE;
+          memcpy(leave_buf, pr.leave_str, ll);
+          char tsig[SIG_LEN];
+          snprintf(tsig, SIG_LEN, "P%d|%s", pr.score, leave_buf);
+          bool dup = false;
+          for (int t = 0; t < n_targeted; t++) {
+            if (strcmp(targeted_sig[t], tsig) == 0) { dup = true; break; }
+          }
+          if (!dup) {
+            memcpy(targeted_sig[n_targeted++], tsig, SIG_LEN);
+          }
+        }
+      }
       targeted_filter_active = true;
     }
 
@@ -3260,21 +3295,28 @@ static bool inject_target_turn_rack_for_category(
 // Only fires when the on-turn player matches rare_target_player.
 static void inject_target_turn_rack_by_category(
     AutoplayWorker *w, GameRunner *gr, uint64_t seed) {
+  // Reset per-call so stale values from the previous game don't leak
+  // into the consumer at eb_enumerate_actions. The late-stage path
+  // below sets play_id when it succeeds; other paths leave it at -1.
+  gr->eb_target_play_id = -1;
   const int p = game_get_player_on_turn_index(gr->game);
   if (p != w->shared_data->rare_target_player) return;
 
   // Phase 4: late-stage targeted mode bypasses the category sampler
-  // entirely. Pick a starved cell, then a rack reaching it. DFS at
-  // the recording turn enumerates plays via play_index_pick_targeted_plays
-  // which includes the starved cell's play since deficit>0.
+  // entirely. Pick a starved cell, then a rack reaching it, and capture
+  // the specific play_id covering that cell so eb_enumerate_actions can
+  // force-include it in the fanout (otherwise sum-aggregated score_play
+  // can drop the targeted play under bias toward many-small-cell plays).
   if (atomic_load_explicit(&w->shared_data->eb_late_stage,
                            memory_order_relaxed) &&
       w->shared_data->play_index) {
     uint32_t rid = 0;
+    uint32_t pid = 0;
     const char *target = play_index_pick_starved_rack(
-        w->shared_data->play_index, seed, &rid);
+        w->shared_data->play_index, seed, &rid, &pid);
     if (target) {
       gr->eb_target_rack_id = (int64_t)rid;
+      gr->eb_target_play_id = (int64_t)pid;
       swap_player_rack(gr->game, p, target);
     }
     return;
