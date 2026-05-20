@@ -1023,6 +1023,10 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   }
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
+  void vmodel_log_stats(void);  // defined later in this TU
+  if (shared_data->vmodel) {
+    vmodel_log_stats();
+  }
   vmodel_destroy(shared_data->vmodel);
   static_leaves_destroy(shared_data->vmodel_static_leaves);
   free(shared_data);
@@ -1766,6 +1770,24 @@ static int vmodel_extract_rack_indices(const Rack *rack, uint8_t *out_buf,
   return n;
 }
 
+// Diagnostic counters incremented every time vmodel fires. Atomic so
+// concurrent workers don't lose updates. Printed at shutdown via
+// vmodel_log_stats().
+static _Atomic uint64_t g_vmodel_total_calls   = 0;
+static _Atomic uint64_t g_vmodel_disagreements = 0;
+
+void vmodel_log_stats(void) {
+  const uint64_t total = atomic_load_explicit(&g_vmodel_total_calls,
+                                              memory_order_relaxed);
+  if (total == 0) return;
+  const uint64_t disagree = atomic_load_explicit(&g_vmodel_disagreements,
+                                                  memory_order_relaxed);
+  fprintf(stderr,
+          "vmodel: %llu picks (%llu disagreed with top equity, %.2f%%)\n",
+          (unsigned long long)total, (unsigned long long)disagree,
+          100.0 * (double)disagree / (double)total);
+}
+
 // V-model pick: score every move in the move-list with the trained model,
 // return the highest-win% move. Strict greater-than scan preserves the
 // movegen-sort tiebreak (equity desc). Returns NULL if vmodel is not
@@ -1846,6 +1868,14 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
     if (p_round > best_win) {  // strict > preserves equity-sorted tie order
       best_win  = p_round;
       best_move = m;
+    }
+  }
+  if (best_move) {
+    atomic_fetch_add_explicit(&g_vmodel_total_calls, 1, memory_order_relaxed);
+    // Disagreement = picked move is not the top-equity (movegen-sorted index 0).
+    if (best_move != move_list_get_move(ml, 0)) {
+      atomic_fetch_add_explicit(&g_vmodel_disagreements, 1,
+                                memory_order_relaxed);
     }
   }
   return best_move;
