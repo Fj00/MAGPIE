@@ -1875,6 +1875,23 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
         kind, diff, shared->vmodel_turn,
         shared->vmodel_static_leaves);
     if (p < 0.0f) continue;  // unscored (stratum/bucket missing)
+    // DEBUG: dump first N moves to stderr (one worker only).
+    if (autoplay_worker->worker_index == 0) {
+      static _Atomic int s_dbg_lines = 0;
+      int line = atomic_fetch_add_explicit(&s_dbg_lines, 1, memory_order_relaxed);
+      if (line < 200) {
+        char rack_buf[16] = {0};
+        for (int rc = 0; rc < rack_len; rc++) {
+          rack_buf[rc] = rack_idx[rc] == 0 ? '?' : ('A' + rack_idx[rc] - 1);
+        }
+        char leave_buf[16] = {0};
+        for (int lc = 0; lc < leave_len; lc++) {
+          leave_buf[lc] = leave_idx[lc] == 0 ? '?' : ('A' + leave_idx[lc] - 1);
+        }
+        fprintf(stderr, "VMDBG %d move=%d/%d rack=%s leave=%s kind=%d diff=%d p=%.6f\n",
+                line, i, n_moves, rack_buf, leave_buf, kind, diff, p);
+      }
+    }
     // Round to 4 decimal places (0.01%) before tie-breaking: model SE on
     // any single prediction is ~0.005, so numerical jitter finer than
     // 1e-4 isn't real signal. Ties at this granularity fall back to
