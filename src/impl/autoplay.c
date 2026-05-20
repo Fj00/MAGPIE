@@ -1773,19 +1773,27 @@ static int vmodel_extract_rack_indices(const Rack *rack, uint8_t *out_buf,
 // Diagnostic counters incremented every time vmodel fires. Atomic so
 // concurrent workers don't lose updates. Printed at shutdown via
 // vmodel_log_stats().
-static _Atomic uint64_t g_vmodel_total_calls   = 0;
-static _Atomic uint64_t g_vmodel_disagreements = 0;
+static _Atomic uint64_t g_vmodel_invocations  = 0;  // function entered (turn matched)
+static _Atomic uint64_t g_vmodel_total_calls  = 0;  // best_move successfully picked
+static _Atomic uint64_t g_vmodel_no_pick      = 0;  // turn matched but no scoreable move
+static _Atomic uint64_t g_vmodel_disagreements = 0; // best_move != equity-top
 
 void vmodel_log_stats(void) {
+  const uint64_t invos = atomic_load_explicit(&g_vmodel_invocations,
+                                              memory_order_relaxed);
+  if (invos == 0) return;
   const uint64_t total = atomic_load_explicit(&g_vmodel_total_calls,
                                               memory_order_relaxed);
-  if (total == 0) return;
+  const uint64_t nop = atomic_load_explicit(&g_vmodel_no_pick,
+                                            memory_order_relaxed);
   const uint64_t disagree = atomic_load_explicit(&g_vmodel_disagreements,
                                                   memory_order_relaxed);
   fprintf(stderr,
-          "vmodel: %llu picks (%llu disagreed with top equity, %.2f%%)\n",
-          (unsigned long long)total, (unsigned long long)disagree,
-          100.0 * (double)disagree / (double)total);
+          "vmodel: %llu invocations | %llu picks | %llu no-pick | "
+          "%llu disagreed with top equity (%.2f%% of picks)\n",
+          (unsigned long long)invos, (unsigned long long)total,
+          (unsigned long long)nop, (unsigned long long)disagree,
+          total ? 100.0 * (double)disagree / (double)total : 0.0);
 }
 
 // V-model pick: score every move in the move-list with the trained model,
@@ -1798,6 +1806,7 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
   if (!shared->vmodel) return NULL;
   // turn_number is 0-indexed; compare 1-indexed.
   if (game_runner->turn_number + 1 != shared->vmodel_turn) return NULL;
+  atomic_fetch_add_explicit(&g_vmodel_invocations, 1, memory_order_relaxed);
 
   Game *game = game_runner->game;
   const int player_on_turn_index = game_get_player_on_turn_index(game);
@@ -1877,6 +1886,8 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
       atomic_fetch_add_explicit(&g_vmodel_disagreements, 1,
                                 memory_order_relaxed);
     }
+  } else {
+    atomic_fetch_add_explicit(&g_vmodel_no_pick, 1, memory_order_relaxed);
   }
   return best_move;
 }
