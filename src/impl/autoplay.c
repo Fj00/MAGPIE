@@ -1792,6 +1792,9 @@ static _Atomic uint64_t g_vmodel_pts_hist_exch[VMDBG_PTS_BUCKETS];
 static _Atomic uint64_t g_vmodel_pts_hist_play[VMDBG_PTS_BUCKETS];
 // Distribution of n_tiles_exchanged (1..7) when the pick was an exchange.
 static _Atomic uint64_t g_vmodel_exch_n_hist[8];
+// Histogram over rack-point-sum across ALL vmodel invocations (so we can
+// sanity-check that the rack distribution is what we think it is).
+static _Atomic uint64_t g_vmodel_rack_pts_hist[VMDBG_PTS_BUCKETS];
 // English tile point values, indexed by python-canonical 0..26.
 static const uint8_t k_vmodel_tile_pts[27] = {
     0,1,3,3,2,1,4,2,4,1,8,5,1,3,1,1,3,10,1,1,1,1,4,4,8,4,10};
@@ -1839,6 +1842,12 @@ void vmodel_log_stats(void) {
           (unsigned long long)tl, total ? 100.0*tl/total : 0.0);
 
   // Histograms — print non-empty buckets.
+  fprintf(stderr, "vmodel: ALL-invocation rack-pts hist:\n");
+  for (int b = 0; b < VMDBG_PTS_BUCKETS; b++) {
+    uint64_t c = atomic_load_explicit(&g_vmodel_rack_pts_hist[b], memory_order_relaxed);
+    if (c) fprintf(stderr, "  %s%d: %llu\n", b == VMDBG_PTS_BUCKETS-1 ? ">=" : "",
+                   b, (unsigned long long)c);
+  }
   fprintf(stderr, "vmodel: PASS leave-pts hist (rack pts when passing):\n");
   for (int b = 0; b < VMDBG_PTS_BUCKETS; b++) {
     uint64_t c = atomic_load_explicit(&g_vmodel_pts_hist_pass[b], memory_order_relaxed);
@@ -1882,6 +1891,17 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
   // any later turn following an unbroken sequence of passes/exchanges).
   if (board_get_tiles_played(game_get_board(game)) != 0) return NULL;
   atomic_fetch_add_explicit(&g_vmodel_invocations, 1, memory_order_relaxed);
+  {
+    Rack *_pr = player_get_rack(game_get_player(game,
+                  game_get_player_on_turn_index(game)));
+    uint8_t _ri[16];
+    int _rl = vmodel_extract_rack_indices(_pr, _ri, 16);
+    int _rp = vmodel_indices_to_pts(_ri, _rl);
+    if (_rp < 0) _rp = 0;
+    if (_rp >= VMDBG_PTS_BUCKETS) _rp = VMDBG_PTS_BUCKETS - 1;
+    atomic_fetch_add_explicit(&g_vmodel_rack_pts_hist[_rp], 1,
+                              memory_order_relaxed);
+  }
 
   const int player_on_turn_index = game_get_player_on_turn_index(game);
   // Per-player move_lists are sized to num_plays (often 1), so
