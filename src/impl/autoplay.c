@@ -1827,6 +1827,95 @@ static _Atomic uint64_t g_vmodel_exch_n_hist[8];
 // Histogram over rack-point-sum across ALL vmodel invocations (so we can
 // sanity-check that the rack distribution is what we think it is).
 static _Atomic uint64_t g_vmodel_rack_pts_hist[VMDBG_PTS_BUCKETS];
+
+// Rank of the chosen move within its kind, equity-sorted (0 = top equity).
+// Tracks whether the V model usually picks near the top of HastyBot's
+// equity ranking (=> can be safely truncated to top-N candidates) or
+// scatters across the list. Bucket k counts picks at equity-rank k;
+// last bucket clamps to "deep" picks.
+#define VMDBG_RANK_BUCKETS 64
+static _Atomic uint64_t g_vmodel_play_rank_hist[VMDBG_RANK_BUCKETS];
+static _Atomic uint64_t g_vmodel_exch_rank_hist[VMDBG_RANK_BUCKETS];
+// Total candidates in move list per kind (sum of counts across picks).
+static _Atomic uint64_t g_vmodel_n_play_total = 0;
+static _Atomic uint64_t g_vmodel_n_exch_total = 0;
+static _Atomic uint64_t g_vmodel_n_call_total = 0;
+// Cache hit/miss totals.
+static _Atomic uint64_t g_vmodel_cache_hits = 0;
+static _Atomic uint64_t g_vmodel_cache_misses = 0;
+
+// Per-call cache: dedup vmodel_predict by (kind, canonical-leave, diff).
+// Within a single vmodel_pick_top_move call, the rack is fixed, so the
+// triple (kind, leave, diff) fully determines the prediction. Many move
+// lists have duplicate signatures — e.g. bingos with the same word at
+// different board positions all have leave="" and same score → same
+// prediction. Caching collapses 100s of inferences to 1 per unique
+// signature.
+#define VMCACHE_SLOTS 1024
+typedef struct VmCacheEntry {
+  uint8_t used;
+  uint8_t kind;
+  uint8_t leave_len;
+  uint8_t leave[STATIC_LEAVES_MAX_LEN];
+  int32_t diff;
+  float   p;
+} VmCacheEntry;
+
+static inline uint32_t vmcache_hash(uint8_t kind, const uint8_t *leave,
+                                     int leave_len, int diff) {
+  uint32_t h = 2166136261u;  // FNV-1a
+  h = (h ^ kind) * 16777619u;
+  h = (h ^ (uint32_t)diff) * 16777619u;
+  h = (h ^ (uint32_t)leave_len) * 16777619u;
+  for (int i = 0; i < leave_len; i++) {
+    h = (h ^ leave[i]) * 16777619u;
+  }
+  return h;
+}
+
+// Look up cache for (kind, canonical leave, diff); return -1.0f if miss.
+static float vmcache_get(const VmCacheEntry *cache, uint8_t kind,
+                          const uint8_t *cleave, int leave_len, int diff) {
+  uint32_t h = vmcache_hash(kind, cleave, leave_len, diff);
+  for (int probe = 0; probe < VMCACHE_SLOTS; probe++) {
+    uint32_t idx = (h + probe) & (VMCACHE_SLOTS - 1);
+    const VmCacheEntry *e = &cache[idx];
+    if (!e->used) return -2.0f;  // empty slot — miss
+    if (e->kind == kind && e->leave_len == leave_len && e->diff == diff &&
+        memcmp(e->leave, cleave, leave_len) == 0) {
+      return e->p;
+    }
+  }
+  return -2.0f;
+}
+
+static void vmcache_put(VmCacheEntry *cache, uint8_t kind,
+                        const uint8_t *cleave, int leave_len, int diff,
+                        float p) {
+  uint32_t h = vmcache_hash(kind, cleave, leave_len, diff);
+  for (int probe = 0; probe < VMCACHE_SLOTS; probe++) {
+    uint32_t idx = (h + probe) & (VMCACHE_SLOTS - 1);
+    VmCacheEntry *e = &cache[idx];
+    if (!e->used) {
+      e->used = 1;
+      e->kind = kind;
+      e->leave_len = (uint8_t)leave_len;
+      memcpy(e->leave, cleave, leave_len);
+      e->diff = diff;
+      e->p = p;
+      return;
+    }
+  }
+  // Full — overwrite hash slot (rare with 1024 slots and ~500 candidates).
+  uint32_t idx = h & (VMCACHE_SLOTS - 1);
+  VmCacheEntry *e = &cache[idx];
+  e->used = 1;
+  e->kind = kind;
+  e->leave_len = (uint8_t)leave_len;
+  memcpy(e->leave, cleave, leave_len);
+  e->diff = diff;
+  e->p = p;
+}
 // English tile point values, indexed by python-canonical 0..26.
 static const uint8_t k_vmodel_tile_pts[27] = {
     0,1,3,3,2,1,4,2,4,1,8,5,1,3,1,1,3,10,1,1,1,1,4,4,8,4,10};
@@ -1903,6 +1992,52 @@ void vmodel_log_stats(void) {
     if (c) fprintf(stderr, "  %s%d: %llu\n", b == VMDBG_PTS_BUCKETS-1 ? ">=" : "",
                    b, (unsigned long long)c);
   }
+  // Equity-rank histogram per kind: how deep into the equity-sorted
+  // candidate list does the V model pick? Tight to the top → top-N
+  // truncation is safe; long tail → vmodel needs full list.
+  fprintf(stderr, "vmodel: PLAY equity-rank hist (picked play's index in"
+                  " equity-sorted plays):\n");
+  for (int b = 0; b < VMDBG_RANK_BUCKETS; b++) {
+    uint64_t c = atomic_load_explicit(&g_vmodel_play_rank_hist[b],
+                                       memory_order_relaxed);
+    if (c) fprintf(stderr, "  %srank %d: %llu\n",
+                   b == VMDBG_RANK_BUCKETS-1 ? ">=" : "",
+                   b, (unsigned long long)c);
+  }
+  fprintf(stderr, "vmodel: EXCH equity-rank hist (picked exch's index in"
+                  " equity-sorted exch):\n");
+  for (int b = 0; b < VMDBG_RANK_BUCKETS; b++) {
+    uint64_t c = atomic_load_explicit(&g_vmodel_exch_rank_hist[b],
+                                       memory_order_relaxed);
+    if (c) fprintf(stderr, "  %srank %d: %llu\n",
+                   b == VMDBG_RANK_BUCKETS-1 ? ">=" : "",
+                   b, (unsigned long long)c);
+  }
+  // Mean candidates per call (helps decide top-N truncation).
+  const uint64_t ncall = atomic_load_explicit(&g_vmodel_n_call_total,
+                                                memory_order_relaxed);
+  const uint64_t npl = atomic_load_explicit(&g_vmodel_n_play_total,
+                                              memory_order_relaxed);
+  const uint64_t nex = atomic_load_explicit(&g_vmodel_n_exch_total,
+                                              memory_order_relaxed);
+  if (ncall) {
+    fprintf(stderr,
+            "vmodel: mean candidates per call: play=%.1f exch=%.1f "
+            "(over %llu calls)\n",
+            (double)npl / (double)ncall, (double)nex / (double)ncall,
+            (unsigned long long)ncall);
+  }
+  // Cache stats.
+  const uint64_t ch = atomic_load_explicit(&g_vmodel_cache_hits,
+                                            memory_order_relaxed);
+  const uint64_t cm = atomic_load_explicit(&g_vmodel_cache_misses,
+                                            memory_order_relaxed);
+  if (ch + cm) {
+    fprintf(stderr,
+            "vmodel: cache: hits=%llu misses=%llu (%.1f%% hit rate)\n",
+            (unsigned long long)ch, (unsigned long long)cm,
+            100.0 * (double)ch / (double)(ch + cm));
+  }
 }
 
 // V-model pick: score every move in the move-list with the trained model,
@@ -1975,6 +2110,19 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
 
   Move *best_move = NULL;
   float best_win  = -1.0f;
+  int   best_idx  = -1;  // equity-sorted index of best_move (for rank stats)
+  int   n_play = 0, n_exch = 0;
+  int   play_idx_in_kind = 0, exch_idx_in_kind = 0;
+  int   best_kind_idx = -1;  // index within own kind (play or exch)
+
+  // Per-call dedup cache: (kind, canonical-leave, diff) → prediction.
+  // Movegen produces many duplicate (leave, diff) signatures (especially
+  // for plays — a bingo word has many positional variants all with
+  // leave="" and same score). Hash-table dedup collapses these to one
+  // inference per unique signature.
+  VmCacheEntry cache[VMCACHE_SLOTS];
+  memset(cache, 0, sizeof(cache));
+  uint64_t local_hits = 0, local_misses = 0;
 
   Rack leave_rack;
   rack_set_dist_size(&leave_rack, rack_get_dist_size(player_rack));
@@ -1988,6 +2136,9 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
       case GAME_EVENT_TILE_PLACEMENT_MOVE: kind = 2; break;
       default: continue;
     }
+    int kind_idx = -1;
+    if (kind == 1) { kind_idx = exch_idx_in_kind++; n_exch++; }
+    else if (kind == 2) { kind_idx = play_idx_in_kind++; n_play++; }
     rack_reset(&leave_rack);
     get_leave_for_move(m, game, &leave_rack);
     uint8_t leave_idx[16];
@@ -1996,12 +2147,25 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
     if (kind == 2) {
       diff += equity_to_int(move_get_score(m));
     }
-    const float p = vmodel_predict(
-        model,
-        rack_idx, rack_len,
-        leave_idx, leave_len,
-        kind, diff, game_turn,
-        shared->vmodel_static_leaves);
+    // Cache lookup keyed on canonical leave + kind + diff.
+    uint8_t cleave[STATIC_LEAVES_MAX_LEN] = {0};
+    int cleave_len = leave_len < STATIC_LEAVES_MAX_LEN ? leave_len
+                                                       : STATIC_LEAVES_MAX_LEN;
+    static_leaves_canonicalize(leave_idx, cleave_len, cleave);
+    float p = vmcache_get(cache, (uint8_t)kind, cleave, cleave_len, diff);
+    if (p < -1.5f) {
+      // miss
+      p = vmodel_predict(
+          model,
+          rack_idx, rack_len,
+          leave_idx, leave_len,
+          kind, diff, game_turn,
+          shared->vmodel_static_leaves);
+      vmcache_put(cache, (uint8_t)kind, cleave, cleave_len, diff, p);
+      local_misses++;
+    } else {
+      local_hits++;
+    }
     if (p < 0.0f) continue;  // unscored (stratum/bucket missing)
     // Round to 4 decimal places (0.01%) before tie-breaking: model SE on
     // any single prediction is ~0.005, so numerical jitter finer than
@@ -2011,17 +2175,30 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
     if (p_round > best_win) {  // strict > preserves equity-sorted tie order
       best_win  = p_round;
       best_move = m;
+      best_idx  = i;
+      best_kind_idx = kind_idx;
     }
   }
   // Movegen does NOT include a pass move alongside plays/exchanges. The V
   // model needs to consider passing too, so score pass explicitly and
   // override `best_move` if its win% beats the best play/exchange.
   {
-    const float p_pass = vmodel_predict(
-        model, rack_idx, rack_len,
-        rack_idx, rack_len,  // pass: leave == rack
-        0, pre_diff, game_turn,
-        shared->vmodel_static_leaves);
+    uint8_t pass_cleave[STATIC_LEAVES_MAX_LEN] = {0};
+    int pass_clen = rack_len < STATIC_LEAVES_MAX_LEN ? rack_len
+                                                      : STATIC_LEAVES_MAX_LEN;
+    static_leaves_canonicalize(rack_idx, pass_clen, pass_cleave);
+    float p_pass = vmcache_get(cache, 0, pass_cleave, pass_clen, pre_diff);
+    if (p_pass < -1.5f) {
+      p_pass = vmodel_predict(
+          model, rack_idx, rack_len,
+          rack_idx, rack_len,  // pass: leave == rack
+          0, pre_diff, game_turn,
+          shared->vmodel_static_leaves);
+      vmcache_put(cache, 0, pass_cleave, pass_clen, pre_diff, p_pass);
+      local_misses++;
+    } else {
+      local_hits++;
+    }
     if (p_pass >= 0.0f) {
       const float pp_round = roundf(p_pass * 10000.0f) / 10000.0f;
       // Strict > so that if pass ties a play, the equity-sorted play wins
@@ -2031,9 +2208,21 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
         move_set_as_pass(spare);
         best_win = pp_round;
         best_move = spare;
+        best_kind_idx = 0;  // pass is rank 0 in its own (degenerate) kind
       }
     }
   }
+  // Roll up cache stats once per call (cheaper than per-move atomics).
+  atomic_fetch_add_explicit(&g_vmodel_cache_hits, local_hits,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_vmodel_cache_misses, local_misses,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_vmodel_n_play_total, (uint64_t)n_play,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_vmodel_n_exch_total, (uint64_t)n_exch,
+                            memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_vmodel_n_call_total, 1, memory_order_relaxed);
+  (void)best_idx;  // available for future use
   if (best_move) {
     atomic_fetch_add_explicit(&g_vmodel_total_calls, 1, memory_order_relaxed);
     // Disagreement = picked move is not the top-equity (movegen-sorted index 0).
@@ -2050,6 +2239,18 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
     int leave_pts = vmodel_indices_to_pts(bm_leave_idx, bm_leave_len);
     if (leave_pts < 0) leave_pts = 0;
     if (leave_pts >= VMDBG_PTS_BUCKETS) leave_pts = VMDBG_PTS_BUCKETS - 1;
+    // Record the picked move's rank within its kind (equity-sorted).
+    if (best_kind_idx >= 0) {
+      int rb = best_kind_idx;
+      if (rb >= VMDBG_RANK_BUCKETS) rb = VMDBG_RANK_BUCKETS - 1;
+      if (move_get_type(best_move) == GAME_EVENT_EXCHANGE) {
+        atomic_fetch_add_explicit(&g_vmodel_exch_rank_hist[rb], 1,
+                                  memory_order_relaxed);
+      } else if (move_get_type(best_move) == GAME_EVENT_TILE_PLACEMENT_MOVE) {
+        atomic_fetch_add_explicit(&g_vmodel_play_rank_hist[rb], 1,
+                                  memory_order_relaxed);
+      }
+    }
     switch (move_get_type(best_move)) {
       case GAME_EVENT_PASS:
         atomic_fetch_add_explicit(&g_vmodel_pick_pass, 1, memory_order_relaxed);
