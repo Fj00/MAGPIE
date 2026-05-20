@@ -217,19 +217,24 @@ typedef struct AutoplaySharedData {
   // target. All other turns are pass-cycle plumbing or post-target natural
   // play. Set by MAGPIE_EB_TARGET_TURN; default 6.
   int eb_target_turn;
-  // V-model inference hook. When `vmodel` is non-NULL and the current
-  // turn matches `vmodel_turn`, game_runner_play_move replaces HastyBot's
-  // pick with `vmodel_pick_top_move`: score every candidate move with
-  // the trained V model and pick max predicted win%. Ties broken by
-  // movegen-sort order (equity desc) via strict greater-than scan.
-  // Other turns use the existing decision path unchanged. Env vars:
-  //   MAGPIE_VMODEL_PATH        — .vmt model file
-  //   MAGPIE_VMODEL_LEAVES_6    — CSW24_gen_6.csv  (static_leave for L1..L6)
+  // V-model inference hooks — one slot per game turn (1..6). Each .vmt
+  // file declares its own training turn (m->turn); the loader places it
+  // in the matching slot. game_runner_play_move dispatches based on the
+  // current game turn: if `vmodels[turn]` is non-NULL AND board is
+  // empty, the V model replaces HastyBot's pick. Other turns / non-
+  // empty boards use the existing decision path unchanged. Env vars:
+  //   MAGPIE_VMODEL_PATHS       — colon-separated .vmt file list; each
+  //                               loads into its training-turn slot
+  //   MAGPIE_VMODEL_PATH        — backward-compat single file (placed
+  //                               in slot matching its training turn)
+  //   MAGPIE_VMODEL_LEAVES_6    — CSW24_gen_6.csv  (static_leave L1..L6)
   //   MAGPIE_VMODEL_LEAVES_7    — CSW24_7tile_gen_6.csv  (L7 racks)
-  //   MAGPIE_VMODEL_TURN        — turn to apply the model (default 6)
-  VModel *vmodel;
+  //   MAGPIE_VMODEL_TURN        — (deprecated) which game-turn to apply
+  //                               the model at; ignored when more than
+  //                               one .vmt is loaded
+  VModel *vmodels[7];   // indexed by game turn (1..6); slot 0 unused
   StaticLeaves *vmodel_static_leaves;
-  int vmodel_turn;
+  int vmodel_any_loaded;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -531,7 +536,7 @@ AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
         malloc_or_die(sizeof(uint32_t) * (size_t)cap);
   }
   autoplay_worker->eb_move_list = NULL;
-  if (shared_data->eb_branch_active || shared_data->vmodel) {
+  if (shared_data->eb_branch_active || shared_data->vmodel_any_loaded) {
     // Sized to match force_leaves_capacity when force-table is active so the
     // T6 force-target append can consider plays past the top-2000 by equity
     // (rare-leave plays often sit much deeper in the equity-sorted list).
@@ -907,39 +912,66 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
             "MAGPIE_EB_{PASS,EXCH,BINGO,PLAY,RARE}_POOL for the 5-way mix.\n");
   }
 
-  // V-model inference: optional T6 (or other-turn) decision override.
-  // Loaded only if MAGPIE_VMODEL_PATH is set; otherwise the existing
-  // HastyBot decision path runs unchanged.
-  shared_data->vmodel = NULL;
+  // V-model inference: load any number of .vmt files. Each declares its
+  // own training turn (m->turn) and goes into the matching slot.
+  for (int i = 0; i < 7; i++) shared_data->vmodels[i] = NULL;
   shared_data->vmodel_static_leaves = NULL;
-  shared_data->vmodel_turn = 6;
-  const char *vmt_path = getenv("MAGPIE_VMODEL_PATH");
-  if (vmt_path && vmt_path[0] != '\0') {
-    shared_data->vmodel = vmodel_create(vmt_path);
-    if (!shared_data->vmodel) {
-      log_fatal("MAGPIE_VMODEL_PATH set but model failed to load: %s",
-                vmt_path);
+  shared_data->vmodel_any_loaded = 0;
+  {
+    // Build a working list of paths from MAGPIE_VMODEL_PATHS (colon-
+    // separated) plus the back-compat singleton MAGPIE_VMODEL_PATH.
+    const char *paths_env = getenv("MAGPIE_VMODEL_PATHS");
+    const char *single_env = getenv("MAGPIE_VMODEL_PATH");
+    char *combined = NULL;
+    size_t cap = 0;
+    if (paths_env && paths_env[0] != '\0') {
+      cap = strlen(paths_env) + 1;
+      combined = malloc(cap);
+      snprintf(combined, cap, "%s", paths_env);
     }
-    const char *l6 = getenv("MAGPIE_VMODEL_LEAVES_6");
-    const char *l7 = getenv("MAGPIE_VMODEL_LEAVES_7");
-    shared_data->vmodel_static_leaves = static_leaves_create(l6, l7);
-    if (!shared_data->vmodel_static_leaves) {
-      log_fatal("vmodel: static_leaves_create failed (leaves_6=%s leaves_7=%s)",
-                l6 ? l6 : "(null)", l7 ? l7 : "(null)");
-    }
-    const char *vt = getenv("MAGPIE_VMODEL_TURN");
-    if (vt && vt[0] != '\0') {
-      const int t = atoi(vt);
-      if (t >= 1 && t <= 6) {
-        shared_data->vmodel_turn = t;
+    if (single_env && single_env[0] != '\0') {
+      size_t add = strlen(single_env) + 2;
+      char *grown = realloc(combined, cap + add);
+      if (!grown) log_fatal("vmodel: alloc fail");
+      combined = grown;
+      if (cap == 0) {
+        snprintf(combined, add, "%s", single_env);
+        cap = strlen(single_env) + 1;
       } else {
-        fprintf(stderr,
-                "vmodel: invalid MAGPIE_VMODEL_TURN=%s (must be 1..6); "
-                "using default 6\n", vt);
+        cap--;  // drop terminator
+        snprintf(combined + cap, add, ":%s", single_env);
+        cap += add - 1;
       }
     }
-    fprintf(stderr, "vmodel: loaded %s; replaces HastyBot at T%d\n",
-            vmt_path, shared_data->vmodel_turn);
+    if (combined && combined[0] != '\0') {
+      const char *l6 = getenv("MAGPIE_VMODEL_LEAVES_6");
+      const char *l7 = getenv("MAGPIE_VMODEL_LEAVES_7");
+      shared_data->vmodel_static_leaves = static_leaves_create(l6, l7);
+      if (!shared_data->vmodel_static_leaves) {
+        log_fatal("vmodel: static_leaves_create failed "
+                  "(leaves_6=%s leaves_7=%s)",
+                  l6 ? l6 : "(null)", l7 ? l7 : "(null)");
+      }
+      char *saveptr = NULL;
+      for (char *p = strtok_r(combined, ":", &saveptr); p;
+           p = strtok_r(NULL, ":", &saveptr)) {
+        if (p[0] == '\0') continue;
+        VModel *m = vmodel_create(p);
+        if (!m) log_fatal("vmodel: failed to load %s", p);
+        if (m->turn < 1 || m->turn > 6) {
+          log_fatal("vmodel: model %s has unsupported turn %d (must be 1..6)",
+                    p, m->turn);
+        }
+        if (shared_data->vmodels[m->turn]) {
+          log_fatal("vmodel: duplicate model for turn %d (existing + %s)",
+                    m->turn, p);
+        }
+        shared_data->vmodels[m->turn] = m;
+        shared_data->vmodel_any_loaded = 1;
+        fprintf(stderr, "vmodel: loaded %s for T%d\n", p, m->turn);
+      }
+    }
+    free(combined);
   }
 
   shared_data->empty_board_recorder = NULL;
@@ -1024,10 +1056,10 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
   void vmodel_log_stats(void);  // defined later in this TU
-  if (shared_data->vmodel) {
+  if (shared_data->vmodel_any_loaded) {
     vmodel_log_stats();
   }
-  vmodel_destroy(shared_data->vmodel);
+  for (int i = 0; i < 7; i++) vmodel_destroy(shared_data->vmodels[i]);
   static_leaves_destroy(shared_data->vmodel_static_leaves);
   free(shared_data);
 }
@@ -1880,15 +1912,18 @@ void vmodel_log_stats(void) {
 static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
                                         GameRunner *game_runner) {
   AutoplaySharedData *shared = game_runner->shared_data;
-  if (!shared->vmodel) return NULL;
-  // turn_number is 0-indexed; compare 1-indexed.
-  if (game_runner->turn_number + 1 != shared->vmodel_turn) return NULL;
+  if (!shared->vmodel_any_loaded) return NULL;
+  // turn_number is 0-indexed; convert to 1-indexed game turn.
+  const int game_turn = game_runner->turn_number + 1;
+  if (game_turn < 1 || game_turn > 6) return NULL;
+  const VModel *model = shared->vmodels[game_turn];
+  if (!model) return NULL;
   Game *game = game_runner->game;
-  // T6 model assumes bag=93 / board empty / both scores 0. Skip if the
-  // game state doesn't match those assumptions — falls through to
-  // HastyBot. For natural autoplay this means vmodel only fires at the
-  // configured turn when the board is still empty (= game-turn 1, or
-  // any later turn following an unbroken sequence of passes/exchanges).
+  // V model assumes bag=93 / board empty / both scores 0 (its training
+  // distribution). Skip if the game state doesn't match those
+  // assumptions — falls through to HastyBot. In EB cycle target=T runs,
+  // turns 1..T-1 are forced pass/exchange so board stays empty; once
+  // T's recorded move plays tiles, post-T turns no longer satisfy this.
   if (board_get_tiles_played(game_get_board(game)) != 0) return NULL;
   atomic_fetch_add_explicit(&g_vmodel_invocations, 1, memory_order_relaxed);
   {
@@ -1962,10 +1997,10 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
       diff += equity_to_int(move_get_score(m));
     }
     const float p = vmodel_predict(
-        shared->vmodel,
+        model,
         rack_idx, rack_len,
         leave_idx, leave_len,
-        kind, diff, shared->vmodel_turn,
+        kind, diff, game_turn,
         shared->vmodel_static_leaves);
     if (p < 0.0f) continue;  // unscored (stratum/bucket missing)
     // Round to 4 decimal places (0.01%) before tie-breaking: model SE on
@@ -1983,9 +2018,9 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
   // override `best_move` if its win% beats the best play/exchange.
   {
     const float p_pass = vmodel_predict(
-        shared->vmodel, rack_idx, rack_len,
+        model, rack_idx, rack_len,
         rack_idx, rack_len,  // pass: leave == rack
-        0, pre_diff, shared->vmodel_turn,
+        0, pre_diff, game_turn,
         shared->vmodel_static_leaves);
     if (p_pass >= 0.0f) {
       const float pp_round = roundf(p_pass * 10000.0f) / 10000.0f;
