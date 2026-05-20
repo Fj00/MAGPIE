@@ -531,7 +531,7 @@ AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
         malloc_or_die(sizeof(uint32_t) * (size_t)cap);
   }
   autoplay_worker->eb_move_list = NULL;
-  if (shared_data->eb_branch_active) {
+  if (shared_data->eb_branch_active || shared_data->vmodel) {
     // Sized to match force_leaves_capacity when force-table is active so the
     // T6 force-target append can consider plays past the top-2000 by equity
     // (rare-leave plays often sit much deeper in the equity-sorted list).
@@ -1816,7 +1816,12 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
   atomic_fetch_add_explicit(&g_vmodel_invocations, 1, memory_order_relaxed);
 
   const int player_on_turn_index = game_get_player_on_turn_index(game);
-  MoveList *ml = autoplay_worker->move_lists[player_on_turn_index];
+  // Per-player move_lists are sized to num_plays (often 1), so
+  // MOVE_RECORD_ALL into them would prune to top-1. eb_move_list is
+  // pre-allocated large for exactly this kind of full-enumeration.
+  MoveList *ml = autoplay_worker->eb_move_list
+                     ? autoplay_worker->eb_move_list
+                     : autoplay_worker->move_lists[player_on_turn_index];
   const MoveGenArgs gen_args = {
       .game = game,
       .move_list = ml,
