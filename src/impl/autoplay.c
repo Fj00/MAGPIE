@@ -18,6 +18,9 @@
 #include "../ent/data_filepaths.h"
 #include "../ent/equity.h"
 #include "../ent/force_table.h"
+#include "../ent/static_leaves.h"
+#include "../ent/vmodel.h"
+#include "../ent/vmodel_features.h"
 #include "../ent/game.h"
 #include "../ent/empty_board.h"
 #include "../ent/empty_board_strata.h"
@@ -213,6 +216,19 @@ typedef struct AutoplaySharedData {
   // target. All other turns are pass-cycle plumbing or post-target natural
   // play. Set by MAGPIE_EB_TARGET_TURN; default 6.
   int eb_target_turn;
+  // V-model inference hook. When `vmodel` is non-NULL and the current
+  // turn matches `vmodel_turn`, game_runner_play_move replaces HastyBot's
+  // pick with `vmodel_pick_top_move`: score every candidate move with
+  // the trained V model and pick max predicted win%. Ties broken by
+  // movegen-sort order (equity desc) via strict greater-than scan.
+  // Other turns use the existing decision path unchanged. Env vars:
+  //   MAGPIE_VMODEL_PATH        — .vmt model file
+  //   MAGPIE_VMODEL_LEAVES_6    — CSW24_gen_6.csv  (static_leave for L1..L6)
+  //   MAGPIE_VMODEL_LEAVES_7    — CSW24_7tile_gen_6.csv  (L7 racks)
+  //   MAGPIE_VMODEL_TURN        — turn to apply the model (default 6)
+  VModel *vmodel;
+  StaticLeaves *vmodel_static_leaves;
+  int vmodel_turn;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -890,6 +906,41 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
             "MAGPIE_EB_{PASS,EXCH,BINGO,PLAY,RARE}_POOL for the 5-way mix.\n");
   }
 
+  // V-model inference: optional T6 (or other-turn) decision override.
+  // Loaded only if MAGPIE_VMODEL_PATH is set; otherwise the existing
+  // HastyBot decision path runs unchanged.
+  shared_data->vmodel = NULL;
+  shared_data->vmodel_static_leaves = NULL;
+  shared_data->vmodel_turn = 6;
+  const char *vmt_path = getenv("MAGPIE_VMODEL_PATH");
+  if (vmt_path && vmt_path[0] != '\0') {
+    shared_data->vmodel = vmodel_create(vmt_path);
+    if (!shared_data->vmodel) {
+      log_fatal("MAGPIE_VMODEL_PATH set but model failed to load: %s",
+                vmt_path);
+    }
+    const char *l6 = getenv("MAGPIE_VMODEL_LEAVES_6");
+    const char *l7 = getenv("MAGPIE_VMODEL_LEAVES_7");
+    shared_data->vmodel_static_leaves = static_leaves_create(l6, l7);
+    if (!shared_data->vmodel_static_leaves) {
+      log_fatal("vmodel: static_leaves_create failed (leaves_6=%s leaves_7=%s)",
+                l6 ? l6 : "(null)", l7 ? l7 : "(null)");
+    }
+    const char *vt = getenv("MAGPIE_VMODEL_TURN");
+    if (vt && vt[0] != '\0') {
+      const int t = atoi(vt);
+      if (t >= 1 && t <= 6) {
+        shared_data->vmodel_turn = t;
+      } else {
+        fprintf(stderr,
+                "vmodel: invalid MAGPIE_VMODEL_TURN=%s (must be 1..6); "
+                "using default 6\n", vt);
+      }
+    }
+    fprintf(stderr, "vmodel: loaded %s; replaces HastyBot at T%d\n",
+            vmt_path, shared_data->vmodel_turn);
+  }
+
   shared_data->empty_board_recorder = NULL;
   const char *eb_out = getenv("MAGPIE_EMPTY_BOARD_OUT");
   if (eb_out && eb_out[0] != '\0') {
@@ -971,6 +1022,8 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   }
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
+  vmodel_destroy(shared_data->vmodel);
+  static_leaves_destroy(shared_data->vmodel_static_leaves);
   free(shared_data);
 }
 
@@ -1690,6 +1743,108 @@ const Move *game_runner_get_best_move(AutoplayWorker *autoplay_worker,
   return game_runner_get_top_simming_move(autoplay_worker, game_runner);
 }
 
+// Extract tile indices (python-canonical 0='?'..26='Z') from a Rack into
+// `out_buf`, returning the count written. Assumes magpie's English ML
+// encoding matches the python canonical (blank=0, A=1..Z=26).
+static int vmodel_extract_rack_indices(const Rack *rack, uint8_t *out_buf,
+                                       int max_len) {
+  int n = 0;
+  const uint16_t dist_size = rack_get_dist_size(rack);
+  for (uint16_t ml = 0; ml < dist_size && n < max_len; ml++) {
+    const int c = rack_get_letter(rack, ml);
+    for (int k = 0; k < c && n < max_len; k++) {
+      // Blanks-in-play retain BLANK_MASK bit; canonical encoding wants
+      // index 0 for blanks and 1..26 for letters. ML 0 is the unplayed
+      // blank; played blanks have the mask bit set. For leave/rack here
+      // we want the underlying tile identity, not the played-as letter,
+      // so unblank.
+      const int unblanked = get_unblanked_machine_letter(ml);
+      out_buf[n++] = (uint8_t)unblanked;
+    }
+  }
+  return n;
+}
+
+// V-model pick: score every move in the move-list with the trained model,
+// return the highest-win% move. Strict greater-than scan preserves the
+// movegen-sort tiebreak (equity desc). Returns NULL if vmodel is not
+// active for this turn or if no move is scoreable.
+static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
+                                        GameRunner *game_runner) {
+  AutoplaySharedData *shared = game_runner->shared_data;
+  if (!shared->vmodel) return NULL;
+  // turn_number is 0-indexed; compare 1-indexed.
+  if (game_runner->turn_number + 1 != shared->vmodel_turn) return NULL;
+
+  Game *game = game_runner->game;
+  const int player_on_turn_index = game_get_player_on_turn_index(game);
+  MoveList *ml = autoplay_worker->move_lists[player_on_turn_index];
+  const MoveGenArgs gen_args = {
+      .game = game,
+      .move_list = ml,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_EQUITY,
+      .override_kwg = NULL,
+      .thread_index = autoplay_worker->worker_index,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+      .tiles_played_bv = NULL,
+      .initial_tiles_bv = 0};
+  generate_moves(&gen_args);
+  move_list_sort_moves(ml);
+  const int n_moves = move_list_get_count(ml);
+  if (n_moves == 0) return NULL;
+
+  Rack *player_rack =
+      player_get_rack(game_get_player(game, player_on_turn_index));
+  uint8_t rack_idx[16];
+  int rack_len = vmodel_extract_rack_indices(player_rack, rack_idx, 16);
+
+  // Pre-action diff (this player's score advantage before the move).
+  const Player *me  = game_get_player(game, player_on_turn_index);
+  const Player *opp = game_get_player(game, 1 - player_on_turn_index);
+  const int pre_diff =
+      equity_to_int(player_get_score(me)) - equity_to_int(player_get_score(opp));
+
+  Move *best_move = NULL;
+  float best_win  = -1.0f;
+
+  Rack leave_rack;
+  rack_set_dist_size(&leave_rack, rack_get_dist_size(player_rack));
+
+  for (int i = 0; i < n_moves; i++) {
+    Move *m = move_list_get_move(ml, i);
+    int kind;
+    switch (move_get_type(m)) {
+      case GAME_EVENT_PASS:                kind = 0; break;
+      case GAME_EVENT_EXCHANGE:            kind = 1; break;
+      case GAME_EVENT_TILE_PLACEMENT_MOVE: kind = 2; break;
+      default: continue;
+    }
+    rack_reset(&leave_rack);
+    get_leave_for_move(m, game, &leave_rack);
+    uint8_t leave_idx[16];
+    int leave_len = vmodel_extract_rack_indices(&leave_rack, leave_idx, 16);
+    int diff = pre_diff;
+    if (kind == 2) {
+      diff += equity_to_int(move_get_score(m));
+    }
+    const float p = vmodel_predict(
+        shared->vmodel,
+        rack_idx, rack_len,
+        leave_idx, leave_len,
+        kind, diff, shared->vmodel_turn,
+        shared->vmodel_static_leaves);
+    if (p < 0.0f) continue;  // unscored (stratum/bucket missing)
+    if (p > best_win) {       // strict > preserves equity-sorted tie order
+      best_win  = p;
+      best_move = m;
+    }
+  }
+  return best_move;
+}
+
 // Returns the played move
 const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
                                   GameRunner *game_runner) {
@@ -1872,6 +2027,10 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
   // iter_count-derived force_kind bits.)
   if (!move) {
     move = try_forced_move(autoplay_worker, game_runner);
+  }
+  // V-model decision hook: replaces HastyBot at the configured turn.
+  if (!move) {
+    move = vmodel_pick_top_move(autoplay_worker, game_runner);
   }
   if (!move) {
     move = game_runner_get_best_move(autoplay_worker, game_runner);
