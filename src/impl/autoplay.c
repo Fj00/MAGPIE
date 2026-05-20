@@ -2020,6 +2020,30 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
       best_move = m;
     }
   }
+  // Movegen does NOT include a pass move alongside plays/exchanges. The V
+  // model needs to consider passing too, so score pass explicitly and
+  // override `best_move` if its win% beats the best play/exchange.
+  {
+    const float p_pass = vmodel_predict(
+        shared->vmodel, rack_idx, rack_len,
+        rack_idx, rack_len,  // pass: leave == rack
+        0, pre_diff, shared->vmodel_turn,
+        shared->vmodel_static_leaves);
+    if (p_pass >= 0.0f) {
+      const float pp_round = roundf(p_pass * 10000.0f) / 10000.0f;
+      if (dbg_low_pts) {
+        fprintf(stderr, "LOWPTS PASS p=%.4f\n", p_pass);
+      }
+      // Strict > so that if pass ties a play, the equity-sorted play wins
+      // (matches the per-move tiebreak convention).
+      if (pp_round > best_win) {
+        Move *spare = move_list_get_spare_move(ml);
+        move_set_as_pass(spare);
+        best_win = pp_round;
+        best_move = spare;
+      }
+    }
+  }
   if (best_move) {
     atomic_fetch_add_explicit(&g_vmodel_total_calls, 1, memory_order_relaxed);
     // Disagreement = picked move is not the top-equity (movegen-sorted index 0).
