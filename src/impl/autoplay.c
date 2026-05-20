@@ -1891,6 +1891,7 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
   // any later turn following an unbroken sequence of passes/exchanges).
   if (board_get_tiles_played(game_get_board(game)) != 0) return NULL;
   atomic_fetch_add_explicit(&g_vmodel_invocations, 1, memory_order_relaxed);
+  bool dbg_low_pts = false;
   {
     Rack *_pr = player_get_rack(game_get_player(game,
                   game_get_player_on_turn_index(game)));
@@ -1901,6 +1902,17 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
     if (_rp >= VMDBG_PTS_BUCKETS) _rp = VMDBG_PTS_BUCKETS - 1;
     atomic_fetch_add_explicit(&g_vmodel_rack_pts_hist[_rp], 1,
                               memory_order_relaxed);
+    // Verbose dump when rack has leave_pts<=5 (rare case we're investigating)
+    static _Atomic int s_low_dbg = 0;
+    if (_rp <= 5 && atomic_fetch_add_explicit(&s_low_dbg, 1,
+                                                memory_order_relaxed) < 20) {
+      dbg_low_pts = true;
+      char rb[16] = {0};
+      for (int i = 0; i < _rl; i++) {
+        rb[i] = _ri[i] == 0 ? '?' : ('A' + _ri[i] - 1);
+      }
+      fprintf(stderr, "LOWPTS rack=%s rack_pts=%d\n", rb, _rp);
+    }
   }
 
   const int player_on_turn_index = game_get_player_on_turn_index(game);
@@ -1990,6 +2002,19 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
     // 1e-4 isn't real signal. Ties at this granularity fall back to
     // movegen's equity-desc sort order (= HastyBot static equity).
     const float p_round = roundf(p * 10000.0f) / 10000.0f;
+    if (dbg_low_pts && (kind == 0 || (kind == 1 && leave_len == 6) || (kind == 2))) {
+      // Dump pass + keep-6 exchanges + a sample of plays for the low-pts rack.
+      static _Atomic int s_lp_emitted = 0;
+      if (atomic_fetch_add_explicit(&s_lp_emitted, 1,
+                                     memory_order_relaxed) < 200) {
+        char lb[16] = {0};
+        for (int li = 0; li < leave_len; li++) {
+          lb[li] = leave_idx[li] == 0 ? '?' : ('A' + leave_idx[li] - 1);
+        }
+        fprintf(stderr, "LOWPTS move kind=%d leave=%s diff=%d p=%.4f\n",
+                kind, lb, diff, p);
+      }
+    }
     if (p_round > best_win) {  // strict > preserves equity-sorted tie order
       best_win  = p_round;
       best_move = m;
