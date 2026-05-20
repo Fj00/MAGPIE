@@ -1891,7 +1891,6 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
   // any later turn following an unbroken sequence of passes/exchanges).
   if (board_get_tiles_played(game_get_board(game)) != 0) return NULL;
   atomic_fetch_add_explicit(&g_vmodel_invocations, 1, memory_order_relaxed);
-  bool dbg_low_pts = false;
   {
     Rack *_pr = player_get_rack(game_get_player(game,
                   game_get_player_on_turn_index(game)));
@@ -1902,17 +1901,6 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
     if (_rp >= VMDBG_PTS_BUCKETS) _rp = VMDBG_PTS_BUCKETS - 1;
     atomic_fetch_add_explicit(&g_vmodel_rack_pts_hist[_rp], 1,
                               memory_order_relaxed);
-    // Verbose dump when rack has leave_pts<=5 (rare case we're investigating)
-    static _Atomic int s_low_dbg = 0;
-    if (_rp <= 5 && atomic_fetch_add_explicit(&s_low_dbg, 1,
-                                                memory_order_relaxed) < 20) {
-      dbg_low_pts = true;
-      char rb[16] = {0};
-      for (int i = 0; i < _rl; i++) {
-        rb[i] = _ri[i] == 0 ? '?' : ('A' + _ri[i] - 1);
-      }
-      fprintf(stderr, "LOWPTS rack=%s rack_pts=%d\n", rb, _rp);
-    }
   }
 
   const int player_on_turn_index = game_get_player_on_turn_index(game);
@@ -1980,41 +1968,11 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
         kind, diff, shared->vmodel_turn,
         shared->vmodel_static_leaves);
     if (p < 0.0f) continue;  // unscored (stratum/bucket missing)
-    // DEBUG: dump first N moves to stderr (one worker only).
-    if (autoplay_worker->worker_index == 0) {
-      static _Atomic int s_dbg_lines = 0;
-      int line = atomic_fetch_add_explicit(&s_dbg_lines, 1, memory_order_relaxed);
-      if (line < 200) {
-        char rack_buf[16] = {0};
-        for (int rc = 0; rc < rack_len; rc++) {
-          rack_buf[rc] = rack_idx[rc] == 0 ? '?' : ('A' + rack_idx[rc] - 1);
-        }
-        char leave_buf[16] = {0};
-        for (int lc = 0; lc < leave_len; lc++) {
-          leave_buf[lc] = leave_idx[lc] == 0 ? '?' : ('A' + leave_idx[lc] - 1);
-        }
-        fprintf(stderr, "VMDBG %d move=%d/%d rack=%s leave=%s kind=%d diff=%d p=%.6f\n",
-                line, i, n_moves, rack_buf, leave_buf, kind, diff, p);
-      }
-    }
     // Round to 4 decimal places (0.01%) before tie-breaking: model SE on
     // any single prediction is ~0.005, so numerical jitter finer than
     // 1e-4 isn't real signal. Ties at this granularity fall back to
     // movegen's equity-desc sort order (= HastyBot static equity).
     const float p_round = roundf(p * 10000.0f) / 10000.0f;
-    if (dbg_low_pts && (kind == 0 || (kind == 1 && leave_len == 6) || (kind == 2))) {
-      // Dump pass + keep-6 exchanges + a sample of plays for the low-pts rack.
-      static _Atomic int s_lp_emitted = 0;
-      if (atomic_fetch_add_explicit(&s_lp_emitted, 1,
-                                     memory_order_relaxed) < 200) {
-        char lb[16] = {0};
-        for (int li = 0; li < leave_len; li++) {
-          lb[li] = leave_idx[li] == 0 ? '?' : ('A' + leave_idx[li] - 1);
-        }
-        fprintf(stderr, "LOWPTS move kind=%d leave=%s diff=%d p=%.4f\n",
-                kind, lb, diff, p);
-      }
-    }
     if (p_round > best_win) {  // strict > preserves equity-sorted tie order
       best_win  = p_round;
       best_move = m;
@@ -2031,9 +1989,6 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
         shared->vmodel_static_leaves);
     if (p_pass >= 0.0f) {
       const float pp_round = roundf(p_pass * 10000.0f) / 10000.0f;
-      if (dbg_low_pts) {
-        fprintf(stderr, "LOWPTS PASS p=%.4f\n", p_pass);
-      }
       // Strict > so that if pass ties a play, the equity-sorted play wins
       // (matches the per-move tiebreak convention).
       if (pp_round > best_win) {
