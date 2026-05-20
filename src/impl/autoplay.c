@@ -1777,6 +1777,12 @@ static _Atomic uint64_t g_vmodel_invocations  = 0;  // function entered (turn ma
 static _Atomic uint64_t g_vmodel_total_calls  = 0;  // best_move successfully picked
 static _Atomic uint64_t g_vmodel_no_pick      = 0;  // turn matched but no scoreable move
 static _Atomic uint64_t g_vmodel_disagreements = 0; // best_move != equity-top
+static _Atomic uint64_t g_vmodel_pick_pass    = 0;  // best_move was a pass
+static _Atomic uint64_t g_vmodel_pick_exch    = 0;  // best_move was an exchange
+static _Atomic uint64_t g_vmodel_pick_play    = 0;  // best_move was a play
+static _Atomic uint64_t g_vmodel_top_pass     = 0;  // top-equity was a pass
+static _Atomic uint64_t g_vmodel_top_exch     = 0;  // top-equity was an exchange
+static _Atomic uint64_t g_vmodel_top_play     = 0;  // top-equity was a play
 
 void vmodel_log_stats(void) {
   const uint64_t invos = atomic_load_explicit(&g_vmodel_invocations,
@@ -1788,12 +1794,30 @@ void vmodel_log_stats(void) {
                                             memory_order_relaxed);
   const uint64_t disagree = atomic_load_explicit(&g_vmodel_disagreements,
                                                   memory_order_relaxed);
+  const uint64_t pp = atomic_load_explicit(&g_vmodel_pick_pass, memory_order_relaxed);
+  const uint64_t pe = atomic_load_explicit(&g_vmodel_pick_exch, memory_order_relaxed);
+  const uint64_t pl = atomic_load_explicit(&g_vmodel_pick_play, memory_order_relaxed);
+  const uint64_t tp = atomic_load_explicit(&g_vmodel_top_pass, memory_order_relaxed);
+  const uint64_t te = atomic_load_explicit(&g_vmodel_top_exch, memory_order_relaxed);
+  const uint64_t tl = atomic_load_explicit(&g_vmodel_top_play, memory_order_relaxed);
   fprintf(stderr,
           "vmodel: %llu invocations | %llu picks | %llu no-pick | "
           "%llu disagreed with top equity (%.2f%% of picks)\n",
           (unsigned long long)invos, (unsigned long long)total,
           (unsigned long long)nop, (unsigned long long)disagree,
           total ? 100.0 * (double)disagree / (double)total : 0.0);
+  fprintf(stderr,
+          "vmodel: pick distribution: pass=%llu (%.1f%%) exch=%llu (%.1f%%) "
+          "play=%llu (%.1f%%)\n",
+          (unsigned long long)pp, total ? 100.0*pp/total : 0.0,
+          (unsigned long long)pe, total ? 100.0*pe/total : 0.0,
+          (unsigned long long)pl, total ? 100.0*pl/total : 0.0);
+  fprintf(stderr,
+          "vmodel: top-equity dist:  pass=%llu (%.1f%%) exch=%llu (%.1f%%) "
+          "play=%llu (%.1f%%)\n",
+          (unsigned long long)tp, total ? 100.0*tp/total : 0.0,
+          (unsigned long long)te, total ? 100.0*te/total : 0.0,
+          (unsigned long long)tl, total ? 100.0*tl/total : 0.0);
 }
 
 // V-model pick: score every move in the move-list with the trained model,
@@ -1910,9 +1934,28 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
   if (best_move) {
     atomic_fetch_add_explicit(&g_vmodel_total_calls, 1, memory_order_relaxed);
     // Disagreement = picked move is not the top-equity (movegen-sorted index 0).
-    if (best_move != move_list_get_move(ml, 0)) {
+    Move *top_eq = move_list_get_move(ml, 0);
+    if (best_move != top_eq) {
       atomic_fetch_add_explicit(&g_vmodel_disagreements, 1,
                                 memory_order_relaxed);
+    }
+    switch (move_get_type(best_move)) {
+      case GAME_EVENT_PASS:
+        atomic_fetch_add_explicit(&g_vmodel_pick_pass, 1, memory_order_relaxed); break;
+      case GAME_EVENT_EXCHANGE:
+        atomic_fetch_add_explicit(&g_vmodel_pick_exch, 1, memory_order_relaxed); break;
+      case GAME_EVENT_TILE_PLACEMENT_MOVE:
+        atomic_fetch_add_explicit(&g_vmodel_pick_play, 1, memory_order_relaxed); break;
+      default: break;
+    }
+    switch (move_get_type(top_eq)) {
+      case GAME_EVENT_PASS:
+        atomic_fetch_add_explicit(&g_vmodel_top_pass, 1, memory_order_relaxed); break;
+      case GAME_EVENT_EXCHANGE:
+        atomic_fetch_add_explicit(&g_vmodel_top_exch, 1, memory_order_relaxed); break;
+      case GAME_EVENT_TILE_PLACEMENT_MOVE:
+        atomic_fetch_add_explicit(&g_vmodel_top_play, 1, memory_order_relaxed); break;
+      default: break;
     }
   } else {
     atomic_fetch_add_explicit(&g_vmodel_no_pick, 1, memory_order_relaxed);
