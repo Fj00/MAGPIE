@@ -52,6 +52,7 @@
 #include "move_gen.h"
 #include "rack_list.h"
 #include "simmer.h"
+#include <math.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -1837,8 +1838,13 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
         kind, diff, shared->vmodel_turn,
         shared->vmodel_static_leaves);
     if (p < 0.0f) continue;  // unscored (stratum/bucket missing)
-    if (p > best_win) {       // strict > preserves equity-sorted tie order
-      best_win  = p;
+    // Round to 4 decimal places (0.01%) before tie-breaking: model SE on
+    // any single prediction is ~0.005, so numerical jitter finer than
+    // 1e-4 isn't real signal. Ties at this granularity fall back to
+    // movegen's equity-desc sort order (= HastyBot static equity).
+    const float p_round = roundf(p * 10000.0f) / 10000.0f;
+    if (p_round > best_win) {  // strict > preserves equity-sorted tie order
+      best_win  = p_round;
       best_move = m;
     }
   }
