@@ -1783,6 +1783,25 @@ static _Atomic uint64_t g_vmodel_pick_play    = 0;  // best_move was a play
 static _Atomic uint64_t g_vmodel_top_pass     = 0;  // top-equity was a pass
 static _Atomic uint64_t g_vmodel_top_exch     = 0;  // top-equity was an exchange
 static _Atomic uint64_t g_vmodel_top_play     = 0;  // top-equity was a play
+// Per-kind histograms over picked-move leave point-sum (0..50, clamped).
+// For pass: leave == rack, so this is rack point sum.
+// For exch/play: this is the kept-tile point sum.
+#define VMDBG_PTS_BUCKETS 51
+static _Atomic uint64_t g_vmodel_pts_hist_pass[VMDBG_PTS_BUCKETS];
+static _Atomic uint64_t g_vmodel_pts_hist_exch[VMDBG_PTS_BUCKETS];
+static _Atomic uint64_t g_vmodel_pts_hist_play[VMDBG_PTS_BUCKETS];
+// Distribution of n_tiles_exchanged (1..7) when the pick was an exchange.
+static _Atomic uint64_t g_vmodel_exch_n_hist[8];
+// English tile point values, indexed by python-canonical 0..26.
+static const uint8_t k_vmodel_tile_pts[27] = {
+    0,1,3,3,2,1,4,2,4,1,8,5,1,3,1,1,3,10,1,1,1,1,4,4,8,4,10};
+static int vmodel_indices_to_pts(const uint8_t *idx, int n) {
+  int s = 0;
+  for (int i = 0; i < n; i++) {
+    if (idx[i] < 27) s += k_vmodel_tile_pts[idx[i]];
+  }
+  return s;
+}
 
 void vmodel_log_stats(void) {
   const uint64_t invos = atomic_load_explicit(&g_vmodel_invocations,
@@ -1818,6 +1837,31 @@ void vmodel_log_stats(void) {
           (unsigned long long)tp, total ? 100.0*tp/total : 0.0,
           (unsigned long long)te, total ? 100.0*te/total : 0.0,
           (unsigned long long)tl, total ? 100.0*tl/total : 0.0);
+
+  // Histograms — print non-empty buckets.
+  fprintf(stderr, "vmodel: PASS leave-pts hist (rack pts when passing):\n");
+  for (int b = 0; b < VMDBG_PTS_BUCKETS; b++) {
+    uint64_t c = atomic_load_explicit(&g_vmodel_pts_hist_pass[b], memory_order_relaxed);
+    if (c) fprintf(stderr, "  %s%d: %llu\n", b == VMDBG_PTS_BUCKETS-1 ? ">=" : "",
+                   b, (unsigned long long)c);
+  }
+  fprintf(stderr, "vmodel: EXCH leave-pts hist (kept-tile pts when exchanging):\n");
+  for (int b = 0; b < VMDBG_PTS_BUCKETS; b++) {
+    uint64_t c = atomic_load_explicit(&g_vmodel_pts_hist_exch[b], memory_order_relaxed);
+    if (c) fprintf(stderr, "  %s%d: %llu\n", b == VMDBG_PTS_BUCKETS-1 ? ">=" : "",
+                   b, (unsigned long long)c);
+  }
+  fprintf(stderr, "vmodel: EXCH n_tiles_exch hist (1..7 throwbacks):\n");
+  for (int b = 1; b < 8; b++) {
+    uint64_t c = atomic_load_explicit(&g_vmodel_exch_n_hist[b], memory_order_relaxed);
+    if (c) fprintf(stderr, "  exch %d tiles: %llu\n", b, (unsigned long long)c);
+  }
+  fprintf(stderr, "vmodel: PLAY leave-pts hist (kept-tile pts after a play):\n");
+  for (int b = 0; b < VMDBG_PTS_BUCKETS; b++) {
+    uint64_t c = atomic_load_explicit(&g_vmodel_pts_hist_play[b], memory_order_relaxed);
+    if (c) fprintf(stderr, "  %s%d: %llu\n", b == VMDBG_PTS_BUCKETS-1 ? ">=" : "",
+                   b, (unsigned long long)c);
+  }
 }
 
 // V-model pick: score every move in the move-list with the trained model,
@@ -1939,13 +1983,36 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
       atomic_fetch_add_explicit(&g_vmodel_disagreements, 1,
                                 memory_order_relaxed);
     }
+    // Re-derive the best move's leave for histogram bucketing.
+    rack_reset(&leave_rack);
+    get_leave_for_move(best_move, game, &leave_rack);
+    uint8_t bm_leave_idx[16];
+    int bm_leave_len = vmodel_extract_rack_indices(&leave_rack, bm_leave_idx, 16);
+    int leave_pts = vmodel_indices_to_pts(bm_leave_idx, bm_leave_len);
+    if (leave_pts < 0) leave_pts = 0;
+    if (leave_pts >= VMDBG_PTS_BUCKETS) leave_pts = VMDBG_PTS_BUCKETS - 1;
     switch (move_get_type(best_move)) {
       case GAME_EVENT_PASS:
-        atomic_fetch_add_explicit(&g_vmodel_pick_pass, 1, memory_order_relaxed); break;
-      case GAME_EVENT_EXCHANGE:
-        atomic_fetch_add_explicit(&g_vmodel_pick_exch, 1, memory_order_relaxed); break;
+        atomic_fetch_add_explicit(&g_vmodel_pick_pass, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_vmodel_pts_hist_pass[leave_pts], 1,
+                                  memory_order_relaxed);
+        break;
+      case GAME_EVENT_EXCHANGE: {
+        atomic_fetch_add_explicit(&g_vmodel_pick_exch, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_vmodel_pts_hist_exch[leave_pts], 1,
+                                  memory_order_relaxed);
+        int n_exch = rack_len - bm_leave_len;
+        if (n_exch >= 1 && n_exch <= 7) {
+          atomic_fetch_add_explicit(&g_vmodel_exch_n_hist[n_exch], 1,
+                                    memory_order_relaxed);
+        }
+        break;
+      }
       case GAME_EVENT_TILE_PLACEMENT_MOVE:
-        atomic_fetch_add_explicit(&g_vmodel_pick_play, 1, memory_order_relaxed); break;
+        atomic_fetch_add_explicit(&g_vmodel_pick_play, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_vmodel_pts_hist_play[leave_pts], 1,
+                                  memory_order_relaxed);
+        break;
       default: break;
     }
     switch (move_get_type(top_eq)) {
