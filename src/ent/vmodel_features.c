@@ -298,6 +298,13 @@ float vmodel_predict(const VModel *m,
                       const uint8_t *leave_indices, int leave_len,
                       int kind, int diff, int turn,
                       const StaticLeaves *sl) {
+    // The `turn` arg controls the terminal-zero-score gate (which
+    // collapses K1_L3..6 to "all" and switches K0/K1 to the compact pts
+    // indicator schema). What matters is the MODEL's training turn,
+    // not the game's current turn — the schema must match the trained
+    // coefs. Override unconditionally so callers can pass game-turn as
+    // a documentation hint without affecting inference.
+    turn = m->turn;
     VModelLeaveType lt = vmodel_classify_leave(leave_indices, leave_len);
     int si = vmodel_stratum_index(m, kind, leave_len, lt, turn);
     if (si < 0) return -1.0f;

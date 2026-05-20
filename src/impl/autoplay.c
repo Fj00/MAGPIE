@@ -1807,13 +1807,11 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
   // turn_number is 0-indexed; compare 1-indexed.
   if (game_runner->turn_number + 1 != shared->vmodel_turn) return NULL;
   Game *game = game_runner->game;
-  // The model is trained at bag=93 (= unseen pile fixed at 93). At
-  // T6 in the EB cycle, this is satisfied iff the board is still empty
-  // (all 5 prior turns were passes/exchanges). For non-opener T6 the
-  // diff bucket-lookup misses (diff != 0) and every move scores -1, so
-  // the function returns NULL and falls through to HastyBot anyway —
-  // but we skip the wasted movegen + predict loop and the diagnostic
-  // counters reflect the true model-applicability ratio.
+  // T6 model assumes bag=93 / board empty / both scores 0. Skip if the
+  // game state doesn't match those assumptions — falls through to
+  // HastyBot. For natural autoplay this means vmodel only fires at the
+  // configured turn when the board is still empty (= game-turn 1, or
+  // any later turn following an unbroken sequence of passes/exchanges).
   if (board_get_tiles_played(game_get_board(game)) != 0) return NULL;
   atomic_fetch_add_explicit(&g_vmodel_invocations, 1, memory_order_relaxed);
 
