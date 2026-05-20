@@ -2028,6 +2028,14 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
   // tiles for racks not in the pool). Applied symmetrically to both
   // players: after an exchange, the new rack is re-checked, so a player
   // who exchanges into a pass-favorable rack starts passing.
+  // V-model decision hook (raised ahead of pass-cycle preemption): when
+  // the V model is the decision-maker for this turn, it sees the full
+  // movegen output INCLUDING pass — so we don't want the pass-cycle
+  // classifier to preempt the call. The V model decides pass-vs-play
+  // itself based on which has the highest predicted win%.
+  if (!move) {
+    move = vmodel_pick_top_move(autoplay_worker, game_runner);
+  }
   if (!move && game_runner->pass_cycle_active &&
       game_runner->pass_cycle_branch == 0 &&
       board_get_tiles_played(game_get_board(game)) == 0) {
@@ -2063,10 +2071,6 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
   // iter_count-derived force_kind bits.)
   if (!move) {
     move = try_forced_move(autoplay_worker, game_runner);
-  }
-  // V-model decision hook: replaces HastyBot at the configured turn.
-  if (!move) {
-    move = vmodel_pick_top_move(autoplay_worker, game_runner);
   }
   if (!move) {
     move = game_runner_get_best_move(autoplay_worker, game_runner);
