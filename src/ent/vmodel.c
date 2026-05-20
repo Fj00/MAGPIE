@@ -94,6 +94,16 @@ static bool parse_float(char **rest, float *out) {
     return true;
 }
 
+static bool parse_double(char **rest, double *out) {
+    char *t = next_token(rest);
+    if (!t) return false;
+    char *end = NULL;
+    double v = strtod(t, &end);
+    if (end == t) return false;
+    *out = v;
+    return true;
+}
+
 static bool parse_str(char **rest, char *out, size_t cap) {
     char *t = next_token(rest);
     if (!t) return false;
@@ -291,9 +301,9 @@ static bool parse_stratum(FILE *f, VStratum *s) {
                 if (!parse_int(&peek, &b->n_drawn)) {
                     log_warn("vmodel: bad DRAWN n in %s", s->key); return false;
                 }
-                b->drawn = malloc(sizeof(float) * b->n_drawn);
+                b->drawn = malloc(sizeof(double) * b->n_drawn);
                 for (int j = 0; j < b->n_drawn; j++) {
-                    if (!parse_float(&peek, &b->drawn[j])) {
+                    if (!parse_double(&peek, &b->drawn[j])) {
                         log_warn("vmodel: bad DRAWN val in %s", s->key); return false;
                     }
                 }

@@ -114,6 +114,7 @@ static TestEntry test_table[] = {
     {"wmg", test_wmp_move_gen},
     {"winpct", test_win_pct},
     {"vmodel", test_vmodel},
+    {"vmodel_verify", test_vmodel_verify},
     {"endgame", test_endgame},
     {"eldar_v", test_eldar_v_stick},
     {"zobrist", test_zobrist},

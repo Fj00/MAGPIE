@@ -37,7 +37,9 @@ typedef struct VBucket {
     int     n_pts;
     int    *pts;            // [n_pts]  optional pts_indicators
     int     n_drawn;
-    float  *drawn;          // [n_drawn]  optional drawn_indicators
+    double *drawn;          // [n_drawn]  optional drawn_indicators (double:
+                            // Python rounds to 4dp and compares exact-equal;
+                            // float32 would round-trip-lose precision)
     int     n_bag;
     uint8_t *bag_tiles;     // [n_bag]  python-canonical tile index (0='?'..26='Z')
     int8_t  *bag_counts;    // [n_bag]
