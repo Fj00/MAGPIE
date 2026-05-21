@@ -1831,9 +1831,10 @@ static _Atomic uint64_t g_vmodel_rack_pts_hist[VMDBG_PTS_BUCKETS];
 // Rank of the chosen move within its kind, equity-sorted (0 = top equity).
 // Tracks whether the V model usually picks near the top of HastyBot's
 // equity ranking (=> can be safely truncated to top-N candidates) or
-// scatters across the list. Bucket k counts picks at equity-rank k;
-// last bucket clamps to "deep" picks.
-#define VMDBG_RANK_BUCKETS 64
+// scatters across the list. One slot per rank up to MAX (last slot
+// clamps anything deeper). MAX sized to fit the worst-case opener move
+// count comfortably (plays can hit ~2000 candidates with ?-rich racks).
+#define VMDBG_RANK_BUCKETS 2048
 static _Atomic uint64_t g_vmodel_play_rank_hist[VMDBG_RANK_BUCKETS];
 static _Atomic uint64_t g_vmodel_exch_rank_hist[VMDBG_RANK_BUCKETS];
 // Total candidates in move list per kind (sum of counts across picks).
