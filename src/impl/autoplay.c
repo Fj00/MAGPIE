@@ -21,6 +21,7 @@
 #include "../ent/static_leaves.h"
 #include "../ent/vmodel.h"
 #include "../ent/vmodel_features.h"
+#include "../ent/vmodel_picks.h"
 #include "../ent/game.h"
 #include "../ent/empty_board.h"
 #include "../ent/empty_board_strata.h"
@@ -235,6 +236,15 @@ typedef struct AutoplaySharedData {
   VModel *vmodels[7];   // indexed by game turn (1..6); slot 0 unused
   StaticLeaves *vmodel_static_leaves;
   int vmodel_any_loaded;
+  // Precomputed rack -> chosen move lookup tables, one slot per game
+  // turn. Each .picks file declares its training turn; the loader
+  // places it in the matching slot. When set, `try_vmodel_picks_pick`
+  // short-circuits ahead of the inference-based `vmodel_pick_top_move`,
+  // collapsing the per-call cost to ~200 ns (binary search) instead of
+  // tens of µs of movegen + scoring. Env var:
+  //   MAGPIE_VMODEL_PICKS_PATHS — colon-separated .picks files
+  VModelPicks *vmodel_picks[7];
+  int vmodel_picks_any_loaded;
   const LetterDistribution *ld;
 } AutoplaySharedData;
 
@@ -914,9 +924,13 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
 
   // V-model inference: load any number of .vmt files. Each declares its
   // own training turn (m->turn) and goes into the matching slot.
-  for (int i = 0; i < 7; i++) shared_data->vmodels[i] = NULL;
+  for (int i = 0; i < 7; i++) {
+    shared_data->vmodels[i] = NULL;
+    shared_data->vmodel_picks[i] = NULL;
+  }
   shared_data->vmodel_static_leaves = NULL;
   shared_data->vmodel_any_loaded = 0;
+  shared_data->vmodel_picks_any_loaded = 0;
   {
     // Build a working list of paths from MAGPIE_VMODEL_PATHS (colon-
     // separated) plus the back-compat singleton MAGPIE_VMODEL_PATH.
@@ -972,6 +986,34 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
       }
     }
     free(combined);
+  }
+
+  // V-model picks (precomputed rack→move lookup tables). Same env-var
+  // shape as MAGPIE_VMODEL_PATHS: colon-separated .picks files. Each
+  // file declares its training turn in its header; loader places it
+  // in the matching slot.
+  {
+    const char *picks_env = getenv("MAGPIE_VMODEL_PICKS_PATHS");
+    if (picks_env && picks_env[0] != '\0') {
+      char *combined = strdup(picks_env);
+      char *saveptr = NULL;
+      for (char *p = strtok_r(combined, ":", &saveptr); p;
+           p = strtok_r(NULL, ":", &saveptr)) {
+        if (p[0] == '\0') continue;
+        VModelPicks *pk = vmodel_picks_create(p);
+        if (!pk) log_fatal("vmodel_picks: failed to load %s", p);
+        int t = pk->model_turn;
+        if (t < 1 || t > 6) log_fatal(
+            "vmodel_picks: model_turn %d out of range in %s", t, p);
+        if (shared_data->vmodel_picks[t]) {
+          log_fatal("vmodel_picks: duplicate file for T%d (existing + %s)",
+                    t, p);
+        }
+        shared_data->vmodel_picks[t] = pk;
+        shared_data->vmodel_picks_any_loaded = 1;
+      }
+      free(combined);
+    }
   }
 
   shared_data->empty_board_recorder = NULL;
@@ -1056,10 +1098,12 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
   void vmodel_log_stats(void);  // defined later in this TU
-  if (shared_data->vmodel_any_loaded) {
+  if (shared_data->vmodel_any_loaded ||
+      shared_data->vmodel_picks_any_loaded) {
     vmodel_log_stats();
   }
   for (int i = 0; i < 7; i++) vmodel_destroy(shared_data->vmodels[i]);
+  for (int i = 0; i < 7; i++) vmodel_picks_destroy(shared_data->vmodel_picks[i]);
   static_leaves_destroy(shared_data->vmodel_static_leaves);
   free(shared_data);
 }
@@ -1802,6 +1846,50 @@ static int vmodel_extract_rack_indices(const Rack *rack, uint8_t *out_buf,
   return n;
 }
 
+// V-model picks (precomputed table) dispatch counters. Per-turn and
+// total. Logged at shutdown alongside the inference-path stats.
+static _Atomic uint64_t g_vmodel_picks_hits = 0;
+static _Atomic uint64_t g_vmodel_picks_misses = 0;
+
+// Try the precomputed rack→move table for the current turn. Returns
+// a Move* if hit (caller uses verbatim), NULL on miss / no table /
+// non-empty board. Same turn + bag=93 board-empty gate as
+// vmodel_pick_top_move so the two share the same applicability.
+static const Move *try_vmodel_picks_pick(AutoplayWorker *autoplay_worker,
+                                          GameRunner *game_runner) {
+  AutoplaySharedData *shared = game_runner->shared_data;
+  if (!shared->vmodel_picks_any_loaded) return NULL;
+  const int game_turn = game_runner->turn_number + 1;
+  if (game_turn < 1 || game_turn > 6) return NULL;
+  const VModelPicks *picks = shared->vmodel_picks[game_turn];
+  if (!picks) return NULL;
+  Game *game = game_runner->game;
+  if (board_get_tiles_played(game_get_board(game)) != 0) return NULL;
+
+  const int player_on_turn_index = game_get_player_on_turn_index(game);
+  Rack *player_rack =
+      player_get_rack(game_get_player(game, player_on_turn_index));
+  uint8_t key[VMODEL_PICKS_RACK_KEY_LEN];
+  vmodel_picks_key_for_rack(player_rack, key);
+  const Move *m = vmodel_picks_lookup(picks, key);
+  if (m == NULL) {
+    atomic_fetch_add_explicit(&g_vmodel_picks_misses, 1,
+                              memory_order_relaxed);
+    return NULL;
+  }
+  atomic_fetch_add_explicit(&g_vmodel_picks_hits, 1,
+                            memory_order_relaxed);
+  // Copy into spare so the caller has a stable Move* even after the
+  // picks table is destroyed (defensive — table lives for process
+  // lifetime, but matches the existing eb_forced_move pattern).
+  MoveList *ml = autoplay_worker->eb_move_list
+                     ? autoplay_worker->eb_move_list
+                     : autoplay_worker->move_lists[player_on_turn_index];
+  Move *spare = move_list_get_spare_move(ml);
+  move_copy(spare, m);
+  return spare;
+}
+
 // Diagnostic counters incremented every time vmodel fires. Atomic so
 // concurrent workers don't lose updates. Printed at shutdown via
 // vmodel_log_stats().
@@ -2038,6 +2126,17 @@ void vmodel_log_stats(void) {
             "vmodel: cache: hits=%llu misses=%llu (%.1f%% hit rate)\n",
             (unsigned long long)ch, (unsigned long long)cm,
             100.0 * (double)ch / (double)(ch + cm));
+  }
+  // Precomputed picks stats (if active).
+  const uint64_t ph = atomic_load_explicit(&g_vmodel_picks_hits,
+                                            memory_order_relaxed);
+  const uint64_t pm = atomic_load_explicit(&g_vmodel_picks_misses,
+                                            memory_order_relaxed);
+  if (ph + pm) {
+    fprintf(stderr,
+            "vmodel_picks: %llu hits, %llu misses (%.2f%% hit rate)\n",
+            (unsigned long long)ph, (unsigned long long)pm,
+            100.0 * (double)ph / (double)(ph + pm));
   }
 }
 
@@ -2443,6 +2542,13 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
   // movegen output INCLUDING pass — so we don't want the pass-cycle
   // classifier to preempt the call. The V model decides pass-vs-play
   // itself based on which has the highest predicted win%.
+  //
+  // Precomputed picks table tried FIRST (~200ns binary-search lookup),
+  // inference fallback (movegen + per-move scoring) tried SECOND
+  // (~tens of µs per call). Both gated identically.
+  if (!move) {
+    move = try_vmodel_picks_pick(autoplay_worker, game_runner);
+  }
   if (!move) {
     move = vmodel_pick_top_move(autoplay_worker, game_runner);
   }
