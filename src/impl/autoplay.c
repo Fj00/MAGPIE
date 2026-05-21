@@ -1011,6 +1011,9 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
         }
         shared_data->vmodel_picks[t] = pk;
         shared_data->vmodel_picks_any_loaded = 1;
+        fprintf(stderr,
+                "vmodel_picks: loaded %s for T%d (%d entries)\n",
+                p, t, pk->n_entries);
       }
       free(combined);
     }
