@@ -47,6 +47,7 @@
 #include "string_util_test.h"
 #include "transposition_table_test.h"
 #include "validated_move_test.h"
+#include "vmodel_picks_test.h"
 #include "vmodel_test.h"
 #include "win_pct_test.h"
 #include "wmp_maker_test.h"
@@ -115,6 +116,7 @@ static TestEntry test_table[] = {
     {"winpct", test_win_pct},
     {"vmodel", test_vmodel},
     {"vmodel_verify", test_vmodel_verify},
+    {"vmodel_picks", test_vmodel_picks},
     {"endgame", test_endgame},
     {"eldar_v", test_eldar_v_stick},
     {"zobrist", test_zobrist},
