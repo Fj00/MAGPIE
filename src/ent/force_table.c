@@ -1098,22 +1098,31 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
                       ld->ld_ml_to_hl[t->subleave_mls[1]][0];
       }
     }
-    // current/target/forced_games_estimate aren't tracked precisely after
-    // runtime; emit 0 placeholders except deficit (the reliable field).
-    // Diff range and rarity_score echoed back as-loaded.
+    // current/target: reconstructed from original_deficit so each dumped
+    // row is self-consistent (current + deficit == target) instead of the
+    // old 0,0 placeholders. STRATUM cells emit the per-side target T (col
+    // 7 is reload-safe — the regular loader reconstructs deficit = 2T);
+    // non-STRATUM emit original_deficit, with current = work done so far.
+    // forced_games_estimate genuinely isn't tracked at runtime — stays 0.
     // For STRATUM cells also emit per-cell W/L tally and per-side target
     // (Phase 3 diagnostic — shows whether stuck cells are W- or L-skewed).
     uint32_t obs_w = 0, obs_l = 0;
     int per_side = 0;
+    int64_t cur_col = 0, tgt_col = 0;
     if (t->kind == FORCE_TARGET_STRATUM) {
       force_table_get_stratum_wl(table, i, &obs_w, &obs_l);
       per_side = t->stratum_per_side;
+      tgt_col = t->stratum_per_side;
+    } else {
+      tgt_col = t->original_deficit;
+      cur_col = t->original_deficit - t->deficit;
     }
     uint64_t cred_attempts = atomic_load_explicit(
         &t->credit_attempts, memory_order_relaxed);
-    fprintf(f, "%s,%d,%d,%s,%d,%s,0,0,%lld,0,%d,%d,%.6e,%u,%u,%d,%llu\n",
+    fprintf(f, "%s,%d,%d,%s,%d,%s,%lld,%lld,%lld,0,%d,%d,%.6e,%u,%u,%d,%llu\n",
             kind_names[t->kind], t->bag, t->leave_length,
             type_names[t->leave_type], t->exchange, subleave,
+            (long long)cur_col, (long long)tgt_col,
             (long long)t->deficit, t->diff_min, t->diff_max,
             t->rarity_score, obs_w, obs_l, per_side,
             (unsigned long long)cred_attempts);
