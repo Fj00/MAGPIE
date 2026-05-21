@@ -65,6 +65,23 @@
 // the progress line to investigate the multi-credit regression (cf.
 // noble-popping-kitten plan).
 static _Atomic uint64_t g_eb_leaves_emitted = 0;
+// Per-leaf cost decomposition counters (noble-popping-kitten plan, T5
+// vs T6 ms/leaf gap). All reset per progress tick alongside leaves.
+//   post_turns: HastyBot turns played past the TARGET turn, summed across
+//               leaves. Divide by leaves → avg POST length.
+//   movegen_calls: eb_enumerate_actions calls that reached generate_moves
+//                  (i.e. role != REC_PRE/POST and board empty).
+//   game_copies: game_duplicate + game_copy invocations inside play_eb_dfs.
+//   target_fanout_total / _count: sum and count of TARGET-role populated
+//                                  slot counts → avg fanout per TARGET
+//                                  enumeration.
+//   force_decrements: force_table_decrement_target calls from eb_emit_leaf.
+static _Atomic uint64_t g_eb_post_turns_total = 0;
+static _Atomic uint64_t g_eb_dfs_movegen_calls = 0;
+static _Atomic uint64_t g_eb_dfs_game_copies = 0;
+static _Atomic uint64_t g_eb_target_fanout_total = 0;
+static _Atomic uint64_t g_eb_target_fanout_count = 0;
+static _Atomic uint64_t g_eb_force_decrement_calls = 0;
 // Multi-credit pipeline cell-count diagnostics. Each is incremented at a
 // distinct stage so we can see whether cells are lost between annotate
 // (slot population), dfs (per-fork-iter propagation into snap arrays),
@@ -2967,6 +2984,18 @@ void print_current_status(AutoplayWorker *autoplay_worker,
       s_seen[i] = atomic_exchange_explicit(&g_eb_stratum_seen_by_len[i], 0,
                                            memory_order_relaxed);
     }
+    const uint64_t post_turns = atomic_exchange_explicit(
+        &g_eb_post_turns_total, 0, memory_order_relaxed);
+    const uint64_t dfs_movegens = atomic_exchange_explicit(
+        &g_eb_dfs_movegen_calls, 0, memory_order_relaxed);
+    const uint64_t dfs_copies = atomic_exchange_explicit(
+        &g_eb_dfs_game_copies, 0, memory_order_relaxed);
+    const uint64_t target_fanout_total = atomic_exchange_explicit(
+        &g_eb_target_fanout_total, 0, memory_order_relaxed);
+    const uint64_t target_fanout_count = atomic_exchange_explicit(
+        &g_eb_target_fanout_count, 0, memory_order_relaxed);
+    const uint64_t force_decs = atomic_exchange_explicit(
+        &g_eb_force_decrement_calls, 0, memory_order_relaxed);
     string_builder_add_formatted_string(
         status_sb,
         " counters: leaves=%llu annot=%llu prop=%llu emitc=%llu "
@@ -2977,7 +3006,9 @@ void print_current_status(AutoplayWorker *autoplay_worker,
         "strat_seen_L0-5=%llu,%llu,%llu,%llu,%llu,%llu "
         "l3p_outer=%llu l3p_typehit=%llu l3p_typepass=%llu "
         "l3p_iter[STRAT,TILE,PAIR]=%llu,%llu,%llu "
-        "l3p_match[STRAT,TILE,PAIR]=%llu,%llu,%llu.\n",
+        "l3p_match[STRAT,TILE,PAIR]=%llu,%llu,%llu "
+        "perfcnt: post_turns=%llu movegens=%llu copies=%llu "
+        "tgt_fanout=%llu/%llu force_decs=%llu.\n",
         (unsigned long long)leaves,
         (unsigned long long)annot,
         (unsigned long long)prop,
@@ -3016,7 +3047,13 @@ void print_current_status(AutoplayWorker *autoplay_worker,
         (unsigned long long)atomic_exchange_explicit(
             &g_eb_l3p_gate_match_by_prio[1], 0, memory_order_relaxed),
         (unsigned long long)atomic_exchange_explicit(
-            &g_eb_l3p_gate_match_by_prio[2], 0, memory_order_relaxed));
+            &g_eb_l3p_gate_match_by_prio[2], 0, memory_order_relaxed),
+        (unsigned long long)post_turns,
+        (unsigned long long)dfs_movegens,
+        (unsigned long long)dfs_copies,
+        (unsigned long long)target_fanout_total,
+        (unsigned long long)target_fanout_count,
+        (unsigned long long)force_decs);
   } else {
     string_builder_add_string(status_sb, "\n");
   }
@@ -3615,6 +3652,8 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
       .tiles_played_bv = NULL,
       .initial_tiles_bv = 0};
+  atomic_fetch_add_explicit(&g_eb_dfs_movegen_calls, 1,
+                            memory_order_relaxed);
   generate_moves(&gen_args);
   const int n_moves = move_list_get_count(ml);
   move_list_sort_moves(ml);
@@ -3826,6 +3865,12 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   for (int i = 0; i <= max_slot; i++) {
     if (gr->eb_action_present[i]) populated++;
   }
+  if (role == EB_ROLE_TARGET) {
+    atomic_fetch_add_explicit(&g_eb_target_fanout_total, (uint64_t)populated,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_eb_target_fanout_count, 1,
+                              memory_order_relaxed);
+  }
   return populated >= 2 ? max_slot + 1 : 0;
 }
 
@@ -3886,6 +3931,8 @@ static void eb_emit_leaf(AutoplayWorker *w, GameRunner *gr, uint64_t branch_id) 
       ForceTarget *ft_target = gr->eb_snap_force_targets[target_turn][k];
       if (ft_target != NULL) {
         atomic_fetch_add_explicit(&g_eb_emit_cells_credited, 1,
+                                   memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_eb_force_decrement_calls, 1,
                                    memory_order_relaxed);
         force_table_credit_game(
             w->shared_data->force_table, ft_target,
@@ -4193,6 +4240,10 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
       if (natural_turn >= 1 && natural_turn <= 6) {
         gr->eb_snap_force_target_count[natural_turn] = 0;
       }
+      if (natural_turn > w->shared_data->eb_target_turn) {
+        atomic_fetch_add_explicit(&g_eb_post_turns_total, 1,
+                                  memory_order_relaxed);
+      }
       game_runner_play_move(w, gr);
       continue;
     }
@@ -4227,6 +4278,8 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
     // fork's restore, leaving the game in a foreign player's mid-iteration
     // state.
     Game *saved_game = game_duplicate(gr->game);
+    atomic_fetch_add_explicit(&g_eb_dfs_game_copies, 1,
+                              memory_order_relaxed);
 
     const int fork_turn = saved_meta.n_snaps + 1;  // turn about to be played
     for (int s = 0; s < n_actions; s++) {
@@ -4267,6 +4320,8 @@ static void play_eb_dfs(AutoplayWorker *w, GameRunner *gr,
       // populated for that position.
       play_eb_dfs(w, gr, (branch_id << 8) | (uint64_t)(s + 1));
       game_copy(gr->game, saved_game);
+      atomic_fetch_add_explicit(&g_eb_dfs_game_copies, 1,
+                                memory_order_relaxed);
       eb_meta_restore(gr, &saved_meta);
     }
     game_destroy(saved_game);
