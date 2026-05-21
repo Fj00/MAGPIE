@@ -2020,6 +2020,19 @@ static int vmodel_indices_to_pts(const uint8_t *idx, int n) {
 }
 
 void vmodel_log_stats(void) {
+  // Always emit picks stats up-front — when picks cover every rack the
+  // inference path may have zero invocations, in which case we'd skip
+  // the rest of this function but still want to report the picks usage.
+  const uint64_t ph_top = atomic_load_explicit(&g_vmodel_picks_hits,
+                                                memory_order_relaxed);
+  const uint64_t pm_top = atomic_load_explicit(&g_vmodel_picks_misses,
+                                                memory_order_relaxed);
+  if (ph_top + pm_top) {
+    fprintf(stderr,
+            "vmodel_picks: %llu hits, %llu misses (%.2f%% hit rate)\n",
+            (unsigned long long)ph_top, (unsigned long long)pm_top,
+            100.0 * (double)ph_top / (double)(ph_top + pm_top));
+  }
   const uint64_t invos = atomic_load_explicit(&g_vmodel_invocations,
                                               memory_order_relaxed);
   if (invos == 0) return;
@@ -2129,17 +2142,6 @@ void vmodel_log_stats(void) {
             "vmodel: cache: hits=%llu misses=%llu (%.1f%% hit rate)\n",
             (unsigned long long)ch, (unsigned long long)cm,
             100.0 * (double)ch / (double)(ch + cm));
-  }
-  // Precomputed picks stats (if active).
-  const uint64_t ph = atomic_load_explicit(&g_vmodel_picks_hits,
-                                            memory_order_relaxed);
-  const uint64_t pm = atomic_load_explicit(&g_vmodel_picks_misses,
-                                            memory_order_relaxed);
-  if (ph + pm) {
-    fprintf(stderr,
-            "vmodel_picks: %llu hits, %llu misses (%.2f%% hit rate)\n",
-            (unsigned long long)ph, (unsigned long long)pm,
-            100.0 * (double)ph / (double)(ph + pm));
   }
 }
 
