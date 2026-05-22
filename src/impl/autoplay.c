@@ -3814,6 +3814,37 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
         for (int k = 0; k < n_sigs; k++) {
           if (strcmp(slot_sig[k], sig) == 0) { dup = true; break; }
         }
+        // Blank-exchange trace stage 3: when a blank-throwing exchange
+        // is about to be dropped as a dup, dump its thrown tiles +
+        // rendered leave + sig so we can see what it collided with.
+        // Capped to the first ~30 occurrences process-wide.
+        if (dup && kind == GAME_EVENT_EXCHANGE) {
+          int candbk = 0;
+          const int ctl = move_get_tiles_length(cand);
+          for (int i = 0; i < ctl; i++) {
+            if (move_get_tile(cand, i) == BLANK_MACHINE_LETTER) { candbk = 1; break; }
+          }
+          if (candbk) {
+            static _Atomic int g_eb_exch_dup_logged = 0;
+            int seen = atomic_fetch_add_explicit(&g_eb_exch_dup_logged, 1,
+                                                 memory_order_relaxed);
+            if (seen < 30) {
+              char thrown[32] = {0};
+              int tn = 0;
+              for (int i = 0; i < ctl && tn < 30; i++) {
+                const MachineLetter t = move_get_tile(cand, i);
+                thrown[tn++] = (t == BLANK_MACHINE_LETTER)
+                                   ? '?' : (char)('A' + t - 1);
+              }
+              char rackbuf[RACK_SIZE + 2] = {0};
+              eb_canonical_rack(gr->game, p_idx, rackbuf);
+              fprintf(stderr,
+                      "EXCHDUP: rack=%s thrown=[%s] leave='%s' sig='%s' "
+                      "collides-with-existing-slot\n",
+                      rackbuf, thrown, leave_str, sig);
+            }
+          }
+        }
         if (dup) continue;
         // For TILE_PLACEMENT plays under the play_index targeted filter:
         // include only the first distinct play (top-equity) PLUS plays
