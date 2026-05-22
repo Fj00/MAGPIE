@@ -82,6 +82,18 @@ static _Atomic uint64_t g_eb_dfs_game_copies = 0;
 static _Atomic uint64_t g_eb_target_fanout_total = 0;
 static _Atomic uint64_t g_eb_target_fanout_count = 0;
 static _Atomic uint64_t g_eb_force_decrement_calls = 0;
+// Blank-exchange tracing (investigating why K1 strata never record a
+// thrown blank). Three stages along the fanout path at the TARGET turn:
+//   exch_gen:   exchange moves emitted by generate_moves
+//   exch_genbk: of those, ones whose thrown tiles include a blank
+//   exch_slot:  exchange slots that survived dedup into the fanout
+//   exch_slotbk: of those, ones with a blank in the thrown tiles
+// If genbk>0 but slotbk==0 the loss is in eb_enumerate_actions dedup;
+// if genbk==0 the loss is in generate_moves for this code path.
+static _Atomic uint64_t g_eb_exch_gen = 0;
+static _Atomic uint64_t g_eb_exch_genbk = 0;
+static _Atomic uint64_t g_eb_exch_slot = 0;
+static _Atomic uint64_t g_eb_exch_slotbk = 0;
 // Multi-credit pipeline cell-count diagnostics. Each is incremented at a
 // distinct stage so we can see whether cells are lost between annotate
 // (slot population), dfs (per-fork-iter propagation into snap arrays),
@@ -2996,6 +3008,14 @@ void print_current_status(AutoplayWorker *autoplay_worker,
         &g_eb_target_fanout_count, 0, memory_order_relaxed);
     const uint64_t force_decs = atomic_exchange_explicit(
         &g_eb_force_decrement_calls, 0, memory_order_relaxed);
+    const uint64_t exch_gen = atomic_exchange_explicit(
+        &g_eb_exch_gen, 0, memory_order_relaxed);
+    const uint64_t exch_genbk = atomic_exchange_explicit(
+        &g_eb_exch_genbk, 0, memory_order_relaxed);
+    const uint64_t exch_slot = atomic_exchange_explicit(
+        &g_eb_exch_slot, 0, memory_order_relaxed);
+    const uint64_t exch_slotbk = atomic_exchange_explicit(
+        &g_eb_exch_slotbk, 0, memory_order_relaxed);
     string_builder_add_formatted_string(
         status_sb,
         " counters: leaves=%llu annot=%llu prop=%llu emitc=%llu "
@@ -3008,7 +3028,8 @@ void print_current_status(AutoplayWorker *autoplay_worker,
         "l3p_iter[STRAT,TILE,PAIR]=%llu,%llu,%llu "
         "l3p_match[STRAT,TILE,PAIR]=%llu,%llu,%llu "
         "perfcnt: post_turns=%llu movegens=%llu copies=%llu "
-        "tgt_fanout=%llu/%llu force_decs=%llu.\n",
+        "tgt_fanout=%llu/%llu force_decs=%llu "
+        "exch[gen=%llu genbk=%llu slot=%llu slotbk=%llu].\n",
         (unsigned long long)leaves,
         (unsigned long long)annot,
         (unsigned long long)prop,
@@ -3053,7 +3074,11 @@ void print_current_status(AutoplayWorker *autoplay_worker,
         (unsigned long long)dfs_copies,
         (unsigned long long)target_fanout_total,
         (unsigned long long)target_fanout_count,
-        (unsigned long long)force_decs);
+        (unsigned long long)force_decs,
+        (unsigned long long)exch_gen,
+        (unsigned long long)exch_genbk,
+        (unsigned long long)exch_slot,
+        (unsigned long long)exch_slotbk);
   } else {
     string_builder_add_string(status_sb, "\n");
   }
@@ -3663,6 +3688,23 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   int max_slot = -1;
   int play_slot = -1;  // populated slot index of the best-play action
 
+  // Blank-exchange trace stage 1: count exchange moves straight from
+  // generate_moves, and how many throw a blank (thrown tile == ml 0).
+  if (role == EB_ROLE_TARGET) {
+    for (int m = 0; m < n_moves; m++) {
+      const Move *mv = move_list_get_move(ml, m);
+      if (move_get_type(mv) != GAME_EVENT_EXCHANGE) continue;
+      atomic_fetch_add_explicit(&g_eb_exch_gen, 1, memory_order_relaxed);
+      const int tl = move_get_tiles_length(mv);
+      for (int i = 0; i < tl; i++) {
+        if (move_get_tile(mv, i) == BLANK_MACHINE_LETTER) {
+          atomic_fetch_add_explicit(&g_eb_exch_genbk, 1, memory_order_relaxed);
+          break;
+        }
+      }
+    }
+  }
+
   if (role == EB_ROLE_TARGET) {
     // Full fan-out: pass + every distinct (action_type, score, leave) action.
     // Blank-letter equivalents (MANE/SANE/CANE — same score and leave,
@@ -3787,6 +3829,19 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
         memcpy(slot_sig[n_sigs++], sig, SIG_LEN);
         move_copy(gr->eb_action_buf[slot], cand);
         gr->eb_action_present[slot] = true;
+        // Blank-exchange trace stage 2: count exchange slots that
+        // survived dedup, and how many throw a blank.
+        if (kind == GAME_EVENT_EXCHANGE) {
+          atomic_fetch_add_explicit(&g_eb_exch_slot, 1, memory_order_relaxed);
+          const int tl = move_get_tiles_length(cand);
+          for (int i = 0; i < tl; i++) {
+            if (move_get_tile(cand, i) == BLANK_MACHINE_LETTER) {
+              atomic_fetch_add_explicit(&g_eb_exch_slotbk, 1,
+                                        memory_order_relaxed);
+              break;
+            }
+          }
+        }
         if (kind == GAME_EVENT_TILE_PLACEMENT_MOVE) {
           if (play_slot < 0) play_slot = slot;
           first_play_added = true;
