@@ -54,10 +54,17 @@ Equity get_leave_value_for_move(const KLV *klv, const Move *move, Rack *rack) {
 void get_leave_for_move(const Move *move, const Game *game, Rack *leave) {
   rack_copy(leave, player_get_rack(game_get_player(
                        game, game_get_player_on_turn_index(game))));
+  // PLAYED_THROUGH_MARKER and BLANK_MACHINE_LETTER are both 0. In a tile-
+  // placement move a 0 tile means "played through an existing board tile"
+  // (not from the rack — skip). In an EXCHANGE move every tile is a thrown
+  // rack tile, and a 0 there is a thrown blank that MUST be removed from
+  // the leave. Without this distinction every blank-throwing exchange
+  // kept the blank in its computed leave.
+  const bool is_exchange = move_get_type(move) == GAME_EVENT_EXCHANGE;
   int tiles_length = move_get_tiles_length(move);
   for (int idx = 0; idx < tiles_length; idx++) {
     MachineLetter letter = move_get_tile(move, idx);
-    if (letter == PLAYED_THROUGH_MARKER) {
+    if (!is_exchange && letter == PLAYED_THROUGH_MARKER) {
       continue;
     }
     if (get_is_blanked(letter)) {
