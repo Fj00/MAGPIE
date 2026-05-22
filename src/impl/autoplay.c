@@ -334,6 +334,16 @@ bool autoplay_get_next_iter_output(AutoplaySharedData *shared_data,
   } else if (shared_data->stop_on_force_exhaust &&
              force_table_is_exhausted(shared_data->force_table)) {
     at_stop_count = true;
+    // One-shot announcement (runs under iter_mutex, so a plain static
+    // is safe). Gives downstream tooling — chain_train.sh — an
+    // unambiguous "deficit hit 0" signal instead of parsing per-tick
+    // deficit numbers that miss the final partial window.
+    static bool exhaust_announced = false;
+    if (!exhaust_announced) {
+      exhaust_announced = true;
+      fprintf(stderr, "force_table: deficit reached 0 — force table "
+                      "EXHAUSTED, stopping autoplay (clean completion)\n");
+    }
   } else if (shared_data->stop_on_opening_pass_complete &&
              opening_pass_table_is_complete(shared_data->opening_pass_table)) {
     at_stop_count = true;
