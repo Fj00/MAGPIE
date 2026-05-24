@@ -220,14 +220,22 @@ void string_builder_add_move_leave(StringBuilder *sb, const Rack *rack,
                                    const Move *move,
                                    const LetterDistribution *ld) {
   Rack leave = *rack;
+  // PLAYED_THROUGH_MARKER and BLANK_MACHINE_LETTER are both 0. For a
+  // tile-placement move a 0 tile means "played through existing board
+  // tile" (skip). For an EXCHANGE move every tile is a thrown rack tile
+  // and a 0 there is a thrown blank that MUST be removed from the leave.
+  // Mirrors the fix to get_leave_for_move in gameplay.c (b569f5ad).
+  const bool is_exchange = move_get_type(move) == GAME_EVENT_EXCHANGE;
   const int move_tiles_length = move_get_tiles_length(move);
   for (int i = 0; i < move_tiles_length; i++) {
-    if (move_get_tile(move, i) != PLAYED_THROUGH_MARKER) {
-      if (get_is_blanked(move_get_tile(move, i))) {
-        rack_take_letter(&leave, BLANK_MACHINE_LETTER);
-      } else {
-        rack_take_letter(&leave, move_get_tile(move, i));
-      }
+    const MachineLetter tile = move_get_tile(move, i);
+    if (!is_exchange && tile == PLAYED_THROUGH_MARKER) {
+      continue;
+    }
+    if (get_is_blanked(tile)) {
+      rack_take_letter(&leave, BLANK_MACHINE_LETTER);
+    } else {
+      rack_take_letter(&leave, tile);
     }
   }
   string_builder_add_rack(sb, &leave, ld, false);
