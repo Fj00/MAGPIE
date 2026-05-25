@@ -435,14 +435,17 @@ VModelLeaveType vmodel_classify_leave(const uint8_t *leave_indices,
 
 int vmodel_stratum_index(const VModel *m, int kind, int leave_length,
                           VModelLeaveType type, int turn) {
-    // Build the stratum_key matching v_model_predict.stratum_key(): apply
-    // the terminal-zero collapse rule for K1 at L>=3.
+    // Build the stratum_key matching v_model_predict.stratum_key() and
+    // train_v_model.stratum_iter():
+    //   - L=0,1,2,7 → always "all" (trainer never splits these by type)
+    //   - L=3..6: cons/mixed/vowel, unless terminal-zero collapses to "all"
     char key[VMODEL_KEY_MAX];
     const char *typ_str;
     bool tzs = vmodel_terminal_zero_score(turn, kind);
-    if (tzs && leave_length >= 3) {
+    if (leave_length == 0 || leave_length == 1 ||
+        leave_length == 2 || leave_length == 7) {
         typ_str = "all";
-    } else if (leave_length < 3) {
+    } else if (tzs && leave_length >= 3) {
         typ_str = "all";
     } else {
         switch (type) {
