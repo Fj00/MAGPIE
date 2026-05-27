@@ -10,12 +10,13 @@
 
 #include "../util/io_util.h"
 
-// Valid bag range: 8..91 (mid-game) plus 93 (opener). Index 0..84 for
-// bag=8..91; index 85 for bag=93. bag=92 never occurs naturally.
-#define TR_BAG_MIN 8
+// Valid bag range: 1..91 (endgame through mid-game) plus 93 (opener).
+// Index 0..90 for bag=1..91; index 91 for bag=93. bag=92 never occurs
+// naturally. bag=0 = game over, no decision to record.
+#define TR_BAG_MIN 1
 #define TR_BAG_MAX 91
 #define TR_OPENER_BAG 93
-#define TR_NUM_BAGS ((TR_BAG_MAX - TR_BAG_MIN) + 1 + 1)  // 84 + 1 = 85; +1 opener
+#define TR_NUM_BAGS ((TR_BAG_MAX - TR_BAG_MIN) + 1 + 1)  // 91 + 1 = 92; +1 opener
 
 static int tr_bag_to_index(int bag) {
   if (bag == TR_OPENER_BAG) return TR_BAG_MAX - TR_BAG_MIN + 1;

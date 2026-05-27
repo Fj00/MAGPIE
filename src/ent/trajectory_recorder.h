@@ -23,8 +23,9 @@
 // Env var:
 //   MAGPIE_TRAJECTORY_RECORDER=<dir>   recorder root directory
 //
-// Layout: <dir>/positions/bag_<NN>.csv for NN in {8..91, 93}.
-// (bag=92 never occurs naturally; 93 is opener.)
+// Layout: <dir>/positions/bag_<NN>.csv for NN in {1..91, 93}.
+// (bag=92 never occurs naturally; 93 is opener.) bag=1..7 is the
+// post-empty-bag endgame regime.
 
 typedef struct TrajectoryRecorder TrajectoryRecorder;
 typedef struct TrajectoryGameBuffer TrajectoryGameBuffer;
