@@ -2953,31 +2953,35 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
       for (int k = 0; k < nb && n < RACK_SIZE; k++) out[n++] = '?';
       out[n] = '\0';
     }
-    // Action kind / repr / size from `move`.
+    // Action kind / repr / size from `move`. Use string_builder_add_move
+    // so action_repr matches the standard magpie display format:
+    //   pass  -> "pass"
+    //   exch  -> "(exch ABC)"
+    //   play  -> "8H DOYLY" (coord + word with blank lowercase + played-
+    //            through markers when applicable)
+    // This is unambiguous: action_repr alone identifies the move, no need
+    // to cross-reference board state.
     const game_event_t mt = move_get_type(move);
-    int act_kind = 0;
-    int act_size = 0;
-    char act_repr[64] = {0};
+    int act_kind;
+    int act_size;
     if (mt == GAME_EVENT_PASS) {
       act_kind = 0;
       act_size = 0;
     } else if (mt == GAME_EVENT_EXCHANGE) {
       act_kind = 1;
-      const int nt = move_get_tiles_played(move);
-      act_size = nt;
-      int an = 0;
-      const int cap = (int)sizeof(act_repr) - 1;
-      for (int i = 0; i < nt && an < cap; i++) {
-        const MachineLetter ml = move_get_tile(move, i);
-        act_repr[an++] = traj_ld->ld_ml_to_hl[ml][0];
-      }
-      act_repr[an] = '\0';
+      act_size = move_get_tiles_played(move);
     } else {
-      // Tile placement: action_repr left empty (board+leave fully
-      // determines the play downstream). action_size = tiles placed.
       act_kind = 2;
       act_size = move_get_tiles_played(move);
     }
+    char act_repr[64];
+    StringBuilder *act_sb = string_builder_create();
+    string_builder_add_move(act_sb, game_get_board(game), move, traj_ld, false);
+    size_t act_len = 0;
+    char *act_dump = string_builder_dump(act_sb, &act_len);
+    snprintf(act_repr, sizeof(act_repr), "%s", act_dump ? act_dump : "");
+    free(act_dump);
+    string_builder_destroy(act_sb);
     // Leave (post-action rack of the on-turn player).
     Rack traj_leave;
     rack_set_dist_size(&traj_leave, rack_get_dist_size(player_rack));
