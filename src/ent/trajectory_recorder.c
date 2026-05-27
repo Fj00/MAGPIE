@@ -31,11 +31,15 @@ struct TrajectoryRecorder {
   FILE *fhs[TR_NUM_BAGS];
 };
 
-// Pre-formatted CSV line + which per-bag file it routes to. Avoids any
-// re-parsing at commit time.
+// Pre-formatted CSV line (without trailing newline / eventual_outcome)
+// + which per-bag file it routes to + which player is on turn. The
+// outcome column is appended at commit time once the game winner is
+// known. Avoids re-parsing the full line at commit; only the trailing
+// ",<outcome>\n" suffix is written there.
 typedef struct StagedRow {
   int bag_idx;
-  char *line;   // heap-allocated, owned by the buffer
+  uint8_t on_turn;  // 0 = p1, 1 = p2
+  char *line;       // heap-allocated, owned by the buffer; no trailing \n
 } StagedRow;
 
 struct TrajectoryGameBuffer {
@@ -116,7 +120,8 @@ static FILE *tr_get_file(TrajectoryRecorder *r, int bag_idx, int bag) {
     fprintf(fh,
             "game_id,turn,bag,on_turn,p1_rack,p2_rack,p1_score,p2_score,"
             "board_cgp,action_kind,action_repr,action_size,"
-            "move_score,score_diff_pre,score_diff_post,leave\n");
+            "move_score,score_diff_pre,score_diff_post,leave,"
+            "eventual_outcome\n");
     fflush(fh);
     r->fhs[bag_idx] = fh;
   }
@@ -161,12 +166,13 @@ void trajectory_game_buffer_add(
   if (!b) return;
   const int bag_idx = tr_bag_to_index(bag);
   if (bag_idx < 0) return;
-  // Format the row line. Use a big stack scratch; CGP can be ~200 chars
-  // plus overhead. 1 KB is plenty.
+  // Format the row line WITHOUT trailing newline / eventual_outcome —
+  // those are appended at commit time when the game winner is known.
+  // 1 KB scratch (CGP ~200 chars + overhead is comfortable).
   char line[1024];
   int n = snprintf(
       line, sizeof(line),
-      "%llu,%d,%d,%d,%s,%s,%d,%d,\"%s\",%d,%s,%d,%d,%d,%d,%s\n",
+      "%llu,%d,%d,%d,%s,%s,%d,%d,\"%s\",%d,%s,%d,%d,%d,%d,%s",
       (unsigned long long)game_id, turn, bag, on_turn,
       p1_rack ? p1_rack : "", p2_rack ? p2_rack : "",
       p1_score, p2_score, board_cgp ? board_cgp : "",
@@ -181,15 +187,22 @@ void trajectory_game_buffer_add(
   }
   StagedRow *row = &b->rows[b->count++];
   row->bag_idx = bag_idx;
+  row->on_turn = (uint8_t)(on_turn ? 1 : 0);
   row->line = malloc_or_die((size_t)n + 1);
   memcpy(row->line, line, (size_t)n + 1);
 }
 
 void trajectory_game_buffer_commit(
-    TrajectoryRecorder *r, TrajectoryGameBuffer *b) {
+    TrajectoryRecorder *r, TrajectoryGameBuffer *b,
+    int final_p1_score, int final_p2_score) {
   if (!r || !b) return;
-  // Reconstruct bag from bag_idx for the file-open path; tr_get_file
-  // needs it for filename formatting.
+  // Per-row eventual_outcome (from row->on_turn player's perspective):
+  //   1 = on_turn player won, 0 = lost, 2 = tied.
+  // Derive once per game; per-row routing only needs row->on_turn.
+  const int p1_outcome = (final_p1_score > final_p2_score) ? 1
+                       : (final_p1_score < final_p2_score) ? 0
+                                                            : 2;
+  const int p2_outcome = (p1_outcome == 2) ? 2 : (1 - p1_outcome);
   for (int i = 0; i < b->count; i++) {
     const int bag_idx = b->rows[i].bag_idx;
     const int bag = (bag_idx == TR_BAG_MAX - TR_BAG_MIN + 1)
@@ -197,8 +210,10 @@ void trajectory_game_buffer_commit(
                        : bag_idx + TR_BAG_MIN;
     FILE *fh = tr_get_file(r, bag_idx, bag);
     if (!fh) continue;
+    const int outcome = b->rows[i].on_turn ? p2_outcome : p1_outcome;
     pthread_mutex_lock(&r->mutexes[bag_idx]);
     fputs(b->rows[i].line, fh);
+    fprintf(fh, ",%d\n", outcome);
     pthread_mutex_unlock(&r->mutexes[bag_idx]);
   }
   tr_buf_free_rows(b);

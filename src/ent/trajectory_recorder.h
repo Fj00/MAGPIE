@@ -54,9 +54,13 @@ void trajectory_game_buffer_add(
     const char *leave);
 
 // Flush all staged rows to disk under the recorder. Call when the
-// just-played game ended normally. Resets the buffer.
+// just-played game ended normally. Each row's per-game eventual_outcome
+// (0=loss, 1=win, 2=tie) is computed at commit time from the FINAL
+// p1_score / p2_score (after end-of-game tile-bag penalty adjustment)
+// against the row's on_turn player. Resets the buffer.
 void trajectory_game_buffer_commit(
-    TrajectoryRecorder *r, TrajectoryGameBuffer *b);
+    TrajectoryRecorder *r, TrajectoryGameBuffer *b,
+    int final_p1_score, int final_p2_score);
 
 // Drop all staged rows without writing. Call when the just-played game
 // ended via consecutive-zeros / pass-out (pathological positions).

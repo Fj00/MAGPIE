@@ -4664,7 +4664,14 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
         GameRunner *gr = grs[gi];
         if (!gr || !gr->trajectory_buf) continue;
         if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD) {
-          trajectory_game_buffer_commit(traj_r_end, gr->trajectory_buf);
+          // Final scores reflect end-of-game tile-bag penalty adjustment
+          // (magpie applies this internally on STANDARD termination).
+          const int final_p1 = equity_to_int(
+              player_get_score(game_get_player(gr->game, 0)));
+          const int final_p2 = equity_to_int(
+              player_get_score(game_get_player(gr->game, 1)));
+          trajectory_game_buffer_commit(traj_r_end, gr->trajectory_buf,
+                                         final_p1, final_p2);
         } else {
           trajectory_game_buffer_discard(gr->trajectory_buf);
         }
