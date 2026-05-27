@@ -13,6 +13,13 @@
 // (= unseen total = bag_letters + RACK_SIZE) so downstream tools can
 // process one bag's worth of positions independently.
 //
+// Two-phase commit: rows are first staged in a per-worker buffer (one
+// game at a time per worker), then flushed to disk only if the game
+// ends normally (GAME_END_REASON_STANDARD). Games ending via
+// GAME_END_REASON_CONSECUTIVE_ZEROS (6-pass terminus) are discarded —
+// those games produce pathological positions where one or both players
+// got stuck, distorting the training data.
+//
 // Env var:
 //   MAGPIE_TRAJECTORY_RECORDER=<dir>   recorder root directory
 //
@@ -20,45 +27,39 @@
 // (bag=92 never occurs naturally; 93 is opener.)
 
 typedef struct TrajectoryRecorder TrajectoryRecorder;
+typedef struct TrajectoryGameBuffer TrajectoryGameBuffer;
 
 TrajectoryRecorder *trajectory_recorder_create(const char *base_dir);
 void trajectory_recorder_destroy(TrajectoryRecorder *r);
 
-// Write one position snapshot. Thread-safe.
-//
-// game_id            unique identifier for this game (game_runner->game_number).
-// turn               1-indexed game turn (1 = opener, 2 = opp's first move, ...).
-// bag                project-convention unseen total = bag_letters + RACK_SIZE.
-//                    Routes the write to the bag_<bag>.csv file. Out-of-range
-//                    bag values are silently dropped.
-// on_turn            0 or 1, identifying the player about to play.
-// p1_rack, p2_rack   canonical rack strings (blanks as '?', sorted alpha).
-// p1_score, p2_score current scores (post all previous moves, pre this one).
-// board_cgp          full CGP FEN string capturing board+racks+scores+bag.
-//                    Reproducible by feeding back into magpie's `cgp` command.
-// action_kind        0=pass, 1=exchange, 2=play.
-// action_repr        "" for pass, exchanged tiles for exch, played-tile string
-//                    for play (per game_string.c convention).
-// action_size        0 for pass, N tiles thrown for exch, N tiles played for
-//                    play.
-// move_score         points the action scores (0 for pass/exch, X for play).
-// score_diff_pre     pre-move score differential from on-turn player's
-//                    perspective (on_turn_score - opp_score). Recorded
-//                    explicitly so downstream tools don't need to derive
-//                    from p1/p2 + on_turn.
-// score_diff_post    post-move differential = score_diff_pre + move_score.
-//                    This IS the diff bucket the action belongs to in the
-//                    V-model force-table (per the diff calc convention in
-//                    the 91-8 architecture plan).
-// leave              post-action rack (canonical, sorted). Equals current rack
-//                    for pass; rack minus exchanged tiles for exch; rack minus
-//                    played tiles for play.
-void trajectory_recorder_write(
-    TrajectoryRecorder *r, uint64_t game_id, int turn, int bag,
+// Per-worker buffer that stages rows for the current game in flight.
+// One buffer per AutoplayWorker; reused across games (reset on game
+// start, commit or discard on game end).
+TrajectoryGameBuffer *trajectory_game_buffer_create(void);
+void trajectory_game_buffer_destroy(TrajectoryGameBuffer *b);
+
+// Clear buffered rows. Call at the start of each new game.
+void trajectory_game_buffer_reset(TrajectoryGameBuffer *b);
+
+// Stage one position row in the buffer. Same field semantics as the
+// pre-staging API. Returns immediately on a NULL buffer (recorder
+// disabled).
+void trajectory_game_buffer_add(
+    TrajectoryGameBuffer *b, uint64_t game_id, int turn, int bag,
     int on_turn, const char *p1_rack, const char *p2_rack,
     int p1_score, int p2_score, const char *board_cgp,
     int action_kind, const char *action_repr, int action_size,
     int move_score, int score_diff_pre, int score_diff_post,
     const char *leave);
+
+// Flush all staged rows to disk under the recorder. Call when the
+// just-played game ended normally. Resets the buffer.
+void trajectory_game_buffer_commit(
+    TrajectoryRecorder *r, TrajectoryGameBuffer *b);
+
+// Drop all staged rows without writing. Call when the just-played game
+// ended via consecutive-zeros / pass-out (pathological positions).
+// Resets the buffer.
+void trajectory_game_buffer_discard(TrajectoryGameBuffer *b);
 
 #endif

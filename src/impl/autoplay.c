@@ -1332,6 +1332,11 @@ typedef struct GameRunner {
   // win/loss tally.
   ForceTarget *eb_snap_bag_targets[7][MAX_PENDING_BAG_TARGETS];
   uint8_t eb_snap_bag_count[7];
+  // Per-game staging buffer for the trajectory recorder. NULL when
+  // MAGPIE_TRAJECTORY_RECORDER is not set. Reset at game start, committed
+  // (or discarded) at game end based on GAME_END_REASON. One per
+  // game-runner so a game pair gets two independent buffers.
+  TrajectoryGameBuffer *trajectory_buf;
 } GameRunner;
 
 GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
@@ -1371,6 +1376,9 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
       game_runner->eb_action_buf[i] = move_create();
     }
   }
+  game_runner->trajectory_buf = autoplay_worker->shared_data->trajectory_recorder
+                                    ? trajectory_game_buffer_create()
+                                    : NULL;
   return game_runner;
 }
 
@@ -1383,6 +1391,7 @@ void game_runner_destroy(GameRunner *game_runner) {
   for (int i = 0; i < game_runner->eb_n_action_buf; i++) {
     free(game_runner->eb_action_buf[i]);
   }
+  trajectory_game_buffer_destroy(game_runner->trajectory_buf);
   free(game_runner);
 }
 
@@ -1517,6 +1526,11 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   game_runner->pending_force_target = NULL;
   game_runner->pending_force_diff = 0;
   game_runner->pending_force_player_index = 0;
+  // Reset the trajectory buffer for the new game. Buffer commits or
+  // discards at game end based on game_end_reason.
+  if (game_runner->trajectory_buf) {
+    trajectory_game_buffer_reset(game_runner->trajectory_buf);
+  }
   for (int i = 0; i < 7; i++) {
     game_runner->eb_snap_bag_count[i] = 0;
     game_runner->eb_snap_force_target_count[i] = 0;
@@ -2927,11 +2941,13 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     game_runner->pass_cycle_abandoned = true;
   }
 
-  // Trajectory recorder: snapshot the pre-move position to the bag-stratum
-  // CSV for downstream 91-8 V-model training. Active only when
-  // MAGPIE_TRAJECTORY_RECORDER=<dir> is set at startup.
+  // Trajectory recorder: stage the pre-move position in this worker's
+  // per-game buffer. The buffer commits (writes to disk) when the game
+  // ends normally; games ending via 6-pass terminus are discarded.
+  // Active only when MAGPIE_TRAJECTORY_RECORDER=<dir> is set at startup.
   TrajectoryRecorder *traj_r = game_runner->shared_data->trajectory_recorder;
-  if (traj_r) {
+  TrajectoryGameBuffer *traj_buf = game_runner->trajectory_buf;
+  if (traj_r && traj_buf) {
     const LetterDistribution *traj_ld = game_get_ld(game);
     const int traj_bag =
         bag_get_letters(game_get_bag(game)) + (RACK_SIZE);
@@ -3018,8 +3034,8 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     const int opp_score = (player_on_turn_index == 0) ? p2_score : p1_score;
     const int score_diff_pre = on_turn_score - opp_score;
     const int score_diff_post = score_diff_pre + move_score_int;
-    trajectory_recorder_write(
-        traj_r, game_runner->game_number, game_runner->turn_number + 1,
+    trajectory_game_buffer_add(
+        traj_buf, game_runner->game_number, game_runner->turn_number + 1,
         traj_bag, player_on_turn_index, p1_rack_str, p2_rack_str,
         p1_score, p2_score, cgp_str ? cgp_str : "",
         act_kind, act_repr, act_size,
@@ -4627,6 +4643,25 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
         (!move1 || !move2 ||
          compare_moves_without_equity(move1, move2, true) != -1)) {
       games_are_divergent = true;
+    }
+  }
+  // Trajectory recorder: commit each game's buffered rows iff it ended
+  // normally (GAME_END_REASON_STANDARD). Games ending via consecutive-
+  // zeros (6-pass terminus) produce pathological positions; discard.
+  {
+    TrajectoryRecorder *traj_r_end =
+        autoplay_worker->shared_data->trajectory_recorder;
+    if (traj_r_end) {
+      GameRunner *grs[2] = {game_runner1, game_runner2};
+      for (int gi = 0; gi < 2; gi++) {
+        GameRunner *gr = grs[gi];
+        if (!gr || !gr->trajectory_buf) continue;
+        if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD) {
+          trajectory_game_buffer_commit(traj_r_end, gr->trajectory_buf);
+        } else {
+          trajectory_game_buffer_discard(gr->trajectory_buf);
+        }
+      }
     }
   }
   if (autoplay_worker->args.print_boards) {
