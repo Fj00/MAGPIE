@@ -2949,8 +2949,15 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
   TrajectoryGameBuffer *traj_buf = game_runner->trajectory_buf;
   if (traj_r && traj_buf) {
     const LetterDistribution *traj_ld = game_get_ld(game);
+    // Unseen-total convention: physical bag + opp's actual rack size.
+    // At bag<8 (physical bag empty), opp draws nothing so opp_rack_size
+    // can be 1..7. Using a fixed +RACK_SIZE would mislabel every
+    // endgame position as bag=7.
+    const int traj_opp_idx = 1 - player_on_turn_index;
+    const int traj_opp_rack_size = rack_get_total_letters(
+        player_get_rack(game_get_player(game, traj_opp_idx)));
     const int traj_bag =
-        bag_get_letters(game_get_bag(game)) + (RACK_SIZE);
+        bag_get_letters(game_get_bag(game)) + traj_opp_rack_size;
     // Stringify both players' racks (canonical: A..Z then ?).
     char p1_rack_str[RACK_SIZE + 2] = {0};
     char p2_rack_str[RACK_SIZE + 2] = {0};
