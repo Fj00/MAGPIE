@@ -41,6 +41,15 @@ void trajectory_recorder_destroy(TrajectoryRecorder *r);
 //                    for play (per game_string.c convention).
 // action_size        0 for pass, N tiles thrown for exch, N tiles played for
 //                    play.
+// move_score         points the action scores (0 for pass/exch, X for play).
+// score_diff_pre     pre-move score differential from on-turn player's
+//                    perspective (on_turn_score - opp_score). Recorded
+//                    explicitly so downstream tools don't need to derive
+//                    from p1/p2 + on_turn.
+// score_diff_post    post-move differential = score_diff_pre + move_score.
+//                    This IS the diff bucket the action belongs to in the
+//                    V-model force-table (per the diff calc convention in
+//                    the 91-8 architecture plan).
 // leave              post-action rack (canonical, sorted). Equals current rack
 //                    for pass; rack minus exchanged tiles for exch; rack minus
 //                    played tiles for play.
@@ -49,6 +58,7 @@ void trajectory_recorder_write(
     int on_turn, const char *p1_rack, const char *p2_rack,
     int p1_score, int p2_score, const char *board_cgp,
     int action_kind, const char *action_repr, int action_size,
+    int move_score, int score_diff_pre, int score_diff_post,
     const char *leave);
 
 #endif

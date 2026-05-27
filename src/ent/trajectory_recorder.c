@@ -100,7 +100,8 @@ static FILE *tr_get_file(TrajectoryRecorder *r, int bag_idx, int bag) {
     }
     fprintf(fh,
             "game_id,turn,bag,on_turn,p1_rack,p2_rack,p1_score,p2_score,"
-            "board_cgp,action_kind,action_repr,action_size,leave\n");
+            "board_cgp,action_kind,action_repr,action_size,"
+            "move_score,score_diff_pre,score_diff_post,leave\n");
     fflush(fh);
     r->fhs[bag_idx] = fh;
   }
@@ -113,6 +114,7 @@ void trajectory_recorder_write(
     int on_turn, const char *p1_rack, const char *p2_rack,
     int p1_score, int p2_score, const char *board_cgp,
     int action_kind, const char *action_repr, int action_size,
+    int move_score, int score_diff_pre, int score_diff_post,
     const char *leave) {
   if (!r) return;
   const int bag_idx = tr_bag_to_index(bag);
@@ -123,7 +125,7 @@ void trajectory_recorder_write(
   // parsing predictable. No internal double-quotes are produced by magpie's
   // game_get_cgp, so a single surrounding pair suffices.
   pthread_mutex_lock(&r->mutexes[bag_idx]);
-  fprintf(fh, "%llu,%d,%d,%d,%s,%s,%d,%d,\"%s\",%d,%s,%d,%s\n",
+  fprintf(fh, "%llu,%d,%d,%d,%s,%s,%d,%d,\"%s\",%d,%s,%d,%d,%d,%d,%s\n",
           (unsigned long long)game_id, turn, bag, on_turn,
           p1_rack ? p1_rack : "",
           p2_rack ? p2_rack : "",
@@ -132,6 +134,7 @@ void trajectory_recorder_write(
           action_kind,
           action_repr ? action_repr : "",
           action_size,
+          move_score, score_diff_pre, score_diff_post,
           leave ? leave : "");
   pthread_mutex_unlock(&r->mutexes[bag_idx]);
 }

@@ -3009,11 +3009,21 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
         equity_to_int(player_get_score(game_get_player(game, 0)));
     const int p2_score =
         equity_to_int(player_get_score(game_get_player(game, 1)));
+    // move_score: 0 for pass/exchange, the play's score for tile placement.
+    const int move_score_int =
+        (mt == GAME_EVENT_TILE_PLACEMENT_MOVE)
+            ? equity_to_int(move_get_score(move))
+            : 0;
+    const int on_turn_score = (player_on_turn_index == 0) ? p1_score : p2_score;
+    const int opp_score = (player_on_turn_index == 0) ? p2_score : p1_score;
+    const int score_diff_pre = on_turn_score - opp_score;
+    const int score_diff_post = score_diff_pre + move_score_int;
     trajectory_recorder_write(
         traj_r, game_runner->game_number, game_runner->turn_number + 1,
         traj_bag, player_on_turn_index, p1_rack_str, p2_rack_str,
         p1_score, p2_score, cgp_str ? cgp_str : "",
-        act_kind, act_repr, act_size, leave_str);
+        act_kind, act_repr, act_size,
+        move_score_int, score_diff_pre, score_diff_post, leave_str);
     free(cgp_str);
   }
 
