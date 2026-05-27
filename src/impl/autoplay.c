@@ -31,6 +31,7 @@
 #include "../ent/play_index.h"
 #include "../ent/rare_pool.h"
 #include "../ent/t6_baseline.h"
+#include "../ent/trajectory_recorder.h"
 #include "../ent/inference_args.h"
 #include "../ent/inference_results.h"
 #include "../ent/klv.h"
@@ -49,6 +50,7 @@
 #include "../str/sim_string.h"
 #include "../util/io_util.h"
 #include "../util/string_util.h"
+#include "cgp.h"
 #include "gameplay.h"
 #include "move_gen.h"
 #include "rack_list.h"
@@ -275,6 +277,10 @@ typedef struct AutoplaySharedData {
   VModelPicks *vmodel_picks[7];
   int vmodel_picks_any_loaded;
   const LetterDistribution *ld;
+  // Trajectory recorder: when MAGPIE_TRAJECTORY_RECORDER=<dir> is set,
+  // every game turn (before the move plays) writes a row to
+  // <dir>/positions/bag_<NN>.csv. Used by the 91-8 V-model pipeline.
+  TrajectoryRecorder *trajectory_recorder;
 } AutoplaySharedData;
 
 // Per-turn role for single-target-turn EB recording. Each turn (1..6) gets
@@ -1063,6 +1069,11 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   if (eb_out && eb_out[0] != '\0') {
     shared_data->empty_board_recorder = empty_board_recorder_create(eb_out);
   }
+  shared_data->trajectory_recorder = NULL;
+  const char *traj_dir = getenv("MAGPIE_TRAJECTORY_RECORDER");
+  if (traj_dir && traj_dir[0] != '\0') {
+    shared_data->trajectory_recorder = trajectory_recorder_create(traj_dir);
+  }
   shared_data->empty_board_strata_recorder = NULL;
   const char *eb_strata = getenv("MAGPIE_EMPTY_BOARD_STRATA");
   if (eb_strata && eb_strata[0] != '\0') {
@@ -1139,6 +1150,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   }
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
+  trajectory_recorder_destroy(shared_data->trajectory_recorder);
   void vmodel_log_stats(void);  // defined later in this TU
   if (shared_data->vmodel_any_loaded ||
       shared_data->vmodel_picks_any_loaded) {
@@ -2913,6 +2925,92 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
   if (game_runner->pass_cycle_active &&
       move_get_type(move) == GAME_EVENT_TILE_PLACEMENT_MOVE) {
     game_runner->pass_cycle_abandoned = true;
+  }
+
+  // Trajectory recorder: snapshot the pre-move position to the bag-stratum
+  // CSV for downstream 91-8 V-model training. Active only when
+  // MAGPIE_TRAJECTORY_RECORDER=<dir> is set at startup.
+  TrajectoryRecorder *traj_r = game_runner->shared_data->trajectory_recorder;
+  if (traj_r) {
+    const LetterDistribution *traj_ld = game_get_ld(game);
+    const int traj_bag =
+        bag_get_letters(game_get_bag(game)) + (RACK_SIZE);
+    // Stringify both players' racks (canonical: A..Z then ?).
+    char p1_rack_str[RACK_SIZE + 2] = {0};
+    char p2_rack_str[RACK_SIZE + 2] = {0};
+    for (int pp = 0; pp < 2; pp++) {
+      const Rack *rk = player_get_rack(game_get_player(game, pp));
+      char *out = (pp == 0) ? p1_rack_str : p2_rack_str;
+      int n = 0;
+      const uint16_t ds = rack_get_dist_size(rk);
+      for (uint16_t i = 1; i < ds && n < RACK_SIZE; i++) {
+        const int c = rack_get_letter(rk, i);
+        for (int k = 0; k < c && n < RACK_SIZE; k++) {
+          out[n++] = traj_ld->ld_ml_to_hl[i][0];
+        }
+      }
+      const int nb = rack_get_letter(rk, 0);
+      for (int k = 0; k < nb && n < RACK_SIZE; k++) out[n++] = '?';
+      out[n] = '\0';
+    }
+    // Action kind / repr / size from `move`.
+    const game_event_t mt = move_get_type(move);
+    int act_kind = 0;
+    int act_size = 0;
+    char act_repr[64] = {0};
+    if (mt == GAME_EVENT_PASS) {
+      act_kind = 0;
+      act_size = 0;
+    } else if (mt == GAME_EVENT_EXCHANGE) {
+      act_kind = 1;
+      const int nt = move_get_tiles_played(move);
+      act_size = nt;
+      int an = 0;
+      const int cap = (int)sizeof(act_repr) - 1;
+      for (int i = 0; i < nt && an < cap; i++) {
+        const MachineLetter ml = move_get_tile(move, i);
+        act_repr[an++] = traj_ld->ld_ml_to_hl[ml][0];
+      }
+      act_repr[an] = '\0';
+    } else {
+      // Tile placement: action_repr left empty (board+leave fully
+      // determines the play downstream). action_size = tiles placed.
+      act_kind = 2;
+      act_size = move_get_tiles_played(move);
+    }
+    // Leave (post-action rack of the on-turn player).
+    Rack traj_leave;
+    rack_set_dist_size(&traj_leave, rack_get_dist_size(player_rack));
+    rack_reset(&traj_leave);
+    if (mt == GAME_EVENT_PASS) {
+      rack_copy(&traj_leave, player_rack);
+    } else {
+      get_leave_for_move(move, game, &traj_leave);
+    }
+    char leave_str[RACK_SIZE + 2] = {0};
+    int ln = 0;
+    const uint16_t lds = rack_get_dist_size(&traj_leave);
+    for (uint16_t i = 1; i < lds && ln < RACK_SIZE; i++) {
+      const int c = rack_get_letter(&traj_leave, i);
+      for (int k = 0; k < c && ln < RACK_SIZE; k++) {
+        leave_str[ln++] = traj_ld->ld_ml_to_hl[i][0];
+      }
+    }
+    const int lvb = rack_get_letter(&traj_leave, 0);
+    for (int k = 0; k < lvb && ln < RACK_SIZE; k++) leave_str[ln++] = '?';
+    leave_str[ln] = '\0';
+    // CGP (caller owns; free after the write).
+    char *cgp_str = game_get_cgp(game, false);
+    const int p1_score =
+        equity_to_int(player_get_score(game_get_player(game, 0)));
+    const int p2_score =
+        equity_to_int(player_get_score(game_get_player(game, 1)));
+    trajectory_recorder_write(
+        traj_r, game_runner->game_number, game_runner->turn_number + 1,
+        traj_bag, player_on_turn_index, p1_rack_str, p2_rack_str,
+        p1_score, p2_score, cgp_str ? cgp_str : "",
+        act_kind, act_repr, act_size, leave_str);
+    free(cgp_str);
   }
 
   play_move(move, game, NULL);
