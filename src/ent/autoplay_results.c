@@ -1836,6 +1836,198 @@ void tt_data_consolidate(Recorder **recorders, int num_recorders,
   string_builder_destroy(summary);
 }
 
+// All-horizontal recorder: saves games where every tile-placement move is
+// horizontal (no vertical plays) and the game ends standard (no pass-out).
+// Output: one .txt file per qualifying game.
+//
+// Output dir: MAGPIE_AH_OUTPUT_DIR env var (falls back to a host-default
+// — /Users/eric/S/all_horizontal on Mac, /home/eric/N/all_horizontal on
+// the pop-os layout).
+
+#define AH_OUTPUT_DIR_DEFAULT_MAC "/Users/eric/S/all_horizontal"
+#define AH_OUTPUT_DIR_DEFAULT_LINUX "/home/eric/N/all_horizontal"
+
+static const char *ah_output_dir(void) {
+  const char *env = getenv("MAGPIE_AH_OUTPUT_DIR");
+  if (env && env[0]) return env;
+#if defined(__APPLE__)
+  return AH_OUTPUT_DIR_DEFAULT_MAC;
+#else
+  return AH_OUTPUT_DIR_DEFAULT_LINUX;
+#endif
+}
+
+typedef struct AHSharedData {
+  cpthread_mutex_t counter_mutex;
+  uint64_t hit_count;
+} AHSharedData;
+
+typedef struct AHData {
+  StringBuilder *game_log;
+  bool has_vertical_move;
+  uint64_t games_played;
+  uint64_t games_all_horizontal_standard;
+  uint64_t games_all_horizontal_nonstandard;
+} AHData;
+
+void ah_data_reset_game(AHData *data) {
+  string_builder_clear(data->game_log);
+  data->has_vertical_move = false;
+}
+
+void ah_data_reset(Recorder *recorder) {
+  AHData *data = (AHData *)recorder->data;
+  ah_data_reset_game(data);
+  data->games_played = 0;
+  data->games_all_horizontal_standard = 0;
+  data->games_all_horizontal_nonstandard = 0;
+}
+
+void ah_data_create(Recorder *recorder) {
+  AHData *data = malloc_or_die(sizeof(AHData));
+  data->game_log = string_builder_create();
+  data->has_vertical_move = false;
+  data->games_played = 0;
+  data->games_all_horizontal_standard = 0;
+  data->games_all_horizontal_nonstandard = 0;
+  recorder->data = data;
+  AHSharedData *shared_data = NULL;
+  if (recorder->owns_thread_shared_data) {
+    shared_data = malloc_or_die(sizeof(AHSharedData));
+    cpthread_mutex_init(&shared_data->counter_mutex);
+    shared_data->hit_count = 0;
+  }
+  recorder->thread_shared_data = shared_data;
+}
+
+void ah_data_destroy(Recorder *recorder) {
+  AHData *data = (AHData *)recorder->data;
+  string_builder_destroy(data->game_log);
+  if (recorder->owns_thread_shared_data) {
+    free(recorder->thread_shared_data);
+  }
+  free(data);
+}
+
+void ah_data_add_move(Recorder *recorder, const RecorderArgs *args) {
+  AHData *data = (AHData *)recorder->data;
+  if (data->has_vertical_move) {
+    return;
+  }
+  const Game *game = args->game;
+  const Move *move = args->move;
+  if (move_get_type(move) == GAME_EVENT_TILE_PLACEMENT_MOVE &&
+      move_get_dir(move) == BOARD_VERTICAL_DIRECTION) {
+    data->has_vertical_move = true;
+    return;
+  }
+  const int player_index = game_get_player_on_turn_index(game);
+  const Board *board = game_get_board(game);
+  const LetterDistribution *ld = game_get_ld(game);
+  string_builder_add_formatted_string(data->game_log, "P%d ", player_index + 1);
+  string_builder_add_move(data->game_log, board, move, ld, true);
+  string_builder_add_string(data->game_log, "\n");
+}
+
+void ah_data_add_game(Recorder *recorder, const RecorderArgs *args) {
+  AHData *data = (AHData *)recorder->data;
+  data->games_played++;
+
+  if (data->has_vertical_move) {
+    ah_data_reset_game(data);
+    return;
+  }
+
+  const Game *game = args->game;
+  const bool standard_end =
+      game_get_game_end_reason(game) == GAME_END_REASON_STANDARD;
+
+  if (!standard_end) {
+    data->games_all_horizontal_nonstandard++;
+    ah_data_reset_game(data);
+    return;
+  }
+
+  data->games_all_horizontal_standard++;
+
+  const int p1_score =
+      equity_to_int(player_get_score(game_get_player(game, 0)));
+  const int p2_score =
+      equity_to_int(player_get_score(game_get_player(game, 1)));
+
+  StringBuilder *out = string_builder_create();
+  string_builder_add_formatted_string(out, "Seed: %llu\n",
+                                      (unsigned long long)args->seed);
+  string_builder_add_formatted_string(out, "Scores: P1=%d P2=%d\n", p1_score,
+                                      p2_score);
+  string_builder_add_string(out, "\nMoves:\n");
+  string_builder_add_string(out, string_builder_peek(data->game_log));
+  string_builder_add_string(out, "\nFinal board:\n");
+  string_builder_add_game(game, NULL, NULL, NULL, out);
+
+  AHSharedData *shared_data = (AHSharedData *)recorder->thread_shared_data;
+  cpthread_mutex_lock(&shared_data->counter_mutex);
+  uint64_t file_idx = ++shared_data->hit_count;
+  cpthread_mutex_unlock(&shared_data->counter_mutex);
+
+  char *filename = get_formatted_string("%s/%llu.txt", ah_output_dir(),
+                                        (unsigned long long)file_idx);
+  FILE *fh = fopen(filename, "w");
+  if (fh) {
+    fputs(string_builder_peek(out), fh);
+    fclose(fh);
+  } else {
+    fprintf(stderr, "ah recorder: could not open %s\n", filename);
+  }
+
+  fprintf(stderr, "\n=== ALL-HORIZONTAL GAME (seed %llu, P1=%d P2=%d) ===\n",
+          (unsigned long long)args->seed, p1_score, p2_score);
+  fputs(string_builder_peek(data->game_log), stderr);
+  fprintf(stderr, "===\n");
+
+  free(filename);
+  string_builder_destroy(out);
+  ah_data_reset_game(data);
+}
+
+void ah_data_consolidate(Recorder **recorders, int num_recorders,
+                         Recorder *primary_recorder) {
+  AHData *primary = (AHData *)primary_recorder->data;
+  primary->games_played = 0;
+  primary->games_all_horizontal_standard = 0;
+  primary->games_all_horizontal_nonstandard = 0;
+  for (int i = 0; i < num_recorders; i++) {
+    const AHData *thread_data = (const AHData *)recorders[i]->data;
+    primary->games_played += thread_data->games_played;
+    primary->games_all_horizontal_standard +=
+        thread_data->games_all_horizontal_standard;
+    primary->games_all_horizontal_nonstandard +=
+        thread_data->games_all_horizontal_nonstandard;
+  }
+
+  StringBuilder *summary = string_builder_create();
+  string_builder_add_formatted_string(
+      summary,
+      "All-horizontal summary:\n  Games played: %llu\n  "
+      "Standard-end all-horizontal: %llu\n  "
+      "Non-standard-end all-horizontal: %llu\n",
+      (unsigned long long)primary->games_played,
+      (unsigned long long)primary->games_all_horizontal_standard,
+      (unsigned long long)primary->games_all_horizontal_nonstandard);
+
+  char *filename = get_formatted_string("%s/ah_summary.txt", ah_output_dir());
+  FILE *fh = fopen(filename, "w");
+  if (fh) {
+    fputs(string_builder_peek(summary), fh);
+    fclose(fh);
+  } else {
+    fprintf(stderr, "ah recorder: could not open %s\n", filename);
+  }
+  fputs(string_builder_peek(summary), stderr);
+  free(filename);
+  string_builder_destroy(summary);
+}
+
 // Generic recorder and autoplay results functions
 
 Recorder *recorder_create(const Recorder *primary_recorder,
@@ -1971,6 +2163,10 @@ void autoplay_results_set_options_int(AutoplayResults *autoplay_results,
       autoplay_results, options, primary, AUTOPLAY_RECORDER_TYPE_TRIPLE_TRIPLE,
       tt_data_reset, tt_data_create, tt_data_destroy, tt_data_add_move,
       tt_data_add_game, tt_data_consolidate, get_str_noop);
+  autoplay_results_set_recorder(
+      autoplay_results, options, primary, AUTOPLAY_RECORDER_TYPE_HORIZONTAL,
+      ah_data_reset, ah_data_create, ah_data_destroy, ah_data_add_move,
+      ah_data_add_game, ah_data_consolidate, get_str_noop);
   autoplay_results->options = options;
 }
 
@@ -2003,6 +2199,9 @@ void autoplay_results_set_options_with_splitter(
     } else if (has_iprefix(option_str, "tripletriple")) {
       options |=
           autoplay_results_build_option(AUTOPLAY_RECORDER_TYPE_TRIPLE_TRIPLE);
+    } else if (has_iprefix(option_str, "horizontal")) {
+      options |=
+          autoplay_results_build_option(AUTOPLAY_RECORDER_TYPE_HORIZONTAL);
     } else {
       error_stack_push(
           error_stack, ERROR_STATUS_AUTOPLAY_INVALID_OPTIONS,
