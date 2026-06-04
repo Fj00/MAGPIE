@@ -512,15 +512,20 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   autoplay_worker->args.p2_sim_args.seed = iter_output->seed;
   game_set_starting_player_index(game, starting_player_index);
   draw_starting_racks(game);
-  // Opening-bingo: force P1's rack to the experiment rack every game.
+  // Opening-bingo: P1 always opens with the forced rack. Return BOTH
+  // racks so the forced rack is drawn from a full bag (else a letter it
+  // needs may already be in P2's random rack), then redraw P2 random.
   if (autoplay_worker->ob_force_rack) {
+    game_set_starting_player_index(game, 0);
     return_rack_to_bag(game, 0);
+    return_rack_to_bag(game, 1);
     const int drawn =
         draw_rack_string_from_bag(game, 0, autoplay_worker->ob_force_rack);
     if (drawn < 0) {
       log_fatal("opening_bingo: cannot draw forced P1 rack '%s' (code %d)",
                 autoplay_worker->ob_force_rack, drawn);
     }
+    draw_to_full_rack(game, 1);
   }
   if (game_runner->game_one_move_behind) {
     Game *game_one_move_behind = game_runner->game_one_move_behind;
