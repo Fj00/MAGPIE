@@ -27,6 +27,7 @@
 #include "../ent/rack.h"
 #include "../ent/sim_results.h"
 #include "../ent/thread_control.h"
+#include "../ent/validated_move.h"
 #include "../ent/xoshiro.h"
 #include "../str/game_string.h"
 #include "../str/inference_string.h"
@@ -297,6 +298,15 @@ typedef struct AutoplayWorker {
   Rack nontarget_known_rack;
   Rack target_known_rack;
   MoveList *move_lists[2];
+  // Opening-bingo experiment hooks (clean, env-driven; see
+  // bots/winpct opening-bingo analysis). When MAGPIE_OB_P1_RACK is set,
+  // P1's rack is forced to that rack every game; when MAGPIE_OB_P1_OPENING
+  // is set, P1's turn-0 move is forced to that play. The parsed opening
+  // move is cached (board is empty + rack identical every game).
+  const char *ob_force_rack;
+  const char *ob_force_opening;
+  Move ob_forced_move;
+  bool ob_forced_move_ready;
 } AutoplayWorker;
 
 AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
@@ -334,6 +344,19 @@ AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
   autoplay_worker->sim_results = NULL;
   autoplay_worker->inference_results = NULL;
   autoplay_worker->error_stack = NULL;
+
+  // Opening-bingo forcing (env-driven). getenv is safe here: worker
+  // creation runs sequentially in the main thread before threads spawn.
+  autoplay_worker->ob_force_rack = getenv("MAGPIE_OB_P1_RACK");
+  if (autoplay_worker->ob_force_rack && autoplay_worker->ob_force_rack[0] == '\0') {
+    autoplay_worker->ob_force_rack = NULL;
+  }
+  autoplay_worker->ob_force_opening = getenv("MAGPIE_OB_P1_OPENING");
+  if (autoplay_worker->ob_force_opening &&
+      autoplay_worker->ob_force_opening[0] == '\0') {
+    autoplay_worker->ob_force_opening = NULL;
+  }
+  autoplay_worker->ob_forced_move_ready = false;
 
   // Only allocate sim structs if at least one of the players running a sim.
   if (ap_args->p1_sim_args.num_plies > 0 ||
@@ -489,6 +512,16 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   autoplay_worker->args.p2_sim_args.seed = iter_output->seed;
   game_set_starting_player_index(game, starting_player_index);
   draw_starting_racks(game);
+  // Opening-bingo: force P1's rack to the experiment rack every game.
+  if (autoplay_worker->ob_force_rack) {
+    return_rack_to_bag(game, 0);
+    const int drawn =
+        draw_rack_string_from_bag(game, 0, autoplay_worker->ob_force_rack);
+    if (drawn < 0) {
+      log_fatal("opening_bingo: cannot draw forced P1 rack '%s' (code %d)",
+                autoplay_worker->ob_force_rack, drawn);
+    }
+  }
   if (game_runner->game_one_move_behind) {
     Game *game_one_move_behind = game_runner->game_one_move_behind;
     game_reset(game_one_move_behind);
@@ -658,7 +691,30 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     rack_copy(player_rack, &original_rack);
   }
 
-  const Move *move = game_runner_get_best_move(autoplay_worker, game_runner);
+  const Move *move;
+  if (autoplay_worker->ob_force_opening && game_runner->turn_number == 0 &&
+      player_on_turn_index == 0) {
+    // Opening-bingo: force P1's first move. Parse once (empty board +
+    // identical forced rack every game), cache the Move.
+    if (!autoplay_worker->ob_forced_move_ready) {
+      ErrorStack *es = error_stack_create();
+      ValidatedMoves *vms = validated_moves_create(
+          game, 0, autoplay_worker->ob_force_opening, false, false, es);
+      if (!error_stack_is_empty(es) ||
+          validated_moves_get_number_of_moves(vms) < 1) {
+        log_fatal("opening_bingo: failed to parse forced opening '%s'",
+                  autoplay_worker->ob_force_opening);
+      }
+      move_copy(&autoplay_worker->ob_forced_move,
+                validated_moves_get_move(vms, 0));
+      validated_moves_destroy(vms);
+      error_stack_destroy(es);
+      autoplay_worker->ob_forced_move_ready = true;
+    }
+    move = &autoplay_worker->ob_forced_move;
+  } else {
+    move = game_runner_get_best_move(autoplay_worker, game_runner);
+  }
 
   if (lg_shared_data) {
     rack_list_add_rack(lg_shared_data->rack_list, player_rack,
