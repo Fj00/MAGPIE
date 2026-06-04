@@ -298,13 +298,18 @@ typedef struct AutoplayWorker {
   Rack nontarget_known_rack;
   Rack target_known_rack;
   MoveList *move_lists[2];
-  // Opening-bingo experiment hooks (clean, env-driven; see
-  // bots/winpct opening-bingo analysis). When MAGPIE_OB_P1_RACK is set,
-  // P1's rack is forced to that rack every game; when MAGPIE_OB_P1_OPENING
-  // is set, P1's turn-0 move is forced to that play. The parsed opening
-  // move is cached (board is empty + rack identical every game).
-  const char *ob_force_rack;
-  const char *ob_force_opening;
+  // Opening-bingo experiment hooks (clean, isolated; see bots/winpct
+  // opening-bingo analysis). Two sources, checked at worker creation
+  // (i.e. once per `autoplay` command, so a warm sync process can run
+  // many tasks):
+  //   MAGPIE_OB_TASKFILE=<path>  — line1 = P1 rack, line2 = P1 opening.
+  //     Rewritten by the orchestrator before each autoplay call.
+  //   MAGPIE_OB_P1_RACK / MAGPIE_OB_P1_OPENING — one-shot env fallback.
+  // When active, P1 is forced to start with the given rack and play the
+  // given turn-0 move; the parsed move is cached per run.
+  char ob_force_rack[16];
+  char ob_force_opening[48];
+  bool ob_active;
   Move ob_forced_move;
   bool ob_forced_move_ready;
 } AutoplayWorker;
@@ -345,18 +350,42 @@ AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
   autoplay_worker->inference_results = NULL;
   autoplay_worker->error_stack = NULL;
 
-  // Opening-bingo forcing (env-driven). getenv is safe here: worker
-  // creation runs sequentially in the main thread before threads spawn.
-  autoplay_worker->ob_force_rack = getenv("MAGPIE_OB_P1_RACK");
-  if (autoplay_worker->ob_force_rack && autoplay_worker->ob_force_rack[0] == '\0') {
-    autoplay_worker->ob_force_rack = NULL;
-  }
-  autoplay_worker->ob_force_opening = getenv("MAGPIE_OB_P1_OPENING");
-  if (autoplay_worker->ob_force_opening &&
-      autoplay_worker->ob_force_opening[0] == '\0') {
-    autoplay_worker->ob_force_opening = NULL;
-  }
+  // Opening-bingo forcing. Read once per autoplay command (worker
+  // creation is sequential in the main thread before threads spawn).
+  // Taskfile takes precedence over the one-shot env vars.
+  autoplay_worker->ob_active = false;
+  autoplay_worker->ob_force_rack[0] = '\0';
+  autoplay_worker->ob_force_opening[0] = '\0';
   autoplay_worker->ob_forced_move_ready = false;
+  const char *ob_taskfile = getenv("MAGPIE_OB_TASKFILE");
+  if (ob_taskfile && ob_taskfile[0] != '\0') {
+    FILE *tf = fopen(ob_taskfile, "r");
+    if (tf) {
+      if (fgets(autoplay_worker->ob_force_rack,
+                sizeof(autoplay_worker->ob_force_rack), tf) &&
+          fgets(autoplay_worker->ob_force_opening,
+                sizeof(autoplay_worker->ob_force_opening), tf)) {
+        autoplay_worker->ob_force_rack[strcspn(
+            autoplay_worker->ob_force_rack, "\r\n")] = '\0';
+        autoplay_worker->ob_force_opening[strcspn(
+            autoplay_worker->ob_force_opening, "\r\n")] = '\0';
+        if (autoplay_worker->ob_force_rack[0] != '\0') {
+          autoplay_worker->ob_active = true;
+        }
+      }
+      fclose(tf);
+    }
+  } else {
+    const char *er = getenv("MAGPIE_OB_P1_RACK");
+    const char *eo = getenv("MAGPIE_OB_P1_OPENING");
+    if (er && er[0] != '\0' && eo && eo[0] != '\0') {
+      snprintf(autoplay_worker->ob_force_rack,
+               sizeof(autoplay_worker->ob_force_rack), "%s", er);
+      snprintf(autoplay_worker->ob_force_opening,
+               sizeof(autoplay_worker->ob_force_opening), "%s", eo);
+      autoplay_worker->ob_active = true;
+    }
+  }
 
   // Only allocate sim structs if at least one of the players running a sim.
   if (ap_args->p1_sim_args.num_plies > 0 ||
@@ -515,7 +544,7 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
   // Opening-bingo: P1 always opens with the forced rack. Return BOTH
   // racks so the forced rack is drawn from a full bag (else a letter it
   // needs may already be in P2's random rack), then redraw P2 random.
-  if (autoplay_worker->ob_force_rack) {
+  if (autoplay_worker->ob_active) {
     game_set_starting_player_index(game, 0);
     return_rack_to_bag(game, 0);
     return_rack_to_bag(game, 1);
@@ -697,7 +726,7 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
   }
 
   const Move *move;
-  if (autoplay_worker->ob_force_opening && game_runner->turn_number == 0 &&
+  if (autoplay_worker->ob_active && game_runner->turn_number == 0 &&
       player_on_turn_index == 0) {
     // Opening-bingo: force P1's first move. Parse once (empty board +
     // identical forced rack every game), cache the Move.
