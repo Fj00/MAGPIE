@@ -487,7 +487,7 @@ void test_endgame_compare(void) {
   FILE *fp = fopen(path, "re");
   if (!fp) { printf("cannot open %s\n", path); return; }
   Config *config = config_create_or_die(
-      "set -lex CSW21 -ld english -threads 1 -s1 equity -s2 equity");
+      "set -lex CSW24 -leaves CSW24 -ld english -threads 1 -s1 equity -s2 equity");
   exec_config_quiet(config, "new");
   Game *game = config_get_game(config);
   MoveList *move_list = move_list_create(1);
