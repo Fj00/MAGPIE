@@ -473,3 +473,111 @@ void test_benchmark_nonstuck_3v3(void) {
   log_set_level(LOG_FATAL);
   run_ab_benchmark("/tmp/nonstuck_cgps.txt", "nonstuck", 3, 3, 500);
 }
+
+// Endgame optimal-vs-greedy comparison + ply convergence.
+// Reads CGPs from MAGPIE_EG_CGPS (TSV: cgp\ttotal\tnblank). Per position:
+//  - optimal full solve (eplies = total tiles) value + time
+//  - optimal value at reduced plies (6, 10) for convergence
+//  - HastyBot greedy playout to game end -> final spread
+// Prints: total nblank stuck cur_diff opt_full opt_time opt_p6 opt_p10 greedy_diff
+void test_endgame_compare(void) {
+  log_set_level(LOG_FATAL);
+  const char *path = getenv("MAGPIE_EG_CGPS");
+  if (!path) { printf("set MAGPIE_EG_CGPS\n"); return; }
+  FILE *fp = fopen(path, "re");
+  if (!fp) { printf("cannot open %s\n", path); return; }
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -ld english -threads 1 -s1 equity -s2 equity");
+  exec_config_quiet(config, "new");
+  Game *game = config_get_game(config);
+  MoveList *move_list = move_list_create(1);
+  EndgameCtx *solver = NULL;
+  EndgameResults *results = endgame_results_create();
+  printf("total\tnblank\tstuck\tcur_diff\topt_full\topt_time\topt_p6\topt_p10\tgreedy_diff\n");
+  char line[8192];
+  while (fgets(line, sizeof(line), fp)) {
+    char *tab1 = strchr(line, '\t');
+    if (!tab1) continue;
+    *tab1 = '\0';
+    const char *cgp = line;
+    int total = atoi(tab1 + 1);
+    char *tab2 = strchr(tab1 + 1, '\t');
+    int nblank = tab2 ? atoi(tab2 + 1) : 0;
+
+    ErrorStack *err = error_stack_create();
+    game_load_cgp(game, cgp, err);
+    if (!error_stack_is_empty(err)) { error_stack_destroy(err); continue; }
+    error_stack_destroy(err);
+
+    int on = game_get_player_on_turn_index(game);
+    int cur_on = equity_to_int(player_get_score(game_get_player(game, on)));
+    int cur_off = equity_to_int(player_get_score(game_get_player(game, 1 - on)));
+    int cur_diff = cur_on - cur_off;
+    float sf = compute_stuck_fraction(game, move_list, on);
+    int stuck = (sf > 0.0F) ? 1 : 0;
+
+    int eplies_full = total > 25 ? 25 : (total < 1 ? 1 : total);
+    EndgameArgs args = {.game = game,
+                        .thread_control = config_get_thread_control(config),
+                        .plies = eplies_full,
+                        .tt_fraction_of_mem = 0.005,
+                        .initial_small_move_arena_size =
+                            DEFAULT_INITIAL_SMALL_MOVE_ARENA_SIZE,
+                        .num_threads = 1,
+                        .num_top_moves = 1,
+                        .use_heuristics = true,
+                        .per_ply_callback = NULL,
+                        .per_ply_callback_data = NULL,
+                        .forced_pass_bypass = false,
+                        .enable_pv_display = false,
+                        .seed = 42};
+    Timer t;
+    ctimer_start(&t);
+    err = error_stack_create();
+    endgame_solve(&solver, &args, results, err);
+    double opt_time = ctimer_elapsed_seconds(&t);
+    int opt_full =
+        endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
+    error_stack_destroy(err);
+
+    int opt_p6 = opt_full;
+    if (total > 6) {
+      args.plies = 6;
+      err = error_stack_create();
+      endgame_solve(&solver, &args, results, err);
+      opt_p6 = endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
+      error_stack_destroy(err);
+    }
+    int opt_p10 = opt_full;
+    if (total > 10) {
+      args.plies = 10;
+      err = error_stack_create();
+      endgame_solve(&solver, &args, results, err);
+      opt_p10 = endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
+      error_stack_destroy(err);
+    }
+
+    // greedy playout (reload to reset position)
+    err = error_stack_create();
+    game_load_cgp(game, cgp, err);
+    error_stack_destroy(err);
+    int guard = 0;
+    while (game_get_game_end_reason(game) == GAME_END_REASON_NONE &&
+           guard++ < 60) {
+      const Move *m = get_top_equity_move(game, 0, move_list);
+      play_move(m, game, NULL);
+    }
+    int g_on = equity_to_int(player_get_score(game_get_player(game, on)));
+    int g_off = equity_to_int(player_get_score(game_get_player(game, 1 - on)));
+    int greedy_diff = g_on - g_off;
+
+    printf("%d\t%d\t%d\t%d\t%d\t%.3f\t%d\t%d\t%d\n", total, nblank, stuck,
+           cur_diff, opt_full, opt_time, opt_p6, opt_p10, greedy_diff);
+    (void)fflush(stdout);
+  }
+  (void)fclose(fp);
+  move_list_destroy(move_list);
+  endgame_results_destroy(results);
+  (void)solver;  // freed at process exit (matches benchns)
+  config_destroy(config);
+}
