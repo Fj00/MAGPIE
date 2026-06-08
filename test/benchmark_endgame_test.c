@@ -529,8 +529,8 @@ void test_endgame_compare(void) {
                         .per_ply_callback = NULL,
                         .per_ply_callback_data = NULL,
                         .forced_pass_bypass = false,
-                        .soft_time_limit = 180,
-                        .hard_time_limit = 240};
+                        .soft_time_limit = 0,
+                        .hard_time_limit = 0};
     Timer t;
     ctimer_start(&t);
     err = error_stack_create();
