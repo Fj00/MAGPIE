@@ -491,7 +491,7 @@ void test_endgame_compare(void) {
   exec_config_quiet(config, "new");
   Game *game = config_get_game(config);
   MoveList *move_list = move_list_create(1);
-  EndgameCtx *solver = NULL;
+  EndgameSolver *solver = endgame_solver_create();
   EndgameResults *results = endgame_results_create();
   printf("total\tnblank\tstuck\tcur_diff\topt_full\topt_time\topt_p6\topt_p10\tgreedy_diff\n");
   char line[8192];
@@ -529,8 +529,8 @@ void test_endgame_compare(void) {
                         .per_ply_callback = NULL,
                         .per_ply_callback_data = NULL,
                         .forced_pass_bypass = false,
-                        .enable_pv_display = false,
-                        .seed = 42};
+                        .soft_time_limit = 180,
+                        .hard_time_limit = 240};
     Timer t;
     ctimer_start(&t);
     err = error_stack_create();
