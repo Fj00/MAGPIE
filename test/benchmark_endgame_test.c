@@ -493,7 +493,13 @@ void test_endgame_compare(void) {
   MoveList *move_list = move_list_create(1);
   EndgameSolver *solver = endgame_solver_create();
   EndgameResults *results = endgame_results_create();
-  printf("total\tnblank\tstuck\tcur_diff\topt_full\topt_time\topt_p6\topt_p10\tgreedy_diff\n");
+  // Time-bounded full solve: soft limit stops once the optimal value is stable
+  // across a deepening step (converged); hard limit caps the pathological tail
+  // (deep/stuck endgames that need many plies to squeeze out points). p6/p10
+  // are depth-bounded and run first so we always have a bounded value.
+  double soft_tl = getenv("MAGPIE_EG_SOFT") ? atof(getenv("MAGPIE_EG_SOFT")) : 15.0;
+  double hard_tl = getenv("MAGPIE_EG_HARD") ? atof(getenv("MAGPIE_EG_HARD")) : 45.0;
+  printf("total\tnblank\tstuck\tcur_diff\topt_p6\topt_p10\tp10_depth\topt_full\tfull_depth\topt_time\tgreedy_diff\n");
   char line[8192];
   while (fgets(line, sizeof(line), fp)) {
     char *tab1 = strchr(line, '\t');
@@ -531,6 +537,30 @@ void test_endgame_compare(void) {
                         .forced_pass_bypass = false,
                         .soft_time_limit = 0,
                         .hard_time_limit = 0};
+
+    // p6 (depth-bounded, no time limit)
+    args.plies = total > 6 ? 6 : eplies_full;
+    err = error_stack_create();
+    endgame_solve(solver, &args, results, err);
+    int opt_p6 = endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
+    error_stack_destroy(err);
+
+    // p10 (depth-bounded, no time limit) -- computed BEFORE full so even a
+    // pathological position always yields a bounded value.
+    args.plies = total > 10 ? 10 : eplies_full;
+    err = error_stack_create();
+    endgame_solve(solver, &args, results, err);
+    int opt_p10 = endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
+    int p10_depth = endgame_results_get_depth(results, ENDGAME_RESULT_BEST);
+    error_stack_destroy(err);
+
+    // full depth, TIME-BOUNDED. soft_tl stops once value is stable across a
+    // deepening step (converged); hard_tl caps the worst case. full_depth =
+    // plies actually reached; full_depth < total => stopped on time, not
+    // converged (the value at that depth is the deepest we could afford).
+    args.plies = eplies_full;
+    args.soft_time_limit = soft_tl;
+    args.hard_time_limit = hard_tl;
     Timer t;
     ctimer_start(&t);
     err = error_stack_create();
@@ -538,24 +568,8 @@ void test_endgame_compare(void) {
     double opt_time = ctimer_elapsed_seconds(&t);
     int opt_full =
         endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
+    int full_depth = endgame_results_get_depth(results, ENDGAME_RESULT_BEST);
     error_stack_destroy(err);
-
-    int opt_p6 = opt_full;
-    if (total > 6) {
-      args.plies = 6;
-      err = error_stack_create();
-      endgame_solve(solver, &args, results, err);
-      opt_p6 = endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
-      error_stack_destroy(err);
-    }
-    int opt_p10 = opt_full;
-    if (total > 10) {
-      args.plies = 10;
-      err = error_stack_create();
-      endgame_solve(solver, &args, results, err);
-      opt_p10 = endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
-      error_stack_destroy(err);
-    }
 
     // greedy playout (reload to reset position)
     err = error_stack_create();
@@ -571,8 +585,9 @@ void test_endgame_compare(void) {
     int g_off = equity_to_int(player_get_score(game_get_player(game, 1 - on)));
     int greedy_diff = g_on - g_off;
 
-    printf("%d\t%d\t%d\t%d\t%d\t%.3f\t%d\t%d\t%d\n", total, nblank, stuck,
-           cur_diff, opt_full, opt_time, opt_p6, opt_p10, greedy_diff);
+    printf("%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.3f\t%d\n", total, nblank, stuck,
+           cur_diff, opt_p6, opt_p10, p10_depth, opt_full, full_depth, opt_time,
+           greedy_diff);
     (void)fflush(stdout);
   }
   (void)fclose(fp);
