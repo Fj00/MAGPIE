@@ -474,12 +474,39 @@ void test_benchmark_nonstuck_3v3(void) {
   run_ab_benchmark("/tmp/nonstuck_cgps.txt", "nonstuck", 3, 3, 500);
 }
 
+// Captures the endgame value at depth 6 and 10 as iterative deepening passes
+// through them, so a SINGLE time-bounded solve yields p6/p10/full without
+// separate fixed-depth solves (which are NOT cheap: depth-10 of a 13-14 tile
+// double-blank position is near-full-depth and can run for an hour).
+typedef struct {
+  int32_t v6, v10;
+  bool has6, has10;
+} EgPlyCapture;
+
+static void eg_ply_cb(int depth, int32_t value, const struct PVLine *pv_line,
+                      const struct Game *game, const struct PVLine *ranked_pvs,
+                      int num_ranked_pvs, void *user_data) {
+  (void)pv_line;
+  (void)game;
+  (void)ranked_pvs;
+  (void)num_ranked_pvs;
+  EgPlyCapture *c = (EgPlyCapture *)user_data;
+  if (depth == 6) {
+    c->v6 = value;
+    c->has6 = true;
+  }
+  if (depth == 10) {
+    c->v10 = value;
+    c->has10 = true;
+  }
+}
+
 // Endgame optimal-vs-greedy comparison + ply convergence.
-// Reads CGPs from MAGPIE_EG_CGPS (TSV: cgp\ttotal\tnblank). Per position:
-//  - optimal full solve (eplies = total tiles) value + time
-//  - optimal value at reduced plies (6, 10) for convergence
-//  - HastyBot greedy playout to game end -> final spread
-// Prints: total nblank stuck cur_diff opt_full opt_time opt_p6 opt_p10 greedy_diff
+// Reads CGPs from MAGPIE_EG_CGPS (TSV: cgp\ttotal\tnblank). Per position one
+// TIME-BOUNDED iterative-deepening solve (soft/hard limits); p6/p10 captured
+// via per-ply callback; full = deepest value reached; plus HastyBot greedy
+// playout to game end. Prints: total nblank stuck cur_diff opt_p6 opt_p10
+// p10_depth opt_full full_depth opt_time greedy_diff
 void test_endgame_compare(void) {
   log_set_level(LOG_FATAL);
   const char *path = getenv("MAGPIE_EG_CGPS");
@@ -499,6 +526,7 @@ void test_endgame_compare(void) {
   // are depth-bounded and run first so we always have a bounded value.
   double soft_tl = getenv("MAGPIE_EG_SOFT") ? atof(getenv("MAGPIE_EG_SOFT")) : 15.0;
   double hard_tl = getenv("MAGPIE_EG_HARD") ? atof(getenv("MAGPIE_EG_HARD")) : 45.0;
+  double ttf = getenv("MAGPIE_EG_TTF") ? atof(getenv("MAGPIE_EG_TTF")) : 0.005;
   printf("total\tnblank\tstuck\tcur_diff\topt_p6\topt_p10\tp10_depth\topt_full\tfull_depth\topt_time\tgreedy_diff\n");
   char line[8192];
   while (fgets(line, sizeof(line), fp)) {
@@ -523,44 +551,29 @@ void test_endgame_compare(void) {
     int stuck = (sf > 0.0F) ? 1 : 0;
 
     int eplies_full = total > 25 ? 25 : (total < 1 ? 1 : total);
+
+    // ONE time-bounded iterative-deepening solve. soft_tl stops once the value
+    // is stable across a deepening step (converged); hard_tl caps the worst
+    // case. The per-ply callback records the value when the search completes
+    // depth 6 and depth 10, so we get p6/p10/full from a single bounded solve
+    // (separate fixed-depth solves are NOT cheap on deep/stuck positions and
+    // would run unbounded). full_depth = deepest ply reached; full_depth <
+    // total => stopped on time, value is the deepest we could afford.
+    EgPlyCapture cap = {.v6 = 0, .v10 = 0, .has6 = false, .has10 = false};
     EndgameArgs args = {.game = game,
                         .thread_control = config_get_thread_control(config),
                         .plies = eplies_full,
-                        .tt_fraction_of_mem = 0.005,
+                        .tt_fraction_of_mem = ttf,
                         .initial_small_move_arena_size =
                             DEFAULT_INITIAL_SMALL_MOVE_ARENA_SIZE,
                         .num_threads = 1,
                         .num_top_moves = 1,
                         .use_heuristics = true,
-                        .per_ply_callback = NULL,
-                        .per_ply_callback_data = NULL,
+                        .per_ply_callback = eg_ply_cb,
+                        .per_ply_callback_data = &cap,
                         .forced_pass_bypass = false,
-                        .soft_time_limit = 0,
-                        .hard_time_limit = 0};
-
-    // p6 (depth-bounded, no time limit)
-    args.plies = total > 6 ? 6 : eplies_full;
-    err = error_stack_create();
-    endgame_solve(solver, &args, results, err);
-    int opt_p6 = endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
-    error_stack_destroy(err);
-
-    // p10 (depth-bounded, no time limit) -- computed BEFORE full so even a
-    // pathological position always yields a bounded value.
-    args.plies = total > 10 ? 10 : eplies_full;
-    err = error_stack_create();
-    endgame_solve(solver, &args, results, err);
-    int opt_p10 = endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
-    int p10_depth = endgame_results_get_depth(results, ENDGAME_RESULT_BEST);
-    error_stack_destroy(err);
-
-    // full depth, TIME-BOUNDED. soft_tl stops once value is stable across a
-    // deepening step (converged); hard_tl caps the worst case. full_depth =
-    // plies actually reached; full_depth < total => stopped on time, not
-    // converged (the value at that depth is the deepest we could afford).
-    args.plies = eplies_full;
-    args.soft_time_limit = soft_tl;
-    args.hard_time_limit = hard_tl;
+                        .soft_time_limit = soft_tl,
+                        .hard_time_limit = hard_tl};
     Timer t;
     ctimer_start(&t);
     err = error_stack_create();
@@ -570,6 +583,9 @@ void test_endgame_compare(void) {
         endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
     int full_depth = endgame_results_get_depth(results, ENDGAME_RESULT_BEST);
     error_stack_destroy(err);
+    int opt_p6 = cap.has6 ? cap.v6 : opt_full;
+    int opt_p10 = cap.has10 ? cap.v10 : opt_full;
+    int p10_depth = cap.has10 ? 10 : full_depth;
 
     // greedy playout (reload to reset position)
     err = error_stack_create();
