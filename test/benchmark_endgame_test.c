@@ -487,7 +487,7 @@ void test_endgame_compare(void) {
   FILE *fp = fopen(path, "re");
   if (!fp) { printf("cannot open %s\n", path); return; }
   Config *config = config_create_or_die(
-      "set -lex CSW21 -ld english -threads 1");
+      "set -lex CSW24 -leaves CSW24 -ld english -threads 1");
   exec_config_quiet(config, "new");
   Game *game = config_get_game(config);
   MoveList *move_list = move_list_create(1);
@@ -533,7 +533,7 @@ void test_endgame_compare(void) {
     Timer t;
     ctimer_start(&t);
     err = error_stack_create();
-    endgame_solve(&solver, &args, results, err);
+    endgame_solve(solver, &args, results, err);
     double opt_time = ctimer_elapsed_seconds(&t);
     int opt_full =
         endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
@@ -543,7 +543,7 @@ void test_endgame_compare(void) {
     if (total > 6) {
       args.plies = 6;
       err = error_stack_create();
-      endgame_solve(&solver, &args, results, err);
+      endgame_solve(solver, &args, results, err);
       opt_p6 = endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
       error_stack_destroy(err);
     }
@@ -551,7 +551,7 @@ void test_endgame_compare(void) {
     if (total > 10) {
       args.plies = 10;
       err = error_stack_create();
-      endgame_solve(&solver, &args, results, err);
+      endgame_solve(solver, &args, results, err);
       opt_p10 = endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
       error_stack_destroy(err);
     }
