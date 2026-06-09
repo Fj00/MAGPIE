@@ -513,7 +513,8 @@ void test_endgame_compare(void) {
     int cur_on = equity_to_int(player_get_score(game_get_player(game, on)));
     int cur_off = equity_to_int(player_get_score(game_get_player(game, 1 - on)));
     int cur_diff = cur_on - cur_off;
-    int stuck = 0;  // stuck detection disabled (corrupts pre-solve state); TODO compute post-solve
+    float sf = compute_stuck_fraction(game, move_list, on);
+    int stuck = (sf > 0.0F) ? 1 : 0;
 
     int eplies_full = total > 25 ? 25 : (total < 1 ? 1 : total);
     EndgameArgs args = {.game = game,
