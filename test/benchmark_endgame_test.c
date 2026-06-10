@@ -474,13 +474,16 @@ void test_benchmark_nonstuck_3v3(void) {
   run_ab_benchmark("/tmp/nonstuck_cgps.txt", "nonstuck", 3, 3, 500);
 }
 
-// Captures the endgame value at depth 6 and 10 as iterative deepening passes
-// through them, so a SINGLE time-bounded solve yields p6/p10/full without
-// separate fixed-depth solves (which are NOT cheap: depth-10 of a 13-14 tile
-// double-blank position is near-full-depth and can run for an hour).
+// Captures the endgame value at EVERY depth as iterative deepening passes
+// through them, so a SINGLE time-bounded solve yields the full per-depth
+// convergence curve (separate fixed-depth solves are NOT cheap: depth-10 of a
+// 13-14 tile double-blank position is near-full-depth and can run for an hour).
+// Index by depth 1..25; [0] unused. Lets us study shallow sufficiency and the
+// even/odd parity oscillation.
+#define EG_MAX_DEPTH 26
 typedef struct {
-  int32_t v6, v10;
-  bool has6, has10;
+  int32_t v[EG_MAX_DEPTH];
+  bool has[EG_MAX_DEPTH];
 } EgPlyCapture;
 
 static void eg_ply_cb(int depth, int32_t value, const struct PVLine *pv_line,
@@ -491,13 +494,9 @@ static void eg_ply_cb(int depth, int32_t value, const struct PVLine *pv_line,
   (void)ranked_pvs;
   (void)num_ranked_pvs;
   EgPlyCapture *c = (EgPlyCapture *)user_data;
-  if (depth == 6) {
-    c->v6 = value;
-    c->has6 = true;
-  }
-  if (depth == 10) {
-    c->v10 = value;
-    c->has10 = true;
+  if (depth >= 0 && depth < EG_MAX_DEPTH) {
+    c->v[depth] = value;
+    c->has[depth] = true;
   }
 }
 
@@ -527,7 +526,7 @@ void test_endgame_compare(void) {
   double soft_tl = getenv("MAGPIE_EG_SOFT") ? atof(getenv("MAGPIE_EG_SOFT")) : 15.0;
   double hard_tl = getenv("MAGPIE_EG_HARD") ? atof(getenv("MAGPIE_EG_HARD")) : 45.0;
   double ttf = getenv("MAGPIE_EG_TTF") ? atof(getenv("MAGPIE_EG_TTF")) : 0.005;
-  printf("total\tnblank\tstuck\tcur_diff\topt_p6\topt_p10\tp10_depth\topt_full\tfull_depth\topt_time\tgreedy_diff\n");
+  printf("total\tnblank\tstuck\tcur_diff\topt_p6\topt_p10\tp10_depth\topt_full\tfull_depth\topt_time\tgreedy_diff\tvals\n");
   char line[8192];
   while (fgets(line, sizeof(line), fp)) {
     char *tab1 = strchr(line, '\t');
@@ -559,7 +558,8 @@ void test_endgame_compare(void) {
     // (separate fixed-depth solves are NOT cheap on deep/stuck positions and
     // would run unbounded). full_depth = deepest ply reached; full_depth <
     // total => stopped on time, value is the deepest we could afford.
-    EgPlyCapture cap = {.v6 = 0, .v10 = 0, .has6 = false, .has10 = false};
+    EgPlyCapture cap;
+    memset(&cap, 0, sizeof(cap));
     EndgameArgs args = {.game = game,
                         .thread_control = config_get_thread_control(config),
                         .plies = eplies_full,
@@ -583,9 +583,9 @@ void test_endgame_compare(void) {
         endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
     int full_depth = endgame_results_get_depth(results, ENDGAME_RESULT_BEST);
     error_stack_destroy(err);
-    int opt_p6 = cap.has6 ? cap.v6 : opt_full;
-    int opt_p10 = cap.has10 ? cap.v10 : opt_full;
-    int p10_depth = cap.has10 ? 10 : full_depth;
+    int opt_p6 = cap.has[6] ? cap.v[6] : opt_full;
+    int opt_p10 = cap.has[10] ? cap.v[10] : opt_full;
+    int p10_depth = cap.has[10] ? 10 : full_depth;
 
     // greedy playout (reload to reset position)
     err = error_stack_create();
@@ -601,9 +601,19 @@ void test_endgame_compare(void) {
     int g_off = equity_to_int(player_get_score(game_get_player(game, 1 - on)));
     int greedy_diff = g_on - g_off;
 
-    printf("%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.3f\t%d\n", total, nblank, stuck,
-           cur_diff, opt_p6, opt_p10, p10_depth, opt_full, full_depth, opt_time,
-           greedy_diff);
+    // per-depth value list v[1..max captured], comma-separated (for studying
+    // shallow sufficiency + even/odd parity oscillation)
+    char vals[256];
+    int vp = 0;
+    for (int d = 1; d < EG_MAX_DEPTH; d++) {
+      if (!cap.has[d]) continue;
+      vp += snprintf(vals + vp, sizeof(vals) - vp, "%s%d", vp ? "," : "",
+                     cap.v[d]);
+      if (vp >= (int)sizeof(vals) - 8) break;
+    }
+    printf("%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.3f\t%d\t%s\n", total, nblank,
+           stuck, cur_diff, opt_p6, opt_p10, p10_depth, opt_full, full_depth,
+           opt_time, greedy_diff, vals);
     (void)fflush(stdout);
   }
   (void)fclose(fp);
