@@ -483,7 +483,9 @@ void test_benchmark_nonstuck_3v3(void) {
 #define EG_MAX_DEPTH 26
 typedef struct {
   int32_t v[EG_MAX_DEPTH];
+  double t[EG_MAX_DEPTH]; // cumulative seconds when this depth completed
   bool has[EG_MAX_DEPTH];
+  Timer timer; // started right before endgame_solve
 } EgPlyCapture;
 
 static void eg_ply_cb(int depth, int32_t value, const struct PVLine *pv_line,
@@ -496,6 +498,7 @@ static void eg_ply_cb(int depth, int32_t value, const struct PVLine *pv_line,
   EgPlyCapture *c = (EgPlyCapture *)user_data;
   if (depth >= 0 && depth < EG_MAX_DEPTH) {
     c->v[depth] = value;
+    c->t[depth] = ctimer_elapsed_seconds(&c->timer);
     c->has[depth] = true;
   }
 }
@@ -526,7 +529,7 @@ void test_endgame_compare(void) {
   double soft_tl = getenv("MAGPIE_EG_SOFT") ? atof(getenv("MAGPIE_EG_SOFT")) : 15.0;
   double hard_tl = getenv("MAGPIE_EG_HARD") ? atof(getenv("MAGPIE_EG_HARD")) : 45.0;
   double ttf = getenv("MAGPIE_EG_TTF") ? atof(getenv("MAGPIE_EG_TTF")) : 0.005;
-  printf("total\tnblank\tstuck\tcur_diff\topt_p6\topt_p10\tp10_depth\topt_full\tfull_depth\topt_time\tgreedy_diff\tvals\n");
+  printf("total\tnblank\tstuck\tcur_diff\topt_p6\topt_p10\tp10_depth\topt_full\tfull_depth\topt_time\tgreedy_diff\tvals\tvtimes\n");
   char line[8192];
   while (fgets(line, sizeof(line), fp)) {
     char *tab1 = strchr(line, '\t');
@@ -574,11 +577,10 @@ void test_endgame_compare(void) {
                         .forced_pass_bypass = false,
                         .soft_time_limit = soft_tl,
                         .hard_time_limit = hard_tl};
-    Timer t;
-    ctimer_start(&t);
+    ctimer_start(&cap.timer);
     err = error_stack_create();
     endgame_solve(solver, &args, results, err);
-    double opt_time = ctimer_elapsed_seconds(&t);
+    double opt_time = ctimer_elapsed_seconds(&cap.timer);
     int opt_full =
         endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
     int full_depth = endgame_results_get_depth(results, ENDGAME_RESULT_BEST);
@@ -604,16 +606,19 @@ void test_endgame_compare(void) {
     // per-depth value list v[1..max captured], comma-separated (for studying
     // shallow sufficiency + even/odd parity oscillation)
     char vals[256];
-    int vp = 0;
+    char vtimes[384];
+    int vp = 0, tp = 0;
     for (int d = 1; d < EG_MAX_DEPTH; d++) {
       if (!cap.has[d]) continue;
       vp += snprintf(vals + vp, sizeof(vals) - vp, "%s%d", vp ? "," : "",
                      cap.v[d]);
-      if (vp >= (int)sizeof(vals) - 8) break;
+      tp += snprintf(vtimes + tp, sizeof(vtimes) - tp, "%s%.3f", tp ? "," : "",
+                     cap.t[d]);
+      if (vp >= (int)sizeof(vals) - 8 || tp >= (int)sizeof(vtimes) - 12) break;
     }
-    printf("%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.3f\t%d\t%s\n", total, nblank,
-           stuck, cur_diff, opt_p6, opt_p10, p10_depth, opt_full, full_depth,
-           opt_time, greedy_diff, vals);
+    printf("%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.3f\t%d\t%s\t%s\n", total,
+           nblank, stuck, cur_diff, opt_p6, opt_p10, p10_depth, opt_full,
+           full_depth, opt_time, greedy_diff, vals, vtimes);
     (void)fflush(stdout);
   }
   (void)fclose(fp);
