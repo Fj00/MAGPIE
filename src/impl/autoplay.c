@@ -32,6 +32,7 @@
 #include "../ent/rare_pool.h"
 #include "../ent/t6_baseline.h"
 #include "../ent/trajectory_recorder.h"
+#include "../ent/position_pool.h"
 #include "../ent/inference_args.h"
 #include "../ent/inference_results.h"
 #include "../ent/klv.h"
@@ -281,6 +282,13 @@ typedef struct AutoplaySharedData {
   // every game turn (before the move plays) writes a row to
   // <dir>/positions/bag_<NN>.csv. Used by the 91-8 V-model pipeline.
   TrajectoryRecorder *trajectory_recorder;
+  // Position-pool mode (91-8 rack injection): when MAGPIE_POSITION_POOL=<file>
+  // is set, the worker loop loads mid-game CGPs from the pool instead of
+  // starting fresh games, plays the on-turn move + POST, and records via the
+  // trajectory recorder (same positions/bag_<NN>.csv format → combines with
+  // natural). position_pool_next is the shared work-stealing cursor.
+  PositionPool *position_pool;
+  _Atomic int position_pool_next;
 } AutoplaySharedData;
 
 // Per-turn role for single-target-turn EB recording. Each turn (1..6) gets
@@ -1074,6 +1082,12 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   if (traj_dir && traj_dir[0] != '\0') {
     shared_data->trajectory_recorder = trajectory_recorder_create(traj_dir);
   }
+  shared_data->position_pool = NULL;
+  atomic_store(&shared_data->position_pool_next, 0);
+  const char *pos_pool_path = getenv("MAGPIE_POSITION_POOL");
+  if (pos_pool_path && pos_pool_path[0] != '\0') {
+    shared_data->position_pool = position_pool_create(pos_pool_path);
+  }
   shared_data->empty_board_strata_recorder = NULL;
   const char *eb_strata = getenv("MAGPIE_EMPTY_BOARD_STRATA");
   if (eb_strata && eb_strata[0] != '\0') {
@@ -1151,6 +1165,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   empty_board_recorder_destroy(shared_data->empty_board_recorder);
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
   trajectory_recorder_destroy(shared_data->trajectory_recorder);
+  position_pool_destroy(shared_data->position_pool);
   void vmodel_log_stats(void);  // defined later in this TU
   if (shared_data->vmodel_any_loaded ||
       shared_data->vmodel_picks_any_loaded) {
@@ -5032,6 +5047,90 @@ static void t6_baseline_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   }
 }
 
+// Position-pool worker (MAGPIE_POSITION_POOL): work-steal mid-game CGPs from
+// the pool, load each, play the on-turn move (recorded via the trajectory
+// recorder when MAGPIE_TRAJECTORY_RECORDER is also set), then play out POST
+// with HastyBot (NOT recorded), and commit/discard the staged row by the
+// game-end reason — mirroring the trajectory recorder's two-phase semantics.
+// Pilot scope: natural (loaded) rack + best move, to validate the pipeline and
+// the synthetic-vs-natural combinability check. Rack injection + counterfactual
+// move enumeration are the next increment.
+static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
+  AutoplaySharedData *sd = worker->shared_data;
+  PositionPool *pp = sd->position_pool;
+  ThreadControl *tc = worker->args.thread_control;
+  TrajectoryRecorder *traj_r = sd->trajectory_recorder;
+  const int n = position_pool_count(pp);
+  MoveList *post_ml = move_list_create(1);
+  for (;;) {
+    if (thread_control_get_status(tc) == THREAD_CONTROL_STATUS_USER_INTERRUPT) {
+      break;
+    }
+    const int i = atomic_fetch_add_explicit(&sd->position_pool_next, 1,
+                                             memory_order_relaxed);
+    if (i >= n) break;
+    const char *cgp = position_pool_get_cgp(pp, i);
+    if (!cgp) continue;
+
+    game_reset(gr->game);
+    // Reset GameRunner fields normally cleared by game_runner_start, which we
+    // bypass (mirrors t6_baseline_run_worker).
+    gr->turn_number = 0;
+    gr->force_draw = false;
+    gr->force_triggered = false;
+    gr->pending_force_target = NULL;
+    gr->pending_force_diff = 0;
+    gr->pending_force_player_index = 0;
+    gr->pass_cycle_active = false;
+    gr->pass_cycle_abandoned = false;
+    gr->pass_cycle_n_moves = 0;
+    gr->eb_active = false;
+    gr->eb_forced_move = NULL;
+    gr->eb_n_snaps = 0;
+    gr->eb_actions_p0[0] = '\0';
+    gr->eb_actions_p0_off = 0;
+    gr->eb_actions_p1[0] = '\0';
+    gr->eb_actions_p1_off = 0;
+
+    ErrorStack *es = error_stack_create();
+    game_load_cgp(gr->game, cgp, es);
+    if (!error_stack_is_empty(es)) {
+      error_stack_destroy(es);
+      continue;
+    }
+    error_stack_destroy(es);
+    // Seed downstream draws (POST) deterministically per (worker, position).
+    game_seed(gr->game,
+              (uint64_t)worker->worker_index * 0x9e3779b97f4a7c15ULL +
+                  (uint64_t)i);
+    gr->game_number = position_pool_get_id(pp, i);
+
+    if (traj_r && gr->trajectory_buf) {
+      trajectory_game_buffer_reset(gr->trajectory_buf);
+    }
+    // Target turn: record (if recorder set) + play the on-turn move at the
+    // loaded position.
+    game_runner_play_move(worker, gr);
+    // POST: play out to game end with HastyBot equity; not recorded.
+    while (!game_runner_is_game_over(gr)) {
+      const Move *m = get_top_equity_move(gr->game, 0, post_ml);
+      play_move(m, gr->game, NULL);
+    }
+    if (traj_r && gr->trajectory_buf) {
+      if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD) {
+        const int f0 =
+            equity_to_int(player_get_score(game_get_player(gr->game, 0)));
+        const int f1 =
+            equity_to_int(player_get_score(game_get_player(gr->game, 1)));
+        trajectory_game_buffer_commit(traj_r, gr->trajectory_buf, f0, f1);
+      } else {
+        trajectory_game_buffer_discard(gr->trajectory_buf);
+      }
+    }
+  }
+  move_list_destroy(post_ml);
+}
+
 void *autoplay_worker(void *uncasted_autoplay_worker) {
   AutoplayWorker *autoplay_worker = (AutoplayWorker *)uncasted_autoplay_worker;
   const AutoplayArgs *args = &autoplay_worker->args;
@@ -5043,6 +5142,14 @@ void *autoplay_worker(void *uncasted_autoplay_worker) {
   // autoplay. Returns when task file exhausted.
   if (autoplay_worker->shared_data->t6_baseline != NULL) {
     t6_baseline_run_worker(autoplay_worker, game_runner1);
+    game_runner_destroy(game_runner1);
+    return NULL;
+  }
+
+  // Position-pool mode (91-8 rack injection): load mid-game CGPs from the pool
+  // instead of fresh games.
+  if (autoplay_worker->shared_data->position_pool != NULL) {
+    position_pool_run_worker(autoplay_worker, game_runner1);
     game_runner_destroy(game_runner1);
     return NULL;
   }
