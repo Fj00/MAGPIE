@@ -2476,6 +2476,104 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
 }
 
 // Returns the played move
+// Stage one trajectory row for `move` at the current (pre-move) position into
+// the game runner's per-game buffer, when the trajectory recorder is active.
+// Factored out of game_runner_play_move so the position-pool mode can record
+// the same schema without going through the autoplay move-selection path.
+static void eb_stage_trajectory_row(GameRunner *game_runner, Game *game,
+                                    const Move *move,
+                                    int player_on_turn_index) {
+  TrajectoryRecorder *traj_r = game_runner->shared_data->trajectory_recorder;
+  TrajectoryGameBuffer *traj_buf = game_runner->trajectory_buf;
+  if (!(traj_r && traj_buf)) return;
+  const Rack *player_rack =
+      player_get_rack(game_get_player(game, player_on_turn_index));
+  const LetterDistribution *traj_ld = game_get_ld(game);
+  // Unseen-total convention: physical bag + opp's actual rack size.
+  const int traj_opp_idx = 1 - player_on_turn_index;
+  const int traj_opp_rack_size = rack_get_total_letters(
+      player_get_rack(game_get_player(game, traj_opp_idx)));
+  const int traj_bag =
+      bag_get_letters(game_get_bag(game)) + traj_opp_rack_size;
+  char p1_rack_str[RACK_SIZE + 2] = {0};
+  char p2_rack_str[RACK_SIZE + 2] = {0};
+  for (int pp = 0; pp < 2; pp++) {
+    const Rack *rk = player_get_rack(game_get_player(game, pp));
+    char *out = (pp == 0) ? p1_rack_str : p2_rack_str;
+    int n = 0;
+    const uint16_t ds = rack_get_dist_size(rk);
+    for (uint16_t i = 1; i < ds && n < RACK_SIZE; i++) {
+      const int c = rack_get_letter(rk, i);
+      for (int k = 0; k < c && n < RACK_SIZE; k++) {
+        out[n++] = traj_ld->ld_ml_to_hl[i][0];
+      }
+    }
+    const int nb = rack_get_letter(rk, 0);
+    for (int k = 0; k < nb && n < RACK_SIZE; k++) out[n++] = '?';
+    out[n] = '\0';
+  }
+  const game_event_t mt = move_get_type(move);
+  int act_kind;
+  int act_size;
+  if (mt == GAME_EVENT_PASS) {
+    act_kind = 0;
+    act_size = 0;
+  } else if (mt == GAME_EVENT_EXCHANGE) {
+    act_kind = 1;
+    act_size = move_get_tiles_played(move);
+  } else {
+    act_kind = 2;
+    act_size = move_get_tiles_played(move);
+  }
+  char act_repr[64];
+  StringBuilder *act_sb = string_builder_create();
+  string_builder_add_move(act_sb, game_get_board(game), move, traj_ld, false);
+  size_t act_len = 0;
+  char *act_dump = string_builder_dump(act_sb, &act_len);
+  snprintf(act_repr, sizeof(act_repr), "%s", act_dump ? act_dump : "");
+  free(act_dump);
+  string_builder_destroy(act_sb);
+  Rack traj_leave;
+  rack_set_dist_size(&traj_leave, rack_get_dist_size(player_rack));
+  rack_reset(&traj_leave);
+  if (mt == GAME_EVENT_PASS) {
+    rack_copy(&traj_leave, player_rack);
+  } else {
+    get_leave_for_move(move, game, &traj_leave);
+  }
+  char leave_str[RACK_SIZE + 2] = {0};
+  int ln = 0;
+  const uint16_t lds = rack_get_dist_size(&traj_leave);
+  for (uint16_t i = 1; i < lds && ln < RACK_SIZE; i++) {
+    const int c = rack_get_letter(&traj_leave, i);
+    for (int k = 0; k < c && ln < RACK_SIZE; k++) {
+      leave_str[ln++] = traj_ld->ld_ml_to_hl[i][0];
+    }
+  }
+  const int lvb = rack_get_letter(&traj_leave, 0);
+  for (int k = 0; k < lvb && ln < RACK_SIZE; k++) leave_str[ln++] = '?';
+  leave_str[ln] = '\0';
+  char *cgp_str = game_get_cgp(game, false);
+  const int p1_score =
+      equity_to_int(player_get_score(game_get_player(game, 0)));
+  const int p2_score =
+      equity_to_int(player_get_score(game_get_player(game, 1)));
+  const int move_score_int =
+      (mt == GAME_EVENT_TILE_PLACEMENT_MOVE)
+          ? equity_to_int(move_get_score(move))
+          : 0;
+  const int on_turn_score = (player_on_turn_index == 0) ? p1_score : p2_score;
+  const int opp_score = (player_on_turn_index == 0) ? p2_score : p1_score;
+  const int score_diff_pre = on_turn_score - opp_score;
+  const int score_diff_post = score_diff_pre + move_score_int;
+  trajectory_game_buffer_add(
+      traj_buf, game_runner->game_number, game_runner->turn_number + 1,
+      traj_bag, player_on_turn_index, p1_rack_str, p2_rack_str, p1_score,
+      p2_score, cgp_str ? cgp_str : "", act_kind, act_repr, act_size,
+      move_score_int, score_diff_pre, score_diff_post, leave_str);
+  free(cgp_str);
+}
+
 const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
                                   GameRunner *game_runner) {
   if (game_runner_is_game_over(game_runner)) {
@@ -2957,113 +3055,9 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
   }
 
   // Trajectory recorder: stage the pre-move position in this worker's
-  // per-game buffer. The buffer commits (writes to disk) when the game
-  // ends normally; games ending via 6-pass terminus are discarded.
+  // per-game buffer (commits on normal game end; 6-pass terminus discarded).
   // Active only when MAGPIE_TRAJECTORY_RECORDER=<dir> is set at startup.
-  TrajectoryRecorder *traj_r = game_runner->shared_data->trajectory_recorder;
-  TrajectoryGameBuffer *traj_buf = game_runner->trajectory_buf;
-  if (traj_r && traj_buf) {
-    const LetterDistribution *traj_ld = game_get_ld(game);
-    // Unseen-total convention: physical bag + opp's actual rack size.
-    // At bag<8 (physical bag empty), opp draws nothing so opp_rack_size
-    // can be 1..7. Using a fixed +RACK_SIZE would mislabel every
-    // endgame position as bag=7.
-    const int traj_opp_idx = 1 - player_on_turn_index;
-    const int traj_opp_rack_size = rack_get_total_letters(
-        player_get_rack(game_get_player(game, traj_opp_idx)));
-    const int traj_bag =
-        bag_get_letters(game_get_bag(game)) + traj_opp_rack_size;
-    // Stringify both players' racks (canonical: A..Z then ?).
-    char p1_rack_str[RACK_SIZE + 2] = {0};
-    char p2_rack_str[RACK_SIZE + 2] = {0};
-    for (int pp = 0; pp < 2; pp++) {
-      const Rack *rk = player_get_rack(game_get_player(game, pp));
-      char *out = (pp == 0) ? p1_rack_str : p2_rack_str;
-      int n = 0;
-      const uint16_t ds = rack_get_dist_size(rk);
-      for (uint16_t i = 1; i < ds && n < RACK_SIZE; i++) {
-        const int c = rack_get_letter(rk, i);
-        for (int k = 0; k < c && n < RACK_SIZE; k++) {
-          out[n++] = traj_ld->ld_ml_to_hl[i][0];
-        }
-      }
-      const int nb = rack_get_letter(rk, 0);
-      for (int k = 0; k < nb && n < RACK_SIZE; k++) out[n++] = '?';
-      out[n] = '\0';
-    }
-    // Action kind / repr / size from `move`. Use string_builder_add_move
-    // so action_repr matches the standard magpie display format:
-    //   pass  -> "pass"
-    //   exch  -> "(exch ABC)"
-    //   play  -> "8H DOYLY" (coord + word with blank lowercase + played-
-    //            through markers when applicable)
-    // This is unambiguous: action_repr alone identifies the move, no need
-    // to cross-reference board state.
-    const game_event_t mt = move_get_type(move);
-    int act_kind;
-    int act_size;
-    if (mt == GAME_EVENT_PASS) {
-      act_kind = 0;
-      act_size = 0;
-    } else if (mt == GAME_EVENT_EXCHANGE) {
-      act_kind = 1;
-      act_size = move_get_tiles_played(move);
-    } else {
-      act_kind = 2;
-      act_size = move_get_tiles_played(move);
-    }
-    char act_repr[64];
-    StringBuilder *act_sb = string_builder_create();
-    string_builder_add_move(act_sb, game_get_board(game), move, traj_ld, false);
-    size_t act_len = 0;
-    char *act_dump = string_builder_dump(act_sb, &act_len);
-    snprintf(act_repr, sizeof(act_repr), "%s", act_dump ? act_dump : "");
-    free(act_dump);
-    string_builder_destroy(act_sb);
-    // Leave (post-action rack of the on-turn player).
-    Rack traj_leave;
-    rack_set_dist_size(&traj_leave, rack_get_dist_size(player_rack));
-    rack_reset(&traj_leave);
-    if (mt == GAME_EVENT_PASS) {
-      rack_copy(&traj_leave, player_rack);
-    } else {
-      get_leave_for_move(move, game, &traj_leave);
-    }
-    char leave_str[RACK_SIZE + 2] = {0};
-    int ln = 0;
-    const uint16_t lds = rack_get_dist_size(&traj_leave);
-    for (uint16_t i = 1; i < lds && ln < RACK_SIZE; i++) {
-      const int c = rack_get_letter(&traj_leave, i);
-      for (int k = 0; k < c && ln < RACK_SIZE; k++) {
-        leave_str[ln++] = traj_ld->ld_ml_to_hl[i][0];
-      }
-    }
-    const int lvb = rack_get_letter(&traj_leave, 0);
-    for (int k = 0; k < lvb && ln < RACK_SIZE; k++) leave_str[ln++] = '?';
-    leave_str[ln] = '\0';
-    // CGP (caller owns; free after the write).
-    char *cgp_str = game_get_cgp(game, false);
-    const int p1_score =
-        equity_to_int(player_get_score(game_get_player(game, 0)));
-    const int p2_score =
-        equity_to_int(player_get_score(game_get_player(game, 1)));
-    // move_score: 0 for pass/exchange, the play's score for tile placement.
-    const int move_score_int =
-        (mt == GAME_EVENT_TILE_PLACEMENT_MOVE)
-            ? equity_to_int(move_get_score(move))
-            : 0;
-    const int on_turn_score = (player_on_turn_index == 0) ? p1_score : p2_score;
-    const int opp_score = (player_on_turn_index == 0) ? p2_score : p1_score;
-    const int score_diff_pre = on_turn_score - opp_score;
-    const int score_diff_post = score_diff_pre + move_score_int;
-    trajectory_game_buffer_add(
-        traj_buf, game_runner->game_number, game_runner->turn_number + 1,
-        traj_bag, player_on_turn_index, p1_rack_str, p2_rack_str,
-        p1_score, p2_score, cgp_str ? cgp_str : "",
-        act_kind, act_repr, act_size,
-        move_score_int, score_diff_pre, score_diff_post, leave_str);
-    free(cgp_str);
-  }
+  eb_stage_trajectory_row(game_runner, game, move, player_on_turn_index);
 
   play_move(move, game, NULL);
 
@@ -5108,12 +5102,19 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
     if (traj_r && gr->trajectory_buf) {
       trajectory_game_buffer_reset(gr->trajectory_buf);
     }
-    // Target turn: record (if recorder set) + play the on-turn move at the
-    // loaded position.
-    game_runner_play_move(worker, gr);
+    // Target turn: select the on-turn move via get_top_equity_move (HastyBot)
+    // directly — NOT game_runner_play_move, whose autoplay selection path
+    // (sim args / EB role forcing) misbehaves on a loaded mid-game board.
+    // Stage the row through the shared helper, then play it.
+    const int on_idx = game_get_player_on_turn_index(gr->game);
+    const Move *target = get_top_equity_move(gr->game, worker->worker_index,
+                                             post_ml);
+    eb_stage_trajectory_row(gr, gr->game, target, on_idx);
+    play_move(target, gr->game, NULL);
     // POST: play out to game end with HastyBot equity; not recorded.
     while (!game_runner_is_game_over(gr)) {
-      const Move *m = get_top_equity_move(gr->game, 0, post_ml);
+      const Move *m =
+          get_top_equity_move(gr->game, worker->worker_index, post_ml);
       play_move(m, gr->game, NULL);
     }
     if (traj_r && gr->trajectory_buf) {
