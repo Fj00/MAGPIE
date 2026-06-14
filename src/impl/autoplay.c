@@ -293,6 +293,12 @@ typedef struct AutoplaySharedData {
   // Per-(bag,leave,diff-bin) deficit table gating the position-pool fan-out
   // for the L0-L4 per-leave track (NULL = no gating). Env MAGPIE_PP_LEAVE_*.
   LeaveDeficit *leave_deficit;
+  // Targeted rack pool (MAGPIE_PP_RACK_POOL): when set, the fan-out injects an
+  // on-turn rack sampled from this list (e.g. vowel-heavy + consonant-heavy
+  // racks) via swap_player_rack, instead of a random re-roll — so the rare
+  // typed strata (6_vowel, 5_vowel, 6_cons…) get covered efficiently rather
+  // than waiting for random draws to produce them.
+  PositionPool *rack_pool;
 } AutoplaySharedData;
 
 // Per-turn role for single-target-turn EB recording. Each turn (1..6) gets
@@ -1092,6 +1098,11 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   if (pos_pool_path && pos_pool_path[0] != '\0') {
     shared_data->position_pool = position_pool_create(pos_pool_path);
   }
+  shared_data->rack_pool = NULL;
+  const char *rack_pool_path = getenv("MAGPIE_PP_RACK_POOL");
+  if (rack_pool_path && rack_pool_path[0] != '\0') {
+    shared_data->rack_pool = position_pool_create(rack_pool_path);
+  }
   shared_data->leave_deficit = NULL;
   const char *leave_tgt = getenv("MAGPIE_PP_LEAVE_TARGET");
   if (leave_tgt && leave_tgt[0] != '\0') {
@@ -1178,6 +1189,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
   trajectory_recorder_destroy(shared_data->trajectory_recorder);
   position_pool_destroy(shared_data->position_pool);
+  position_pool_destroy(shared_data->rack_pool);
   leave_deficit_destroy(shared_data->leave_deficit);
   void vmodel_log_stats(void);  // defined later in this TU
   if (shared_data->vmodel_any_loaded ||
@@ -5159,8 +5171,24 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
       gr->game_number = pos_id;
 
       const int on_idx = game_get_player_on_turn_index(gr->game);
-      // Rack injection: re-roll the on-turn rack from the bag (own+bag pool).
-      if (rerolls > 0) {
+      // Rack injection. With a targeted rack pool (vowel/cons-heavy racks),
+      // inject a sampled pool rack via swap_player_rack — retrying on
+      // undrawable racks (pool rack may need tiles not in this position's
+      // bag). Else if rerolls>0, random re-roll from the bag. (Set REROLLS=K
+      // alongside RACK_POOL to inject K distinct pool racks per position.)
+      if (sd->rack_pool != NULL) {
+        const int rpn = position_pool_count(sd->rack_pool);
+        uint64_t rseed = (uint64_t)worker->worker_index * 0x9e3779b97f4a7c15ULL +
+                         (uint64_t)i * 1000003ULL + (uint64_t)g;
+        for (int retry = 0; retry < 32 && rpn > 0; retry++) {
+          rseed = rseed * 6364136223846793005ULL + 1442695040888963407ULL;
+          const char *rk =
+              position_pool_get_cgp(sd->rack_pool, (int)(rseed % (uint64_t)rpn));
+          if (rk && swap_player_rack(gr->game, on_idx, rk)) {
+            break;  // injected; on all-retry failure keep the loaded rack
+          }
+        }
+      } else if (rerolls > 0) {
         return_rack_to_bag(gr->game, on_idx);
         draw_to_full_rack(gr->game, on_idx);
       }
