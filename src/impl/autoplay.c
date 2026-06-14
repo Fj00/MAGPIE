@@ -5126,6 +5126,11 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   const char *rerolls_env = getenv("MAGPIE_PP_REROLLS");
   const int rerolls = rerolls_env ? atoi(rerolls_env) : 0;
   const int games_per_pos = rerolls > 0 ? rerolls : 1;
+  // Opp-swap threshold (unseen tiles): at/below this bag the own+bag pool is
+  // too small to draw an injected rack, so the opponent's rack is also
+  // returned to the bag (widening the pool) and redrawn afterward. Default 14.
+  const char *oppswap_env = getenv("MAGPIE_PP_OPPSWAP_MAXBAG");
+  const int oppswap_maxbag = oppswap_env ? atoi(oppswap_env) : 14;
   for (;;) {
     if (thread_control_get_status(tc) == THREAD_CONTROL_STATUS_USER_INTERRUPT) {
       break;
@@ -5172,11 +5177,20 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
       gr->game_number = pos_id;
 
       const int on_idx = game_get_player_on_turn_index(gr->game);
-      // Rack injection. With a targeted rack pool (vowel/cons-heavy racks),
-      // inject a sampled pool rack via swap_player_rack — retrying on
-      // undrawable racks (pool rack may need tiles not in this position's
-      // bag). Else if rerolls>0, random re-roll from the bag. (Set REROLLS=K
-      // alongside RACK_POOL to inject K distinct pool racks per position.)
+      const int opp_idx = 1 - on_idx;
+      // Rack injection. With a targeted rack pool, inject a sampled pool rack
+      // via swap_player_rack (retry on undrawable); else if rerolls>0, random
+      // re-roll. At low bag the own+bag pool is too small to draw an arbitrary
+      // rack, so opp-swap: return the opponent's rack to the bag (widening the
+      // pool), inject, then redraw the opponent. Bag-gated so high-bag keeps
+      // the opponent natural (no synthetic-opp bias).
+      const bool do_inject = (sd->rack_pool != NULL) || (rerolls > 0);
+      const int inj_unseen =
+          bag_get_letters(game_get_bag(gr->game)) +
+          rack_get_total_letters(
+              player_get_rack(game_get_player(gr->game, opp_idx)));
+      const bool oppswap = do_inject && inj_unseen <= oppswap_maxbag;
+      if (oppswap) return_rack_to_bag(gr->game, opp_idx);
       if (sd->rack_pool != NULL) {
         const int rpn = position_pool_count(sd->rack_pool);
         uint64_t rseed = (uint64_t)worker->worker_index * 0x9e3779b97f4a7c15ULL +
@@ -5193,6 +5207,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         return_rack_to_bag(gr->game, on_idx);
         draw_to_full_rack(gr->game, on_idx);
       }
+      if (oppswap) draw_to_full_rack(gr->game, opp_idx);  // redraw the opponent
 
       if (fanout) {
         // Branch a playout per distinct (kind,score,leave) cell of the rack's
