@@ -5049,6 +5049,36 @@ static void t6_baseline_run_worker(AutoplayWorker *worker, GameRunner *gr) {
 // Pilot scope: natural (loaded) rack + best move, to validate the pipeline and
 // the synthetic-vs-natural combinability check. Rack injection + counterfactual
 // move enumeration are the next increment.
+// Render the on-turn player's post-move leave to a canonical string (A..Z
+// then '?'). Used to build (kind,score,leaf) dedup keys for the fan-out.
+static void pp_render_leave(const Move *move, const Game *game, char *out,
+                           size_t cap) {
+  const int on = game_get_player_on_turn_index(game);
+  const Rack *prack = player_get_rack(game_get_player(game, on));
+  Rack lv;
+  rack_set_dist_size(&lv, rack_get_dist_size(prack));
+  rack_reset(&lv);
+  if (move_get_type(move) == GAME_EVENT_PASS) {
+    rack_copy(&lv, prack);
+  } else {
+    get_leave_for_move(move, game, &lv);
+  }
+  const LetterDistribution *ld = game_get_ld(game);
+  int n = 0;
+  const uint16_t ds = rack_get_dist_size(&lv);
+  for (uint16_t i = 1; i < ds && n < (int)cap - 1; i++) {
+    const int c = rack_get_letter(&lv, i);
+    for (int k = 0; k < c && n < (int)cap - 1; k++) {
+      out[n++] = ld->ld_ml_to_hl[i][0];
+    }
+  }
+  const int nb = rack_get_letter(&lv, 0);
+  for (int k = 0; k < nb && n < (int)cap - 1; k++) out[n++] = '?';
+  out[n] = '\0';
+}
+
+#define PP_FANOUT_MAX 512  // max distinct (kind,score,leaf) branches per rack
+
 static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   AutoplaySharedData *sd = worker->shared_data;
   PositionPool *pp = sd->position_pool;
@@ -5056,6 +5086,12 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   TrajectoryRecorder *traj_r = sd->trajectory_recorder;
   const int n = position_pool_count(pp);
   MoveList *post_ml = move_list_create(1);
+  MoveList *fan_ml = move_list_create(8192);  // full move list for fan-out
+  // MAGPIE_PP_FANOUT=1: branch a playout per distinct (kind,score,leaf) cell of
+  // the injected rack's move list (counterfactual coverage), instead of only
+  // the best move. Composes with REROLLS (each re-rolled rack is fanned out).
+  const char *fanout_env = getenv("MAGPIE_PP_FANOUT");
+  const bool fanout = fanout_env && fanout_env[0] == '1';
   // MAGPIE_PP_REROLLS=K: if K>0, inject K randomly re-rolled on-turn racks per
   // position (rack injection for coverage), each a separate playout. K=0 (or
   // unset) = baseline: one playout with the loaded natural rack. The re-roll
@@ -5116,36 +5152,100 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         draw_to_full_rack(gr->game, on_idx);
       }
 
-      if (traj_r && gr->trajectory_buf) {
-        trajectory_game_buffer_reset(gr->trajectory_buf);
-      }
-      // Select the on-turn move via get_top_equity_move (HastyBot) directly —
-      // NOT game_runner_play_move, whose autoplay path (sim / EB role forcing)
-      // misbehaves on a loaded mid-game board. Stage the row, then play it.
-      const Move *target =
-          get_top_equity_move(gr->game, worker->worker_index, post_ml);
-      eb_stage_trajectory_row(gr, gr->game, target, on_idx);
-      play_move(target, gr->game, NULL);
-      // POST: play out to game end with HastyBot equity; not recorded.
-      while (!game_runner_is_game_over(gr)) {
-        const Move *m =
+      if (fanout) {
+        // Branch a playout per distinct (kind,score,leaf) cell of the rack's
+        // move list. Movegen once on gr->game; each branch clones the position
+        // (game_duplicate), plays the move, and POSTs to end on the clone, so
+        // gr->game stays intact for the next branch.
+        const MoveGenArgs fga = {
+            .game = gr->game,
+            .move_list = fan_ml,
+            .move_record_type = MOVE_RECORD_ALL,
+            .move_sort_type = MOVE_SORT_EQUITY,
+            .override_kwg = NULL,
+            .thread_index = worker->worker_index,
+            .eq_margin_movegen = 0,
+            .target_equity = EQUITY_MAX_VALUE,
+            .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+            .tiles_played_bv = NULL,
+            .initial_tiles_bv = 0};
+        generate_moves(&fga);
+        const int nm = move_list_get_count(fan_ml);
+        static _Thread_local char seen[PP_FANOUT_MAX][24];
+        int nseen = 0;
+        for (int m = 0; m < nm && nseen < PP_FANOUT_MAX; m++) {
+          const Move *mv = move_list_get_move(fan_ml, m);
+          char lf[RACK_SIZE + 2];
+          pp_render_leave(mv, gr->game, lf, sizeof(lf));
+          char key[24];
+          snprintf(key, sizeof(key), "%d_%d_%s", (int)move_get_type(mv),
+                   (int)equity_to_int(move_get_score(mv)), lf);
+          bool dup_key = false;
+          for (int s = 0; s < nseen; s++) {
+            if (strcmp(seen[s], key) == 0) {
+              dup_key = true;
+              break;
+            }
+          }
+          if (dup_key) continue;
+          snprintf(seen[nseen++], sizeof(seen[0]), "%s", key);
+          Game *dg = game_duplicate(gr->game);
+          if (traj_r && gr->trajectory_buf) {
+            trajectory_game_buffer_reset(gr->trajectory_buf);
+          }
+          eb_stage_trajectory_row(gr, gr->game, mv, on_idx);
+          play_move(mv, dg, NULL);
+          while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
+            const Move *pm =
+                get_top_equity_move(dg, worker->worker_index, post_ml);
+            play_move(pm, dg, NULL);
+          }
+          if (traj_r && gr->trajectory_buf) {
+            if (game_get_game_end_reason(dg) == GAME_END_REASON_STANDARD) {
+              const int f0 =
+                  equity_to_int(player_get_score(game_get_player(dg, 0)));
+              const int f1 =
+                  equity_to_int(player_get_score(game_get_player(dg, 1)));
+              trajectory_game_buffer_commit(traj_r, gr->trajectory_buf, f0, f1);
+            } else {
+              trajectory_game_buffer_discard(gr->trajectory_buf);
+            }
+          }
+          game_destroy(dg);
+        }
+      } else {
+        if (traj_r && gr->trajectory_buf) {
+          trajectory_game_buffer_reset(gr->trajectory_buf);
+        }
+        // Select the on-turn move via get_top_equity_move (HastyBot) directly —
+        // NOT game_runner_play_move, whose autoplay path (sim / EB role forcing)
+        // misbehaves on a loaded mid-game board. Stage the row, then play it.
+        const Move *target =
             get_top_equity_move(gr->game, worker->worker_index, post_ml);
-        play_move(m, gr->game, NULL);
-      }
-      if (traj_r && gr->trajectory_buf) {
-        if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD) {
-          const int f0 =
-              equity_to_int(player_get_score(game_get_player(gr->game, 0)));
-          const int f1 =
-              equity_to_int(player_get_score(game_get_player(gr->game, 1)));
-          trajectory_game_buffer_commit(traj_r, gr->trajectory_buf, f0, f1);
-        } else {
-          trajectory_game_buffer_discard(gr->trajectory_buf);
+        eb_stage_trajectory_row(gr, gr->game, target, on_idx);
+        play_move(target, gr->game, NULL);
+        // POST: play out to game end with HastyBot equity; not recorded.
+        while (!game_runner_is_game_over(gr)) {
+          const Move *m =
+              get_top_equity_move(gr->game, worker->worker_index, post_ml);
+          play_move(m, gr->game, NULL);
+        }
+        if (traj_r && gr->trajectory_buf) {
+          if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD) {
+            const int f0 =
+                equity_to_int(player_get_score(game_get_player(gr->game, 0)));
+            const int f1 =
+                equity_to_int(player_get_score(game_get_player(gr->game, 1)));
+            trajectory_game_buffer_commit(traj_r, gr->trajectory_buf, f0, f1);
+          } else {
+            trajectory_game_buffer_discard(gr->trajectory_buf);
+          }
         }
       }
     }
   }
   move_list_destroy(post_ml);
+  move_list_destroy(fan_ml);
 }
 
 void *autoplay_worker(void *uncasted_autoplay_worker) {
