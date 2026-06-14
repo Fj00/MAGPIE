@@ -5056,6 +5056,14 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   TrajectoryRecorder *traj_r = sd->trajectory_recorder;
   const int n = position_pool_count(pp);
   MoveList *post_ml = move_list_create(1);
+  // MAGPIE_PP_REROLLS=K: if K>0, inject K randomly re-rolled on-turn racks per
+  // position (rack injection for coverage), each a separate playout. K=0 (or
+  // unset) = baseline: one playout with the loaded natural rack. The re-roll
+  // returns the on-rack to the bag and redraws from it (own+bag pool); opp is
+  // left natural (opp-swap for low-bag diversity is a later increment).
+  const char *rerolls_env = getenv("MAGPIE_PP_REROLLS");
+  const int rerolls = rerolls_env ? atoi(rerolls_env) : 0;
+  const int games_per_pos = rerolls > 0 ? rerolls : 1;
   for (;;) {
     if (thread_control_get_status(tc) == THREAD_CONTROL_STATUS_USER_INTERRUPT) {
       break;
@@ -5065,67 +5073,75 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
     if (i >= n) break;
     const char *cgp = position_pool_get_cgp(pp, i);
     if (!cgp) continue;
+    const uint64_t pos_id = position_pool_get_id(pp, i);
 
-    game_reset(gr->game);
-    // Reset GameRunner fields normally cleared by game_runner_start, which we
-    // bypass (mirrors t6_baseline_run_worker).
-    gr->turn_number = 0;
-    gr->force_draw = false;
-    gr->force_triggered = false;
-    gr->pending_force_target = NULL;
-    gr->pending_force_diff = 0;
-    gr->pending_force_player_index = 0;
-    gr->pass_cycle_active = false;
-    gr->pass_cycle_abandoned = false;
-    gr->pass_cycle_n_moves = 0;
-    gr->eb_active = false;
-    gr->eb_forced_move = NULL;
-    gr->eb_n_snaps = 0;
-    gr->eb_actions_p0[0] = '\0';
-    gr->eb_actions_p0_off = 0;
-    gr->eb_actions_p1[0] = '\0';
-    gr->eb_actions_p1_off = 0;
+    for (int g = 0; g < games_per_pos; g++) {
+      game_reset(gr->game);
+      // Reset GameRunner fields normally cleared by game_runner_start, which we
+      // bypass (mirrors t6_baseline_run_worker).
+      gr->turn_number = 0;
+      gr->force_draw = false;
+      gr->force_triggered = false;
+      gr->pending_force_target = NULL;
+      gr->pending_force_diff = 0;
+      gr->pending_force_player_index = 0;
+      gr->pass_cycle_active = false;
+      gr->pass_cycle_abandoned = false;
+      gr->pass_cycle_n_moves = 0;
+      gr->eb_active = false;
+      gr->eb_forced_move = NULL;
+      gr->eb_n_snaps = 0;
+      gr->eb_actions_p0[0] = '\0';
+      gr->eb_actions_p0_off = 0;
+      gr->eb_actions_p1[0] = '\0';
+      gr->eb_actions_p1_off = 0;
 
-    ErrorStack *es = error_stack_create();
-    game_load_cgp(gr->game, cgp, es);
-    if (!error_stack_is_empty(es)) {
+      ErrorStack *es = error_stack_create();
+      game_load_cgp(gr->game, cgp, es);
+      if (!error_stack_is_empty(es)) {
+        error_stack_destroy(es);
+        break;  // unparseable CGP: skip this position entirely
+      }
       error_stack_destroy(es);
-      continue;
-    }
-    error_stack_destroy(es);
-    // Seed downstream draws (POST) deterministically per (worker, position).
-    game_seed(gr->game,
-              (uint64_t)worker->worker_index * 0x9e3779b97f4a7c15ULL +
-                  (uint64_t)i);
-    gr->game_number = position_pool_get_id(pp, i);
+      // Seed per (worker, position, reroll) so re-rolls + POST diverge.
+      game_seed(gr->game,
+                (uint64_t)worker->worker_index * 0x9e3779b97f4a7c15ULL +
+                    (uint64_t)i * 1000003ULL + (uint64_t)g);
+      gr->game_number = pos_id;
 
-    if (traj_r && gr->trajectory_buf) {
-      trajectory_game_buffer_reset(gr->trajectory_buf);
-    }
-    // Target turn: select the on-turn move via get_top_equity_move (HastyBot)
-    // directly — NOT game_runner_play_move, whose autoplay selection path
-    // (sim args / EB role forcing) misbehaves on a loaded mid-game board.
-    // Stage the row through the shared helper, then play it.
-    const int on_idx = game_get_player_on_turn_index(gr->game);
-    const Move *target = get_top_equity_move(gr->game, worker->worker_index,
-                                             post_ml);
-    eb_stage_trajectory_row(gr, gr->game, target, on_idx);
-    play_move(target, gr->game, NULL);
-    // POST: play out to game end with HastyBot equity; not recorded.
-    while (!game_runner_is_game_over(gr)) {
-      const Move *m =
+      const int on_idx = game_get_player_on_turn_index(gr->game);
+      // Rack injection: re-roll the on-turn rack from the bag (own+bag pool).
+      if (rerolls > 0) {
+        return_rack_to_bag(gr->game, on_idx);
+        draw_to_full_rack(gr->game, on_idx);
+      }
+
+      if (traj_r && gr->trajectory_buf) {
+        trajectory_game_buffer_reset(gr->trajectory_buf);
+      }
+      // Select the on-turn move via get_top_equity_move (HastyBot) directly —
+      // NOT game_runner_play_move, whose autoplay path (sim / EB role forcing)
+      // misbehaves on a loaded mid-game board. Stage the row, then play it.
+      const Move *target =
           get_top_equity_move(gr->game, worker->worker_index, post_ml);
-      play_move(m, gr->game, NULL);
-    }
-    if (traj_r && gr->trajectory_buf) {
-      if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD) {
-        const int f0 =
-            equity_to_int(player_get_score(game_get_player(gr->game, 0)));
-        const int f1 =
-            equity_to_int(player_get_score(game_get_player(gr->game, 1)));
-        trajectory_game_buffer_commit(traj_r, gr->trajectory_buf, f0, f1);
-      } else {
-        trajectory_game_buffer_discard(gr->trajectory_buf);
+      eb_stage_trajectory_row(gr, gr->game, target, on_idx);
+      play_move(target, gr->game, NULL);
+      // POST: play out to game end with HastyBot equity; not recorded.
+      while (!game_runner_is_game_over(gr)) {
+        const Move *m =
+            get_top_equity_move(gr->game, worker->worker_index, post_ml);
+        play_move(m, gr->game, NULL);
+      }
+      if (traj_r && gr->trajectory_buf) {
+        if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD) {
+          const int f0 =
+              equity_to_int(player_get_score(game_get_player(gr->game, 0)));
+          const int f1 =
+              equity_to_int(player_get_score(game_get_player(gr->game, 1)));
+          trajectory_game_buffer_commit(traj_r, gr->trajectory_buf, f0, f1);
+        } else {
+          trajectory_game_buffer_discard(gr->trajectory_buf);
+        }
       }
     }
   }
