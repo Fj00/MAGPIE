@@ -33,6 +33,7 @@
 #include "../ent/t6_baseline.h"
 #include "../ent/trajectory_recorder.h"
 #include "../ent/position_pool.h"
+#include "../ent/leave_deficit.h"
 #include "../ent/inference_args.h"
 #include "../ent/inference_results.h"
 #include "../ent/klv.h"
@@ -289,6 +290,9 @@ typedef struct AutoplaySharedData {
   // natural). position_pool_next is the shared work-stealing cursor.
   PositionPool *position_pool;
   _Atomic int position_pool_next;
+  // Per-(bag,leave,diff-bin) deficit table gating the position-pool fan-out
+  // for the L0-L4 per-leave track (NULL = no gating). Env MAGPIE_PP_LEAVE_*.
+  LeaveDeficit *leave_deficit;
 } AutoplaySharedData;
 
 // Per-turn role for single-target-turn EB recording. Each turn (1..6) gets
@@ -1088,6 +1092,14 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   if (pos_pool_path && pos_pool_path[0] != '\0') {
     shared_data->position_pool = position_pool_create(pos_pool_path);
   }
+  shared_data->leave_deficit = NULL;
+  const char *leave_tgt = getenv("MAGPIE_PP_LEAVE_TARGET");
+  if (leave_tgt && leave_tgt[0] != '\0') {
+    const char *binw = getenv("MAGPIE_PP_LEAVE_BINW");
+    const char *maxlen = getenv("MAGPIE_PP_LEAVE_MAXLEN");
+    shared_data->leave_deficit = leave_deficit_create(
+        atoi(leave_tgt), binw ? atoi(binw) : 20, maxlen ? atoi(maxlen) : 4);
+  }
   shared_data->empty_board_strata_recorder = NULL;
   const char *eb_strata = getenv("MAGPIE_EMPTY_BOARD_STRATA");
   if (eb_strata && eb_strata[0] != '\0') {
@@ -1166,6 +1178,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   empty_board_strata_destroy(shared_data->empty_board_strata_recorder);
   trajectory_recorder_destroy(shared_data->trajectory_recorder);
   position_pool_destroy(shared_data->position_pool);
+  leave_deficit_destroy(shared_data->leave_deficit);
   void vmodel_log_stats(void);  // defined later in this TU
   if (shared_data->vmodel_any_loaded ||
       shared_data->vmodel_picks_any_loaded) {
@@ -5050,7 +5063,7 @@ static void t6_baseline_run_worker(AutoplayWorker *worker, GameRunner *gr) {
 // the synthetic-vs-natural combinability check. Rack injection + counterfactual
 // move enumeration are the next increment.
 // Render the on-turn player's post-move leave to a canonical string (A..Z
-// then '?'). Used to build (kind,score,leaf) dedup keys for the fan-out.
+// then '?'). Used to build (kind,score,leave) dedup keys for the fan-out.
 static void pp_render_leave(const Move *move, const Game *game, char *out,
                            size_t cap) {
   const int on = game_get_player_on_turn_index(game);
@@ -5077,7 +5090,7 @@ static void pp_render_leave(const Move *move, const Game *game, char *out,
   out[n] = '\0';
 }
 
-#define PP_FANOUT_MAX 512  // max distinct (kind,score,leaf) branches per rack
+#define PP_FANOUT_MAX 512  // max distinct (kind,score,leave) branches per rack
 
 static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   AutoplaySharedData *sd = worker->shared_data;
@@ -5087,7 +5100,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   const int n = position_pool_count(pp);
   MoveList *post_ml = move_list_create(1);
   MoveList *fan_ml = move_list_create(8192);  // full move list for fan-out
-  // MAGPIE_PP_FANOUT=1: branch a playout per distinct (kind,score,leaf) cell of
+  // MAGPIE_PP_FANOUT=1: branch a playout per distinct (kind,score,leave) cell of
   // the injected rack's move list (counterfactual coverage), instead of only
   // the best move. Composes with REROLLS (each re-rolled rack is fanned out).
   const char *fanout_env = getenv("MAGPIE_PP_FANOUT");
@@ -5153,7 +5166,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
       }
 
       if (fanout) {
-        // Branch a playout per distinct (kind,score,leaf) cell of the rack's
+        // Branch a playout per distinct (kind,score,leave) cell of the rack's
         // move list. Movegen once on gr->game; each branch clones the position
         // (game_duplicate), plays the move, and POSTs to end on the clone, so
         // gr->game stays intact for the next branch.
@@ -5171,6 +5184,16 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             .initial_tiles_bv = 0};
         generate_moves(&fga);
         const int nm = move_list_get_count(fan_ml);
+        // Position-level values for the deficit gate (same for all branches):
+        // unseen bag and pre-move score diff (move_score added per branch).
+        const int g_opp = 1 - on_idx;
+        const int gate_bag =
+            bag_get_letters(game_get_bag(gr->game)) +
+            rack_get_total_letters(player_get_rack(game_get_player(gr->game,
+                                                                   g_opp)));
+        const int pre_diff =
+            equity_to_int(player_get_score(game_get_player(gr->game, on_idx))) -
+            equity_to_int(player_get_score(game_get_player(gr->game, g_opp)));
         static _Thread_local char seen[PP_FANOUT_MAX][24];
         int nseen = 0;
         for (int m = 0; m < nm && nseen < PP_FANOUT_MAX; m++) {
@@ -5189,6 +5212,17 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           }
           if (dup_key) continue;
           snprintf(seen[nseen++], sizeof(seen[0]), "%s", key);
+          // Deficit gate (per-leave L0-L4 track): skip this cell's playout if
+          // it's already at target or the leave is too long (L5+ -> handled by
+          // the parameterized track). NULL table => gating disabled, allow all.
+          const int msc =
+              move_get_type(mv) == GAME_EVENT_TILE_PLACEMENT_MOVE
+                  ? equity_to_int(move_get_score(mv))
+                  : 0;
+          if (!leave_deficit_take(sd->leave_deficit, gate_bag, lf,
+                                  pre_diff + msc)) {
+            continue;
+          }
           Game *dg = game_duplicate(gr->game);
           if (traj_r && gr->trajectory_buf) {
             trajectory_game_buffer_reset(gr->trajectory_buf);
