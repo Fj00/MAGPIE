@@ -36,7 +36,11 @@ void trajectory_recorder_destroy(TrajectoryRecorder *r);
 // Per-worker buffer that stages rows for the current game in flight.
 // One buffer per AutoplayWorker; reused across games (reset on game
 // start, commit or discard on game end).
-TrajectoryGameBuffer *trajectory_game_buffer_create(void);
+// worker_index identifies the owning worker. With MAGPIE_TRAJECTORY_SHARD=1,
+// commits write to a per-worker shard file (positions/bag_<NN>.w<WORKER>.csv),
+// lock-free, so parallel writers don't contend and aggregation can read the
+// shards in parallel. Without it, the shared per-bag file is used.
+TrajectoryGameBuffer *trajectory_game_buffer_create(int worker_index);
 void trajectory_game_buffer_destroy(TrajectoryGameBuffer *b);
 
 // Clear buffered rows. Call at the start of each new game.

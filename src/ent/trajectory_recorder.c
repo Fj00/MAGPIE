@@ -26,10 +26,16 @@ static int tr_bag_to_index(int bag) {
 
 struct TrajectoryRecorder {
   char *base_dir;
+  int shard;  // MAGPIE_TRAJECTORY_SHARD=1 -> per-worker shard files
   pthread_mutex_t open_mutex;
   pthread_mutex_t mutexes[TR_NUM_BAGS];
   FILE *fhs[TR_NUM_BAGS];
 };
+
+static const char *TR_CSV_HEADER =
+    "game_id,turn,bag,on_turn,p1_rack,p2_rack,p1_score,p2_score,"
+    "board_cgp,action_kind,action_repr,action_size,"
+    "move_score,score_diff_pre,score_diff_post,leave,eventual_outcome\n";
 
 // Pre-formatted CSV line (without trailing newline / eventual_outcome)
 // + which per-bag file it routes to + which player is on turn. The
@@ -46,6 +52,8 @@ struct TrajectoryGameBuffer {
   StagedRow *rows;
   int count;
   int capacity;
+  int worker_index;
+  FILE *own_fhs[TR_NUM_BAGS];  // shard mode: this worker's per-bag files
 };
 
 static void tr_mkdir_or_die(const char *path) {
@@ -71,6 +79,8 @@ TrajectoryRecorder *trajectory_recorder_create(const char *base_dir) {
   TrajectoryRecorder *r = malloc_or_die(sizeof(TrajectoryRecorder));
   r->base_dir = malloc_or_die(strlen(base_dir) + 1);
   strcpy(r->base_dir, base_dir);
+  const char *shard_env = getenv("MAGPIE_TRAJECTORY_SHARD");
+  r->shard = (shard_env && shard_env[0] == '1') ? 1 : 0;
   pthread_mutex_init(&r->open_mutex, NULL);
   for (int i = 0; i < TR_NUM_BAGS; i++) {
     pthread_mutex_init(&r->mutexes[i], NULL);
@@ -81,10 +91,12 @@ TrajectoryRecorder *trajectory_recorder_create(const char *base_dir) {
   snprintf(positions_dir, sizeof(positions_dir), "%s/positions", r->base_dir);
   tr_mkdir_or_die(positions_dir);
   fprintf(stderr,
-          "trajectory_recorder: base_dir=%s; lazy per-bag files in "
-          "%s/bag_<NN>.csv; per-game commit on STANDARD end only "
-          "(consecutive-zeros games discarded)\n",
-          r->base_dir, positions_dir);
+          "trajectory_recorder: base_dir=%s; %s in %s/; per-game commit on "
+          "STANDARD end only (consecutive-zeros games discarded)\n",
+          r->base_dir,
+          r->shard ? "per-worker shard files bag_<NN>.w<WORKER>.csv (lock-free)"
+                   : "lazy per-bag files bag_<NN>.csv",
+          positions_dir);
   return r;
 }
 
@@ -117,11 +129,7 @@ static FILE *tr_get_file(TrajectoryRecorder *r, int bag_idx, int bag) {
       log_fatal("trajectory_recorder: cannot open %s: %s", path,
                 strerror(errno));
     }
-    fprintf(fh,
-            "game_id,turn,bag,on_turn,p1_rack,p2_rack,p1_score,p2_score,"
-            "board_cgp,action_kind,action_repr,action_size,"
-            "move_score,score_diff_pre,score_diff_post,leave,"
-            "eventual_outcome\n");
+    fputs(TR_CSV_HEADER, fh);
     fflush(fh);
     r->fhs[bag_idx] = fh;
   }
@@ -131,12 +139,31 @@ static FILE *tr_get_file(TrajectoryRecorder *r, int bag_idx, int bag) {
 
 // ---- Per-game buffer ----
 
-TrajectoryGameBuffer *trajectory_game_buffer_create(void) {
+TrajectoryGameBuffer *trajectory_game_buffer_create(int worker_index) {
   TrajectoryGameBuffer *b = malloc_or_die(sizeof(TrajectoryGameBuffer));
   b->capacity = 64;  // games usually 20-30 turns; resize if needed
   b->count = 0;
   b->rows = malloc_or_die(sizeof(StagedRow) * b->capacity);
+  b->worker_index = worker_index;
+  for (int i = 0; i < TR_NUM_BAGS; i++) b->own_fhs[i] = NULL;
   return b;
+}
+
+// Shard mode: lazy-open this worker's own per-bag file (no lock — the worker
+// owns it). positions/bag_<NN>.w<WORKER>.csv.
+static FILE *tr_get_own_file(TrajectoryRecorder *r, TrajectoryGameBuffer *b,
+                             int bag_idx, int bag) {
+  if (b->own_fhs[bag_idx]) return b->own_fhs[bag_idx];
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/positions/bag_%02d.w%d.csv", r->base_dir,
+           bag, b->worker_index);
+  FILE *fh = fopen(path, "w");
+  if (!fh) {
+    log_fatal("trajectory_recorder: cannot open %s: %s", path, strerror(errno));
+  }
+  fputs(TR_CSV_HEADER, fh);
+  b->own_fhs[bag_idx] = fh;
+  return fh;
 }
 
 static void tr_buf_free_rows(TrajectoryGameBuffer *b) {
@@ -147,6 +174,12 @@ static void tr_buf_free_rows(TrajectoryGameBuffer *b) {
 void trajectory_game_buffer_destroy(TrajectoryGameBuffer *b) {
   if (!b) return;
   tr_buf_free_rows(b);
+  for (int i = 0; i < TR_NUM_BAGS; i++) {
+    if (b->own_fhs[i]) {
+      fflush(b->own_fhs[i]);
+      fclose(b->own_fhs[i]);
+    }
+  }
   free(b->rows);
   free(b);
 }
@@ -208,13 +241,20 @@ void trajectory_game_buffer_commit(
     const int bag = (bag_idx == TR_BAG_MAX - TR_BAG_MIN + 1)
                        ? TR_OPENER_BAG
                        : bag_idx + TR_BAG_MIN;
-    FILE *fh = tr_get_file(r, bag_idx, bag);
-    if (!fh) continue;
     const int outcome = b->rows[i].on_turn ? p2_outcome : p1_outcome;
-    pthread_mutex_lock(&r->mutexes[bag_idx]);
-    fputs(b->rows[i].line, fh);
-    fprintf(fh, ",%d\n", outcome);
-    pthread_mutex_unlock(&r->mutexes[bag_idx]);
+    if (r->shard) {
+      // Per-worker shard file — this worker owns it, no lock needed.
+      FILE *fh = tr_get_own_file(r, b, bag_idx, bag);
+      fputs(b->rows[i].line, fh);
+      fprintf(fh, ",%d\n", outcome);
+    } else {
+      FILE *fh = tr_get_file(r, bag_idx, bag);
+      if (!fh) continue;
+      pthread_mutex_lock(&r->mutexes[bag_idx]);
+      fputs(b->rows[i].line, fh);
+      fprintf(fh, ",%d\n", outcome);
+      pthread_mutex_unlock(&r->mutexes[bag_idx]);
+    }
   }
   tr_buf_free_rows(b);
 }

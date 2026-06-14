@@ -1416,9 +1416,10 @@ GameRunner *game_runner_create(AutoplayWorker *autoplay_worker) {
       game_runner->eb_action_buf[i] = move_create();
     }
   }
-  game_runner->trajectory_buf = autoplay_worker->shared_data->trajectory_recorder
-                                    ? trajectory_game_buffer_create()
-                                    : NULL;
+  game_runner->trajectory_buf =
+      autoplay_worker->shared_data->trajectory_recorder
+          ? trajectory_game_buffer_create(autoplay_worker->worker_index)
+          : NULL;
   return game_runner;
 }
 
