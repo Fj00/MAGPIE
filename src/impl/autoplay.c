@@ -5128,7 +5128,7 @@ static void pp_render_leave(const Move *move, const Game *game, char *out,
 static bool pp_setup_opener(AutoplayWorker *worker, GameRunner *gr,
                             MoveList *fan_ml, MoveList *post_ml,
                             const char *rack, int score, const char *leave,
-                            char sign) {
+                            char sign, int variant) {
   if (!swap_player_rack(gr->game, 0, rack)) return false;
   const MoveGenArgs mga = {
       .game = gr->game,
@@ -5158,37 +5158,37 @@ static bool pp_setup_opener(AutoplayWorker *worker, GameRunner *gr,
   }
   if (!match) return false;
   play_move(match, gr->game, NULL);
+  (void)fan_ml;
   if (sign == '+') {
-    // Put the opener back on turn at +diff by having the opponent EXCHANGE
+    // Put the opener back on turn at +diff by FORCING the opponent to exchange
     // (the realistic passive turn-2 move: fresh rack, board unchanged so bag
-    // stays 93-k). A PASS would instead waste the opponent's whole turn -> a
-    // tempo artifact that inflates win% to ~100%. Pick the opponent's best
-    // exchange (move list is equity-sorted, so the first EXCHANGE is best).
-    (void)post_ml;
-    const MoveGenArgs mga2 = {
-        .game = gr->game,
-        .move_list = fan_ml,
-        .move_record_type = MOVE_RECORD_ALL,
-        .move_sort_type = MOVE_SORT_EQUITY,
-        .override_kwg = NULL,
-        .thread_index = worker->worker_index,
-        .eq_margin_movegen = 0,
-        .target_equity = EQUITY_MAX_VALUE,
-        .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
-        .tiles_played_bv = NULL,
-        .initial_tiles_bv = 0};
-    generate_moves(&mga2);
-    const int nm2 = move_list_get_count(fan_ml);
-    const Move *exch = NULL;
-    for (int m = 0; m < nm2; m++) {
-      const Move *mv = move_list_get_move(fan_ml, m);
-      if (move_get_type(mv) == GAME_EVENT_EXCHANGE) {
-        exch = mv;
-        break;
+    // stays 93-k). A PASS would waste the opponent's whole turn -> tempo
+    // artifact inflating win% to ~100%. We construct the exchange explicitly
+    // (movegen equity-prunes exchanges for a playable rack), and VARY it across
+    // all types (1..ns tiles, rotating which) by `variant` so the +diff
+    // positions span how an opponent-exchange actually arises rather than all
+    // being "opponent dumped everything".
+    const int opp = game_get_player_on_turn_index(gr->game);  // responder
+    const Rack *prack = player_get_rack(game_get_player(gr->game, opp));
+    MachineLetter tiles[RACK_SIZE];
+    int ns = 0;
+    const uint16_t ds = rack_get_dist_size(prack);
+    for (uint16_t L = 0; L < ds && ns < RACK_SIZE; L++) {
+      const int c = rack_get_letter(prack, L);
+      for (int k = 0; k < c && ns < RACK_SIZE; k++) {
+        tiles[ns++] = (MachineLetter)L;
       }
     }
-    if (!exch) return false;  // no exchange available (bag too small) -> skip
-    play_move(exch, gr->game, NULL);
+    if (ns == 0) return false;  // empty rack (shouldn't happen) -> skip
+    const int k_ex = 1 + (variant % ns);          // exchange 1..ns tiles
+    const int off = (variant / ns) % ns;          // rotate which tiles
+    MachineLetter strip[RACK_SIZE];
+    for (int j = 0; j < k_ex; j++) strip[j] = tiles[(off + j) % ns];
+    Move *ex = move_list_get_spare_move(post_ml);
+    move_set_all(ex, strip, 0, k_ex - 1, /*score=*/0, /*row=*/0, /*col=*/0,
+                 /*tiles_played=*/k_ex, /*dir=*/0, GAME_EVENT_EXCHANGE,
+                 /*leave_value=*/0);
+    play_move(ex, gr->game, NULL);
   }
   return true;
 }
@@ -5268,7 +5268,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
                              opener_pool_get_rack(op, i),
                              opener_pool_get_score(op, i),
                              opener_pool_get_leave(op, i),
-                             opener_pool_get_sign(op, i))) {
+                             opener_pool_get_sign(op, i), i + g)) {
           break;  // rack undrawable or no matching opener: skip entry
         }
       } else {
