@@ -5159,8 +5159,36 @@ static bool pp_setup_opener(AutoplayWorker *worker, GameRunner *gr,
   if (!match) return false;
   play_move(match, gr->game, NULL);
   if (sign == '+') {
-    move_list_set_spare_move_as_pass(post_ml);
-    play_move(move_list_get_spare_move(post_ml), gr->game, NULL);
+    // Put the opener back on turn at +diff by having the opponent EXCHANGE
+    // (the realistic passive turn-2 move: fresh rack, board unchanged so bag
+    // stays 93-k). A PASS would instead waste the opponent's whole turn -> a
+    // tempo artifact that inflates win% to ~100%. Pick the opponent's best
+    // exchange (move list is equity-sorted, so the first EXCHANGE is best).
+    (void)post_ml;
+    const MoveGenArgs mga2 = {
+        .game = gr->game,
+        .move_list = fan_ml,
+        .move_record_type = MOVE_RECORD_ALL,
+        .move_sort_type = MOVE_SORT_EQUITY,
+        .override_kwg = NULL,
+        .thread_index = worker->worker_index,
+        .eq_margin_movegen = 0,
+        .target_equity = EQUITY_MAX_VALUE,
+        .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+        .tiles_played_bv = NULL,
+        .initial_tiles_bv = 0};
+    generate_moves(&mga2);
+    const int nm2 = move_list_get_count(fan_ml);
+    const Move *exch = NULL;
+    for (int m = 0; m < nm2; m++) {
+      const Move *mv = move_list_get_move(fan_ml, m);
+      if (move_get_type(mv) == GAME_EVENT_EXCHANGE) {
+        exch = mv;
+        break;
+      }
+    }
+    if (!exch) return false;  // no exchange available (bag too small) -> skip
+    play_move(exch, gr->game, NULL);
   }
   return true;
 }
