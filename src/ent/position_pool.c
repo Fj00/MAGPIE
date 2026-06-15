@@ -106,3 +106,112 @@ uint64_t position_pool_get_id(const PositionPool *pp, int i) {
   if (!pp || i < 0 || i >= pp->count) return 0;
   return pp->ids[i];
 }
+
+// ===== Opener pool =====
+
+struct OpenerPool {
+  char **racks;
+  char **leaves;
+  int *scores;
+  char *signs;
+  int count;
+  int cap;
+};
+
+static void op_push(OpenerPool *op, const char *rack, int score,
+                    const char *leave, char sign) {
+  if (op->count == op->cap) {
+    op->cap = op->cap ? op->cap * 2 : 4096;
+    op->racks = realloc(op->racks, (size_t)op->cap * sizeof(char *));
+    op->leaves = realloc(op->leaves, (size_t)op->cap * sizeof(char *));
+    op->scores = realloc(op->scores, (size_t)op->cap * sizeof(int));
+    op->signs = realloc(op->signs, (size_t)op->cap * sizeof(char));
+    if (!op->racks || !op->leaves || !op->scores || !op->signs) {
+      log_fatal("opener_pool: realloc failed at cap %d", op->cap);
+    }
+  }
+  op->racks[op->count] = malloc_or_die(strlen(rack) + 1);
+  strcpy(op->racks[op->count], rack);
+  op->leaves[op->count] = malloc_or_die(strlen(leave) + 1);
+  strcpy(op->leaves[op->count], leave);
+  op->scores[op->count] = score;
+  op->signs[op->count] = sign;
+  op->count++;
+}
+
+OpenerPool *opener_pool_create(const char *path) {
+  if (!path || !path[0]) return NULL;
+  FILE *f = fopen(path, "re");
+  if (!f) {
+    log_fatal("opener_pool: cannot open %s", path);
+  }
+  OpenerPool *op = malloc_or_die(sizeof(OpenerPool));
+  op->racks = NULL;
+  op->leaves = NULL;
+  op->scores = NULL;
+  op->signs = NULL;
+  op->count = 0;
+  op->cap = 0;
+
+  char *line = NULL;
+  size_t cap = 0;
+  ssize_t len;
+  while ((len = getline(&line, &cap, f)) != -1) {
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+      line[--len] = '\0';
+    }
+    if (len == 0 || line[0] == '#') continue;
+    // Fields: bag \t rack \t score \t leave \t sign  (bag is informational;
+    // the resulting bag falls out of the replayed move).
+    char *save = NULL;
+    char *f_bag = strtok_r(line, "\t", &save);
+    char *f_rack = strtok_r(NULL, "\t", &save);
+    char *f_score = strtok_r(NULL, "\t", &save);
+    char *f_leave = strtok_r(NULL, "\t", &save);
+    char *f_sign = strtok_r(NULL, "\t", &save);
+    (void)f_bag;
+    if (!f_rack || !f_score || !f_leave || !f_sign) {
+      log_fatal("opener_pool: malformed line in %s", path);
+    }
+    op_push(op, f_rack, atoi(f_score), f_leave, f_sign[0]);
+  }
+  free(line);
+  fclose(f);
+  fprintf(stderr, "opener_pool: loaded %d openers from %s\n", op->count, path);
+  return op;
+}
+
+void opener_pool_destroy(OpenerPool *op) {
+  if (!op) return;
+  for (int i = 0; i < op->count; i++) {
+    free(op->racks[i]);
+    free(op->leaves[i]);
+  }
+  free(op->racks);
+  free(op->leaves);
+  free(op->scores);
+  free(op->signs);
+  free(op);
+}
+
+int opener_pool_count(const OpenerPool *op) { return op ? op->count : 0; }
+
+const char *opener_pool_get_rack(const OpenerPool *op, int i) {
+  if (!op || i < 0 || i >= op->count) return NULL;
+  return op->racks[i];
+}
+
+const char *opener_pool_get_leave(const OpenerPool *op, int i) {
+  if (!op || i < 0 || i >= op->count) return NULL;
+  return op->leaves[i];
+}
+
+int opener_pool_get_score(const OpenerPool *op, int i) {
+  if (!op || i < 0 || i >= op->count) return 0;
+  return op->scores[i];
+}
+
+char opener_pool_get_sign(const OpenerPool *op, int i) {
+  if (!op || i < 0 || i >= op->count) return '-';
+  return op->signs[i];
+}

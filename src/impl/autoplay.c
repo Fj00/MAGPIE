@@ -299,6 +299,13 @@ typedef struct AutoplaySharedData {
   // typed strata (6_vowel, 5_vowel, 6_cons…) get covered efficiently rather
   // than waiting for random draws to produce them.
   PositionPool *rack_pool;
+  // Opener-conditioned pool (MAGPIE_OPENER_POOL): for the opening bags, replay
+  // a specific opener move on an empty board (sets the starting rack,
+  // movegen-matches score+leave, plays it; sign '+' passes the opponent) to
+  // synthesize a (bag, diff) board the natural pool never produces (blank-burn
+  // openers, rare scores). Then the same inject + fan-out runs at the result.
+  // Mutually exclusive with position_pool; reuses position_pool_next as cursor.
+  OpenerPool *opener_pool;
 } AutoplaySharedData;
 
 // Per-turn role for single-target-turn EB recording. Each turn (1..6) gets
@@ -1103,6 +1110,11 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   if (rack_pool_path && rack_pool_path[0] != '\0') {
     shared_data->rack_pool = position_pool_create(rack_pool_path);
   }
+  shared_data->opener_pool = NULL;
+  const char *opener_pool_path = getenv("MAGPIE_OPENER_POOL");
+  if (opener_pool_path && opener_pool_path[0] != '\0') {
+    shared_data->opener_pool = opener_pool_create(opener_pool_path);
+  }
   shared_data->leave_deficit = NULL;
   const char *leave_tgt = getenv("MAGPIE_PP_LEAVE_TARGET");
   if (leave_tgt && leave_tgt[0] != '\0') {
@@ -1190,6 +1202,7 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   trajectory_recorder_destroy(shared_data->trajectory_recorder);
   position_pool_destroy(shared_data->position_pool);
   position_pool_destroy(shared_data->rack_pool);
+  opener_pool_destroy(shared_data->opener_pool);
   leave_deficit_destroy(shared_data->leave_deficit);
   void vmodel_log_stats(void);  // defined later in this TU
   if (shared_data->vmodel_any_loaded ||
@@ -5105,12 +5118,60 @@ static void pp_render_leave(const Move *move, const Game *game, char *out,
 
 #define PP_FANOUT_MAX 512  // max distinct (kind,score,leave) branches per rack
 
+// Replay an opener on the (freshly reset, seeded) empty board: set the starting
+// player's rack, movegen, find the opener move matching (score, leave), play it
+// — synthesizing a (bag=93-tiles_played, diff=score) board the natural pool
+// never produces (blank-burns, rare scores). sign '+' then passes the opponent
+// so the opener is on turn (+diff); '-' leaves the responder on turn (-diff).
+// Returns false if the rack can't be drawn or no matching opener exists (caller
+// skips the entry). After return the on-turn player is the injection target.
+static bool pp_setup_opener(AutoplayWorker *worker, GameRunner *gr,
+                            MoveList *fan_ml, MoveList *post_ml,
+                            const char *rack, int score, const char *leave,
+                            char sign) {
+  if (!swap_player_rack(gr->game, 0, rack)) return false;
+  const MoveGenArgs mga = {
+      .game = gr->game,
+      .move_list = fan_ml,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_EQUITY,
+      .override_kwg = NULL,
+      .thread_index = worker->worker_index,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+      .tiles_played_bv = NULL,
+      .initial_tiles_bv = 0};
+  generate_moves(&mga);
+  const int nm = move_list_get_count(fan_ml);
+  const Move *match = NULL;
+  char lf[RACK_SIZE + 2];
+  for (int m = 0; m < nm; m++) {
+    const Move *mv = move_list_get_move(fan_ml, m);
+    if (move_get_type(mv) != GAME_EVENT_TILE_PLACEMENT_MOVE) continue;
+    if (equity_to_int(move_get_score(mv)) != score) continue;
+    pp_render_leave(mv, gr->game, lf, sizeof(lf));  // on-turn = P1 (opener rack)
+    if (strcmp(lf, leave) == 0) {
+      match = mv;
+      break;
+    }
+  }
+  if (!match) return false;
+  play_move(match, gr->game, NULL);
+  if (sign == '+') {
+    move_list_set_spare_move_as_pass(post_ml);
+    play_move(move_list_get_spare_move(post_ml), gr->game, NULL);
+  }
+  return true;
+}
+
 static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   AutoplaySharedData *sd = worker->shared_data;
   PositionPool *pp = sd->position_pool;
   ThreadControl *tc = worker->args.thread_control;
   TrajectoryRecorder *traj_r = sd->trajectory_recorder;
-  const int n = position_pool_count(pp);
+  OpenerPool *op = sd->opener_pool;
+  const int n = op ? opener_pool_count(op) : position_pool_count(pp);
   MoveList *post_ml = move_list_create(1);
   MoveList *fan_ml = move_list_create(8192);  // full move list for fan-out
   // MAGPIE_PP_FANOUT=1: branch a playout per distinct (kind,score,leave) cell of
@@ -5138,9 +5199,13 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
     const int i = atomic_fetch_add_explicit(&sd->position_pool_next, 1,
                                              memory_order_relaxed);
     if (i >= n) break;
-    const char *cgp = position_pool_get_cgp(pp, i);
-    if (!cgp) continue;
-    const uint64_t pos_id = position_pool_get_id(pp, i);
+    const char *cgp = NULL;
+    uint64_t pos_id = (uint64_t)i;
+    if (!op) {
+      cgp = position_pool_get_cgp(pp, i);
+      if (!cgp) continue;
+      pos_id = position_pool_get_id(pp, i);
+    }
 
     for (int g = 0; g < games_per_pos; g++) {
       game_reset(gr->game);
@@ -5163,17 +5228,30 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
       gr->eb_actions_p1[0] = '\0';
       gr->eb_actions_p1_off = 0;
 
-      ErrorStack *es = error_stack_create();
-      game_load_cgp(gr->game, cgp, es);
-      if (!error_stack_is_empty(es)) {
-        error_stack_destroy(es);
-        break;  // unparseable CGP: skip this position entirely
-      }
-      error_stack_destroy(es);
-      // Seed per (worker, position, reroll) so re-rolls + POST diverge.
+      // Seed per (worker, position, reroll) so re-rolls + POST (and the opener
+      // setup's draws) diverge. Seeded before setup so the opener replay's
+      // refill draws are deterministic per entry.
       game_seed(gr->game,
                 (uint64_t)worker->worker_index * 0x9e3779b97f4a7c15ULL +
                     (uint64_t)i * 1000003ULL + (uint64_t)g);
+      if (op) {
+        // Opener-conditioned: replay the opener to synthesize the board.
+        if (!pp_setup_opener(worker, gr, fan_ml, post_ml,
+                             opener_pool_get_rack(op, i),
+                             opener_pool_get_score(op, i),
+                             opener_pool_get_leave(op, i),
+                             opener_pool_get_sign(op, i))) {
+          break;  // rack undrawable or no matching opener: skip entry
+        }
+      } else {
+        ErrorStack *es = error_stack_create();
+        game_load_cgp(gr->game, cgp, es);
+        if (!error_stack_is_empty(es)) {
+          error_stack_destroy(es);
+          break;  // unparseable CGP: skip this position entirely
+        }
+        error_stack_destroy(es);
+      }
       gr->game_number = pos_id;
 
       const int on_idx = game_get_player_on_turn_index(gr->game);
@@ -5341,9 +5419,10 @@ void *autoplay_worker(void *uncasted_autoplay_worker) {
     return NULL;
   }
 
-  // Position-pool mode (91-8 rack injection): load mid-game CGPs from the pool
-  // instead of fresh games.
-  if (autoplay_worker->shared_data->position_pool != NULL) {
+  // Position-pool mode (91-8 rack injection): load mid-game CGPs, or replay
+  // openers (MAGPIE_OPENER_POOL), instead of fresh games.
+  if (autoplay_worker->shared_data->position_pool != NULL ||
+      autoplay_worker->shared_data->opener_pool != NULL) {
     position_pool_run_worker(autoplay_worker, game_runner1);
     game_runner_destroy(game_runner1);
     return NULL;

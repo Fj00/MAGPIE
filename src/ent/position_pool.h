@@ -36,4 +36,26 @@ const char *position_pool_get_cgp(const PositionPool *pp, int i);
 // when no id column was present).
 uint64_t position_pool_get_id(const PositionPool *pp, int i);
 
+// Opener-conditioned pool (MAGPIE_OPENER_POOL): for the opening bags, replay a
+// specific opener move to synthesize a (bag, diff) board the natural pool never
+// produces (blank-burn openers -> diff 0/2, rare scores -> 22). magpie sets the
+// starting player's rack, movegen-matches (score, leave), plays that opener;
+// sign '+' then passes the opponent so the opener is on turn (+diff), '-'
+// leaves the responder on turn (-diff). The resulting bag = 93 - tiles_played
+// falls out of the move and is recorded by the trajectory recorder's per-bag
+// sharding, so one manifest can mix opener sizes (bags 91..86).
+//
+// Manifest line (tab-separated): bag \t rack \t score \t leave \t sign
+// Env var: MAGPIE_OPENER_POOL=<manifest_path>
+
+typedef struct OpenerPool OpenerPool;
+
+OpenerPool *opener_pool_create(const char *path);
+void opener_pool_destroy(OpenerPool *op);
+int opener_pool_count(const OpenerPool *op);
+const char *opener_pool_get_rack(const OpenerPool *op, int i);
+const char *opener_pool_get_leave(const OpenerPool *op, int i);
+int opener_pool_get_score(const OpenerPool *op, int i);
+char opener_pool_get_sign(const OpenerPool *op, int i);
+
 #endif
