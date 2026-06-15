@@ -161,19 +161,25 @@ OpenerPool *opener_pool_create(const char *path) {
       line[--len] = '\0';
     }
     if (len == 0 || line[0] == '#') continue;
-    // Fields: bag \t rack \t score \t leave \t sign  (bag is informational;
-    // the resulting bag falls out of the replayed move).
-    char *save = NULL;
-    char *f_bag = strtok_r(line, "\t", &save);
-    char *f_rack = strtok_r(NULL, "\t", &save);
-    char *f_score = strtok_r(NULL, "\t", &save);
-    char *f_leave = strtok_r(NULL, "\t", &save);
-    char *f_sign = strtok_r(NULL, "\t", &save);
-    (void)f_bag;
-    if (!f_rack || !f_score || !f_leave || !f_sign) {
+    // Fields: bag \t rack \t score \t leave \t sign  (bag informational; the
+    // resulting bag falls out of the replayed move). Split manually — strtok_r
+    // collapses consecutive tabs, but the leave field is EMPTY for a 7-tile
+    // bingo opener (score \t \t sign), which would misalign the fields.
+    char *fields[5];
+    int nf = 0;
+    char *p = line;
+    fields[nf++] = p;
+    while (nf < 5) {
+      char *t = strchr(p, '\t');
+      if (!t) break;
+      *t = '\0';
+      p = t + 1;
+      fields[nf++] = p;
+    }
+    if (nf < 5 || fields[4][0] == '\0') {
       log_fatal("opener_pool: malformed line in %s", path);
     }
-    op_push(op, f_rack, atoi(f_score), f_leave, f_sign[0]);
+    op_push(op, fields[1], atoi(fields[2]), fields[3], fields[4][0]);
   }
   free(line);
   fclose(f);
