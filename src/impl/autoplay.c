@@ -5169,6 +5169,9 @@ static bool pp_setup_opener(AutoplayWorker *worker, GameRunner *gr,
     // positions span how an opponent-exchange actually arises rather than all
     // being "opponent dumped everything".
     const int opp = game_get_player_on_turn_index(gr->game);  // responder
+    // The responder's rack is empty here (we bypass game_runner_start, so only
+    // the opener's rack was drawn) — fill it from the bag before exchanging.
+    draw_to_full_rack(gr->game, opp);
     const Rack *prack = player_get_rack(game_get_player(gr->game, opp));
     MachineLetter tiles[RACK_SIZE];
     int ns = 0;
