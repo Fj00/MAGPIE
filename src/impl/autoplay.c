@@ -16,9 +16,11 @@
 #include "../ent/board.h"
 #include "../ent/checkpoint.h"
 #include "../ent/data_filepaths.h"
+#include "../ent/endgame_results.h"
 #include "../ent/equity.h"
 #include "../ent/force_table.h"
 #include "../ent/static_leaves.h"
+#include "endgame.h"
 #include "../ent/vmodel.h"
 #include "../ent/vmodel_features.h"
 #include "../ent/vmodel_picks.h"
@@ -5117,6 +5119,130 @@ static void pp_render_leave(const Move *move, const Game *game, char *out,
 }
 
 #define PP_FANOUT_MAX 512  // max distinct (kind,score,leave) branches per rack
+#define PP_FT_MAX 32       // max force cells credited per fan-out branch
+
+// Match a fan-out move's force-table cells: leave cells (stratum/tile/pair via
+// the tile-bitmap predicate) + bag_tile cells (via the pre-move-rack predicate).
+// Collects targets that still have deficit into out[]; returns the count. 0 =>
+// no deficient cell matches, so the fan-out gate skips this branch. Mirrors the
+// EB matcher (eb_append_force_target_slots, autoplay.c) for the position pool.
+static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
+                                int on_idx, int eff_diff, bool is_exch,
+                                ForceTarget **out, int cap) {
+  const LetterDistribution *ld = game_get_ld(game);
+  const Rack *pre_rack = player_get_rack(game_get_player(game, on_idx));
+  Rack leave;
+  rack_set_dist_size(&leave, rack_get_dist_size(pre_rack));
+  get_leave_for_move(mv, game, &leave);
+  uint32_t leave_bm = 0;
+  for (uint16_t i = 0; i < leave.dist_size && i < 32; i++) {
+    if (leave.array[i] > 0) leave_bm |= ((uint32_t)1) << i;
+  }
+  const int leave_len = (int)leave.number_of_letters;
+  if (leave_len < 0 || leave_len >= 8) return 0;
+  const int bag_count = bag_get_letters(game_get_bag(game)) + (RACK_SIZE);
+  int count = 0;
+  ForceTargetSlot *slots = force_table_lookup_slots_by_shape(
+      ft, bag_count, leave_len, is_exch ? 1 : 0, &count);
+  if (count == 0 || slots == NULL) return 0;
+  uint32_t *bitmaps = force_table_lookup_bitmaps_by_shape(
+      ft, bag_count, leave_len, is_exch ? 1 : 0);
+  int ltype = -1;
+  int n = 0;
+  for (int t = 0; t < count && n < cap; t++) {
+    ForceTargetSlot *fs = &slots[t];
+    if (fs->deficit <= 0) continue;
+    if (eff_diff < fs->diff_min || eff_diff > fs->diff_max) continue;
+    const int k = (int)fs->kind;
+    if (k == FORCE_TARGET_BAG_TILE) {
+      if (ltype < 0) ltype = (int)force_classify_leave(&leave, ld);
+      if (force_target_matches_bag(fs->cold, pre_rack, leave_len,
+                                   (LeaveType)ltype, is_exch, eff_diff, ld)) {
+        out[n++] = fs->cold;
+      }
+      continue;
+    }
+    if (k != FORCE_TARGET_PAIR && k != FORCE_TARGET_TILE &&
+        k != FORCE_TARGET_STRATUM) {
+      continue;
+    }
+    if (bitmaps != NULL) {
+      const uint32_t req = bitmaps[t];
+      if ((leave_bm & req) != req) continue;
+    }
+    if (fs->subleave_count == 2 && fs->subleave_mls[0] == fs->subleave_mls[1] &&
+        leave.array[fs->subleave_mls[0]] < 2) {
+      continue;
+    }
+    if (fs->exchange == 0 && fs->leave_length >= 3) {
+      if (ltype < 0) ltype = (int)force_classify_leave(&leave, ld);
+      if ((LeaveType)ltype != (LeaveType)fs->leave_type) continue;
+    }
+    out[n++] = fs->cold;
+  }
+  return n;
+}
+
+// Play `dg` out to game end and report the `mover`'s outcome. For the low-bag
+// endgame phase (`endgame` true), when the bag empties solve the endgame
+// (even-4, diff-gated) for the exact W/L instead of continuing HastyBot — the
+// value-level shortcut (solve once, don't play the endgame out). Returns true
+// if the game reached a committable end; sets *is_win/*is_tie (mover's view)
+// and *f0/*f1 (final scores, sign-correct so the recorder's per-row outcome
+// matches the label).
+static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
+                               ThreadControl *tc, Game *dg, MoveList *post_ml,
+                               int worker_index, int mover, bool endgame,
+                               bool *is_win, bool *is_tie, int *f0, int *f1) {
+  while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
+    if (endgame && bag_get_letters(game_get_bag(dg)) == 0) {
+      const int on = game_get_player_on_turn_index(dg);
+      const int on_s = equity_to_int(player_get_score(game_get_player(dg, on)));
+      const int op_s =
+          equity_to_int(player_get_score(game_get_player(dg, 1 - on)));
+      const int cur_diff = on_s - op_s;  // on-turn perspective
+      int opt = 0;
+      if (abs(cur_diff) < 80) {  // diff-gate: clear blowouts skip the solve
+        const EndgameArgs ea = {
+            .game = dg, .thread_control = tc, .plies = 4,
+            .tt_fraction_of_mem = 0.005,
+            .initial_small_move_arena_size =
+                DEFAULT_INITIAL_SMALL_MOVE_ARENA_SIZE,
+            .num_threads = 1, .num_top_moves = 1, .use_heuristics = true,
+            .per_ply_callback = NULL, .per_ply_callback_data = NULL,
+            .forced_pass_bypass = false, .soft_time_limit = 20.0,
+            .hard_time_limit = 45.0};
+        ErrorStack *err = error_stack_create();
+        endgame_solve(es, &ea, er, err);
+        if (error_stack_is_empty(err)) {
+          const PVLine *pv = endgame_results_get_pvline(er, ENDGAME_RESULT_BEST);
+          if (pv) opt = pv->score;
+        }
+        error_stack_destroy(err);
+      }
+      const int final_on = cur_diff + opt;  // on-turn final spread
+      // Sign-correct synthetic finals (opt attributed to on-turn; recorder
+      // only uses the sign of f_mover - f_opp for the per-row outcome).
+      const int fon = on_s + opt, fop = op_s;
+      *f0 = (on == 0) ? fon : fop;
+      *f1 = (on == 1) ? fon : fop;
+      const bool on_win = final_on > 0, on_tie = final_on == 0;
+      *is_tie = on_tie;
+      *is_win = (on == mover) ? on_win : (!on_win && !on_tie);
+      return true;
+    }
+    const Move *pm = get_top_equity_move(dg, worker_index, post_ml);
+    play_move(pm, dg, NULL);
+  }
+  if (game_get_game_end_reason(dg) != GAME_END_REASON_STANDARD) return false;
+  const int mf = equity_to_int(player_get_score(game_get_player(dg, mover)));
+  const int of = equity_to_int(player_get_score(game_get_player(dg, 1 - mover)));
+  *f0 = equity_to_int(player_get_score(game_get_player(dg, 0)));
+  *f1 = equity_to_int(player_get_score(game_get_player(dg, 1)));
+  *is_tie = (mf == of);
+  *is_win = (mf > of);
+  return true;
+}
 
 // Replay an opener on the (freshly reset, seeded) empty board: set the starting
 // player's rack, movegen, find the opener move matching (score, leave), play it
@@ -5223,6 +5349,18 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   // returned to the bag (widening the pool) and redrawn afterward. Default 14.
   const char *oppswap_env = getenv("MAGPIE_PP_OPPSWAP_MAXBAG");
   const int oppswap_maxbag = oppswap_env ? atoi(oppswap_env) : 14;
+  // MAGPIE_PP_ENDGAME=1: for the low-bag phase (8-14), when a playout empties
+  // the bag, solve the endgame (even-4, diff-gated) for exact W/L instead of
+  // the HastyBot playout. One solver/results per worker (TT memory-bound;
+  // single-thread per solve).
+  const char *endgame_env = getenv("MAGPIE_PP_ENDGAME");
+  const bool endgame = endgame_env && endgame_env[0] == '1';
+  EndgameSolver *es = endgame ? endgame_solver_create() : NULL;
+  EndgameResults *er = endgame ? endgame_results_create() : NULL;
+  // Force-table gate: when loaded (MAGPIE_FORCE_TABLE), the fan-out fills
+  // per-(stratum,bucket,feature) cells to target instead of the per-leaf
+  // leave_deficit. ft==NULL falls back to leave_deficit.
+  ForceTable *ft = sd->force_table;
   for (;;) {
     if (thread_control_get_status(tc) == THREAD_CONTROL_STATUS_USER_INTERRUPT) {
       break;
@@ -5365,15 +5503,23 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           }
           if (dup_key) continue;
           snprintf(seen[nseen++], sizeof(seen[0]), "%s", key);
-          // Deficit gate (per-leave L0-L4 track): skip this cell's playout if
-          // it's already at target or the leave is too long (L5+ -> handled by
-          // the parameterized track). NULL table => gating disabled, allow all.
           const int msc =
               move_get_type(mv) == GAME_EVENT_TILE_PLACEMENT_MOVE
                   ? equity_to_int(move_get_score(mv))
                   : 0;
-          if (!leave_deficit_take(sd->leave_deficit, gate_bag, lf,
-                                  pre_diff + msc)) {
+          const int eff_diff = pre_diff + msc;
+          const bool is_exch_mv = move_get_type(mv) == GAME_EVENT_EXCHANGE;
+          // Gate: force-table cells (T2-T6 spec) when loaded, else the per-leaf
+          // leave_deficit. Skip the branch if no deficient cell would be
+          // credited (no point spending a playout on a satisfied cell).
+          ForceTarget *ftgts[PP_FT_MAX];
+          int nft = 0;
+          if (ft != NULL) {
+            nft = pp_match_force_cells(ft, gr->game, mv, on_idx, eff_diff,
+                                       is_exch_mv, ftgts, PP_FT_MAX);
+            if (nft == 0) continue;
+          } else if (!leave_deficit_take(sd->leave_deficit, gate_bag, lf,
+                                         eff_diff)) {
             continue;
           }
           Game *dg = game_duplicate(gr->game);
@@ -5382,21 +5528,22 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           }
           eb_stage_trajectory_row(gr, gr->game, mv, on_idx);
           play_move(mv, dg, NULL);
-          while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
-            const Move *pm =
-                get_top_equity_move(dg, worker->worker_index, post_ml);
-            play_move(pm, dg, NULL);
-          }
-          if (traj_r && gr->trajectory_buf) {
-            if (game_get_game_end_reason(dg) == GAME_END_REASON_STANDARD) {
-              const int f0 =
-                  equity_to_int(player_get_score(game_get_player(dg, 0)));
-              const int f1 =
-                  equity_to_int(player_get_score(game_get_player(dg, 1)));
-              trajectory_game_buffer_commit(traj_r, gr->trajectory_buf, f0, f1);
-            } else {
-              trajectory_game_buffer_discard(gr->trajectory_buf);
+          bool win = false, tie = false;
+          int f0 = 0, f1 = 0;
+          const bool committable = pp_playout_outcome(
+              es, er, tc, dg, post_ml, worker->worker_index, on_idx, endgame,
+              &win, &tie, &f0, &f1);
+          if (committable) {
+            if (ft != NULL) {
+              for (int kk = 0; kk < nft; kk++) {
+                force_table_credit_game(ft, ftgts[kk], eff_diff, win, tie);
+              }
             }
+            if (traj_r && gr->trajectory_buf) {
+              trajectory_game_buffer_commit(traj_r, gr->trajectory_buf, f0, f1);
+            }
+          } else if (traj_r && gr->trajectory_buf) {
+            trajectory_game_buffer_discard(gr->trajectory_buf);
           }
           game_destroy(dg);
         }
@@ -5411,18 +5558,16 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             get_top_equity_move(gr->game, worker->worker_index, post_ml);
         eb_stage_trajectory_row(gr, gr->game, target, on_idx);
         play_move(target, gr->game, NULL);
-        // POST: play out to game end with HastyBot equity; not recorded.
-        while (!game_runner_is_game_over(gr)) {
-          const Move *m =
-              get_top_equity_move(gr->game, worker->worker_index, post_ml);
-          play_move(m, gr->game, NULL);
-        }
+        // POST: play out to game end (endgame solve at bag-empty if enabled).
+        bool win = false, tie = false;
+        int f0 = 0, f1 = 0;
+        const bool committable = pp_playout_outcome(
+            es, er, tc, gr->game, post_ml, worker->worker_index, on_idx,
+            endgame, &win, &tie, &f0, &f1);
+        (void)win;
+        (void)tie;
         if (traj_r && gr->trajectory_buf) {
-          if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD) {
-            const int f0 =
-                equity_to_int(player_get_score(game_get_player(gr->game, 0)));
-            const int f1 =
-                equity_to_int(player_get_score(game_get_player(gr->game, 1)));
+          if (committable) {
             trajectory_game_buffer_commit(traj_r, gr->trajectory_buf, f0, f1);
           } else {
             trajectory_game_buffer_discard(gr->trajectory_buf);
@@ -5431,6 +5576,8 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
       }
     }
   }
+  if (es) endgame_solver_destroy(es);
+  if (er) endgame_results_destroy(er);
   move_list_destroy(post_ml);
   move_list_destroy(fan_ml);
 }
