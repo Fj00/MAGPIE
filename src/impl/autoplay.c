@@ -5357,6 +5357,10 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   const bool endgame = endgame_env && endgame_env[0] == '1';
   EndgameSolver *es = endgame ? endgame_solver_create() : NULL;
   EndgameResults *er = endgame ? endgame_results_create() : NULL;
+  // Per-worker ThreadControl for the endgame solves: worker->args.thread_control
+  // is SHARED across all autoplay workers, so concurrent endgame_solve on it
+  // corrupts/crashes. Each worker gets its own (num_threads=1 per solve).
+  ThreadControl *eg_tc = endgame ? thread_control_create() : NULL;
   // Force-table gate: when loaded (MAGPIE_FORCE_TABLE), the fan-out fills
   // per-(stratum,bucket,feature) cells to target instead of the per-leaf
   // leave_deficit. ft==NULL falls back to leave_deficit.
@@ -5531,7 +5535,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           bool win = false, tie = false;
           int f0 = 0, f1 = 0;
           const bool committable = pp_playout_outcome(
-              es, er, tc, dg, post_ml, worker->worker_index, on_idx, endgame,
+              es, er, eg_tc, dg, post_ml, worker->worker_index, on_idx, endgame,
               &win, &tie, &f0, &f1);
           if (committable) {
             if (ft != NULL) {
@@ -5562,7 +5566,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         bool win = false, tie = false;
         int f0 = 0, f1 = 0;
         const bool committable = pp_playout_outcome(
-            es, er, tc, gr->game, post_ml, worker->worker_index, on_idx,
+            es, er, eg_tc, gr->game, post_ml, worker->worker_index, on_idx,
             endgame, &win, &tie, &f0, &f1);
         (void)win;
         (void)tie;
@@ -5578,6 +5582,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   }
   if (es) endgame_solver_destroy(es);
   if (er) endgame_results_destroy(er);
+  if (eg_tc) thread_control_destroy(eg_tc);
   move_list_destroy(post_ml);
   move_list_destroy(fan_ml);
 }
