@@ -131,6 +131,11 @@ struct EndgameSolver {
   // Thread 0 sets this after each completed depth (from EBF estimate).
   // All worker threads check it periodically and bail if exceeded.
   _Atomic int64_t depth_deadline_ns;
+  // Absolute wall-clock deadline for the whole solve: CLOCK_MONOTONIC ns;
+  // 0 = disabled. Armed once at solve start from hard_time_limit and checked
+  // in-search by every worker, so a single runaway depth (one the EBF estimate
+  // failed to predict) is still cut off. depth_deadline_ns can only tighten it.
+  _Atomic int64_t hard_deadline_ns;
   // Flag: stuck-tile mode has been logged (0=not yet, 1=logged)
   atomic_int stuck_tile_logged;
   // Fraction of opponent's tiles that are stuck at the root (0.0 = none)
@@ -460,6 +465,15 @@ void endgame_solver_reset(EndgameSolver *es, const EndgameArgs *endgame_args) {
   // Initialize ABDADA synchronization
   atomic_store(&es->search_complete, 0);
   atomic_store(&es->depth_deadline_ns, 0);
+  // Arm the absolute wall-clock deadline so every depth is bounded by the hard
+  // limit regardless of the EBF estimate (prevents single-depth runaways).
+  if (es->hard_time_limit > 0) {
+    atomic_store(&es->hard_deadline_ns,
+                 ctimer_monotonic_ns() +
+                     (int64_t)(es->hard_time_limit * 1e9));
+  } else {
+    atomic_store(&es->hard_deadline_ns, 0);
+  }
   atomic_store(&es->stuck_tile_logged, 0);
   atomic_store(&es->root_moves_completed, 0);
   atomic_store(&es->root_moves_total, 0);
@@ -1554,11 +1568,14 @@ __attribute__((noinline)) static bool
 check_depth_deadline(EndgameSolverWorker *worker) {
   int64_t deadline_ns = atomic_load_explicit(&worker->solver->depth_deadline_ns,
                                              memory_order_relaxed);
-  if (deadline_ns == 0) {
+  int64_t hard_ns = atomic_load_explicit(&worker->solver->hard_deadline_ns,
+                                         memory_order_relaxed);
+  if (deadline_ns == 0 && hard_ns == 0) {
     return false;
   }
   int64_t now_ns = ctimer_monotonic_ns();
-  if (now_ns > deadline_ns) {
+  if ((deadline_ns != 0 && now_ns > deadline_ns) ||
+      (hard_ns != 0 && now_ns > hard_ns)) {
     atomic_store(&worker->solver->search_complete, 1);
     return true;
   }
