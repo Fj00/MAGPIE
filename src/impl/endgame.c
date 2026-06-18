@@ -2398,9 +2398,12 @@ static float compute_initial_stuck_fraction(const EndgameSolver *solver,
   int opp_idx = 1 - solver->solving_player;
   Game *root_game = game_duplicate(game);
   MoveList *tmp_ml = move_list_create_small(DEFAULT_ENDGAME_MOVELIST_CAPACITY);
+  // Runs on the calling (parent) thread before solver workers exist, so use the
+  // solver's base movegen slot (the parent autoplay worker's reserved index)
+  // rather than 0 — otherwise concurrent solves all collide on scratch slot 0.
   float frac = compute_opp_stuck_fraction(
-      root_game, tmp_ml, solver_get_pruned_kwg(solver, opp_idx), opp_idx, 0,
-      NULL, NULL);
+      root_game, tmp_ml, solver_get_pruned_kwg(solver, opp_idx), opp_idx,
+      solver->base_thread_index, NULL, NULL);
   small_move_list_destroy(tmp_ml);
   game_destroy(root_game);
   return frac;
