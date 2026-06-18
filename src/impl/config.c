@@ -2565,6 +2565,16 @@ void config_fill_endgame_args(Config *config, EndgameArgs *endgame_args) {
   endgame_args->per_ply_callback_data = NULL;
   endgame_args->soft_time_limit = 0;
   endgame_args->hard_time_limit = 0;
+  // Optional wall-clock caps for the `endgame` command (seconds, sub-second ok).
+  // Used by the sign-vs-time sweep; absent -> uncapped (full solve).
+  const char *eg_soft = getenv("MAGPIE_ENDGAME_SOFT_TL");
+  const char *eg_hard = getenv("MAGPIE_ENDGAME_HARD_TL");
+  if (eg_soft) {
+    endgame_args->soft_time_limit = atof(eg_soft);
+  }
+  if (eg_hard) {
+    endgame_args->hard_time_limit = atof(eg_hard);
+  }
 }
 
 void config_endgame(Config *config, EndgameResults *endgame_results,
