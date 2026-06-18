@@ -121,6 +121,7 @@ struct EndgameSolver {
   int solve_multiple_variations;
   int requested_plies;
   int threads;
+  int base_thread_index;  // movegen-scratch offset (see EndgameArgs)
   double tt_fraction_of_mem;
   TranspositionTable *transposition_table;
 
@@ -156,6 +157,7 @@ struct EndgameSolver {
 
 typedef struct EndgameSolverWorker {
   int thread_index;
+  int movegen_index;  // thread_index + solver->base_thread_index (scratch slot)
   Game *game_copy;
   Arena *small_move_arena;
   MoveList *move_list;
@@ -242,7 +244,8 @@ static void pvline_update(PVLine *pv_line, const PVLine *new_pv_line,
 // Greedy playout for display: extend PV with highest-scoring moves after
 // TT extension. Returns number of moves appended.
 static int greedy_playout_for_display(PVLine *pv_line, int start_idx,
-                                      Game *game_copy, MoveList *move_list) {
+                                      Game *game_copy, MoveList *move_list,
+                                      int movegen_index) {
   int num_moves = start_idx;
   while (num_moves < MAX_VARIANT_LENGTH &&
          game_get_game_end_reason(game_copy) == GAME_END_REASON_NONE) {
@@ -252,7 +255,7 @@ static int greedy_playout_for_display(PVLine *pv_line, int start_idx,
         .move_record_type = MOVE_RECORD_ALL_SMALL,
         .move_sort_type = MOVE_SORT_SCORE,
         .override_kwg = NULL,
-        .thread_index = 0,
+        .thread_index = movegen_index,
         .eq_margin_movegen = 0,
         .target_equity = EQUITY_MAX_VALUE,
         .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -296,7 +299,7 @@ static int greedy_playout_for_display(PVLine *pv_line, int start_idx,
 // correct scores) are preserved; only new moves are appended.
 static void pvline_extend_from_tt(PVLine *pv_line, Game *game_copy,
                                   TranspositionTable *tt, int solving_player,
-                                  int max_depth) {
+                                  int max_depth, int movegen_index) {
   if (!tt) {
     return;
   }
@@ -348,7 +351,7 @@ static void pvline_extend_from_tt(PVLine *pv_line, Game *game_copy,
         .move_record_type = MOVE_RECORD_ALL_SMALL,
         .move_sort_type = MOVE_SORT_SCORE,
         .override_kwg = NULL,
-        .thread_index = 0,
+        .thread_index = movegen_index,
         .eq_margin_movegen = 0,
         .target_equity = EQUITY_MAX_VALUE,
         .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -383,8 +386,8 @@ static void pvline_extend_from_tt(PVLine *pv_line, Game *game_copy,
   // Greedy playout: if game isn't over, extend PV with highest-scoring moves.
   // This handles cases where the search PV was truncated (e.g., parallel search
   // effects) and TT entries were overwritten.
-  num_moves +=
-      greedy_playout_for_display(pv_line, num_moves, game_copy, move_list);
+  num_moves += greedy_playout_for_display(pv_line, num_moves, game_copy,
+                                          move_list, movegen_index);
 
   pv_line->num_moves = num_moves;
   small_move_list_destroy(move_list);
@@ -406,6 +409,7 @@ void endgame_solver_reset(EndgameSolver *es, const EndgameArgs *endgame_args) {
   if (es->threads < 1) {
     es->threads = 1;
   }
+  es->base_thread_index = endgame_args->base_thread_index;
   es->requested_plies = endgame_args->plies;
   es->solving_player = game_get_player_on_turn_index(endgame_args->game);
   es->initial_small_move_arena_size =
@@ -523,6 +527,7 @@ EndgameSolverWorker *endgame_solver_create_worker(EndgameSolver *solver,
       malloc_or_die(sizeof(EndgameSolverWorker));
 
   solver_worker->thread_index = worker_index;
+  solver_worker->movegen_index = solver->base_thread_index + worker_index;
   solver_worker->game_copy = game_duplicate(solver->game);
   game_set_endgame_solving_mode(solver_worker->game_copy);
   game_set_backup_mode(solver_worker->game_copy, BACKUP_MODE_SIMULATION);
@@ -808,7 +813,7 @@ int generate_stm_plays(EndgameSolverWorker *worker, int depth) {
       .move_record_type = MOVE_RECORD_ALL_SMALL,
       .move_sort_type = MOVE_SORT_SCORE,
       .override_kwg = solver_get_pruned_kwg(worker->solver, stm_idx),
-      .thread_index = worker->thread_index,
+      .thread_index = worker->movegen_index,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -1238,7 +1243,7 @@ static int32_t negamax_greedy_leaf_playout(EndgameSolverWorker *worker,
     opp_stuck_frac = compute_opp_stuck_fraction(
         worker->game_copy, worker->move_list,
         solver_get_pruned_kwg(worker->solver, opp_idx), opp_idx,
-        worker->thread_index, NULL, worker->solver);
+        worker->movegen_index, NULL, worker->solver);
   }
 
   bool playout_interrupted = false;
@@ -1291,7 +1296,7 @@ static int32_t negamax_greedy_leaf_playout(EndgameSolverWorker *worker,
           .move_sort_type = MOVE_SORT_SCORE,
           .override_kwg = solver_get_pruned_kwg(
               worker->solver, game_get_player_on_turn_index(worker->game_copy)),
-          .thread_index = worker->thread_index,
+          .thread_index = worker->movegen_index,
           .eq_margin_movegen = 0,
           .target_equity = EQUITY_MAX_VALUE,
           .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -1306,7 +1311,7 @@ static int32_t negamax_greedy_leaf_playout(EndgameSolverWorker *worker,
           .move_sort_type = MOVE_SORT_SCORE,
           .override_kwg = solver_get_pruned_kwg(
               worker->solver, game_get_player_on_turn_index(worker->game_copy)),
-          .thread_index = worker->thread_index,
+          .thread_index = worker->movegen_index,
           .eq_margin_movegen = 0,
           .target_equity = EQUITY_MAX_VALUE,
           .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -1497,7 +1502,7 @@ static int negamax_generate_and_sort_moves(EndgameSolverWorker *worker,
     *opp_stuck_frac = compute_opp_stuck_fraction(
         worker->game_copy, worker->move_list,
         solver_get_pruned_kwg(worker->solver, opp_idx), opp_idx,
-        worker->thread_index, &opp_tiles_bv, worker->solver);
+        worker->movegen_index, &opp_tiles_bv, worker->solver);
     // Check for interrupt between the two expensive operations so threads
     // don't run a second full movegen after the timer has already fired.
     if (iterative_deepening_should_stop(worker->solver)) {
@@ -2106,7 +2111,8 @@ static void build_ranked_pvs_and_notify(EndgameSolverWorker *worker, int depth,
       Game *ext_game = game_duplicate(worker->game_copy);
       pvline_extend_from_tt(rpv, ext_game, worker->solver->transposition_table,
                             worker->solver->solving_player,
-                            worker->solver->requested_plies);
+                            worker->solver->requested_plies,
+                            worker->movegen_index);
       game_destroy(ext_game);
     }
   }
@@ -2287,7 +2293,8 @@ void iterative_deepening(EndgameSolverWorker *worker, int plies) {
         Game *temp_game = game_duplicate(worker->game_copy);
         pvline_extend_from_tt(
             &extended_pv, temp_game, worker->solver->transposition_table,
-            worker->solver->solving_player, worker->solver->requested_plies);
+            worker->solver->solving_player, worker->solver->requested_plies,
+            worker->movegen_index);
         game_destroy(temp_game);
       }
 
@@ -2519,7 +2526,8 @@ static int extract_multi_pvs(const EndgameSolver *solver,
       Game *ext_game = game_duplicate(game);
       game_set_endgame_solving_mode(ext_game);
       pvline_extend_from_tt(pv, ext_game, solver->transposition_table,
-                            solver->solving_player, solver->requested_plies);
+                            solver->solving_player, solver->requested_plies,
+                            solver->base_thread_index);
       game_destroy(ext_game);
     }
   }
@@ -2623,7 +2631,7 @@ void endgame_solve(EndgameSolver *solver, const EndgameArgs *endgame_args,
     game_set_endgame_solving_mode(ext_game);
     pvline_extend_from_tt(&solver->principal_variation, ext_game,
                           solver->transposition_table, solver->solving_player,
-                          solver->requested_plies);
+                          solver->requested_plies, solver->base_thread_index);
     game_destroy(ext_game);
     multi_pvs[0] = solver->principal_variation;
   }

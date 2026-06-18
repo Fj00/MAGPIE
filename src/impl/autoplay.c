@@ -5208,7 +5208,8 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
             .tt_fraction_of_mem = 0.005,
             .initial_small_move_arena_size =
                 DEFAULT_INITIAL_SMALL_MOVE_ARENA_SIZE,
-            .num_threads = 1, .num_top_moves = 1, .use_heuristics = true,
+            .num_threads = 1, .base_thread_index = worker_index,
+            .num_top_moves = 1, .use_heuristics = true,
             .per_ply_callback = NULL, .per_ply_callback_data = NULL,
             .forced_pass_bypass = false, .soft_time_limit = 20.0,
             .hard_time_limit = 45.0};

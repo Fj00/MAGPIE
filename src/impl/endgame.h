@@ -39,6 +39,13 @@ typedef struct EndgameArgs {
   int plies;
   int initial_small_move_arena_size;
   int num_threads;
+  // Base offset for the movegen-scratch thread_index used by this solve's
+  // internal generate_moves calls. Lets the solver run concurrently inside a
+  // multi-threaded autoplay (which owns scratch slots 0..N-1): the caller
+  // passes its own worker index (free while it blocks in the solve) so the
+  // solver's movegen doesn't collide with other workers' scratch. Default 0
+  // (standalone). With num_threads>1 the solver uses base..base+num_threads-1.
+  int base_thread_index;
   // Enable stuck-tile heuristics and greedy leaf playout (default: true)
   bool use_heuristics;
   // Number of top moves to return with full PVs (default 1)
