@@ -2302,6 +2302,21 @@ void iterative_deepening(EndgameSolverWorker *worker, int plies) {
     endgame_results_set_best_pvline(worker->solver->results, &pv, pv_value,
                                     ply);
 
+    // Lightweight per-depth trace (sign-vs-time study): emit (depth, value,
+    // elapsed_s) the instant a depth completes, before the heavy callback/TT
+    // display work below so the elapsed reflects pure search time. Thread 0
+    // only. Env-gated; cached so getenv runs once.
+    if (worker->thread_index == 0) {
+      static int eg_ply_trace = -1;
+      if (eg_ply_trace < 0) {
+        eg_ply_trace = getenv("MAGPIE_ENDGAME_PLY_TRACE") ? 1 : 0;
+      }
+      if (eg_ply_trace) {
+        printf("EGPLY %d %d %.5f\n", ply, (int)pv_value,
+               ctimer_elapsed_seconds(&ids_timer));
+      }
+    }
+
     // Call per-ply callback (only thread 0 to avoid race conditions)
     if (worker->thread_index == 0 && worker->solver->per_ply_callback) {
       // Extend PV from TT + greedy playout for display
