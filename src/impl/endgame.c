@@ -122,6 +122,7 @@ struct EndgameSolver {
   int requested_plies;
   int threads;
   int base_thread_index;  // movegen-scratch offset (see EndgameArgs)
+  int sign_stable_k;      // sign-stability early stop depth count (0=off)
   double tt_fraction_of_mem;
   TranspositionTable *transposition_table;
 
@@ -415,6 +416,7 @@ void endgame_solver_reset(EndgameSolver *es, const EndgameArgs *endgame_args) {
     es->threads = 1;
   }
   es->base_thread_index = endgame_args->base_thread_index;
+  es->sign_stable_k = endgame_args->sign_stable_k;
   es->requested_plies = endgame_args->plies;
   es->solving_player = game_get_player_on_turn_index(endgame_args->game);
   es->initial_small_move_arena_size =
@@ -2154,6 +2156,10 @@ void iterative_deepening(EndgameSolverWorker *worker, int plies) {
   // value hasn't changed — result is stable and we can bank the remaining time.
   // INT32_MIN is the sentinel meaning "not yet crossed the soft limit".
   int32_t soft_limit_pv_value = INT32_MIN;
+  // Sign-stability early stop: track how many consecutive completed depths have
+  // shared the same value sign. 2 (sentinel) = no sign seen yet.
+  int sign_run_sign = 2;
+  int sign_run_len = 0;
   bool use_aspiration = (worker->solver->threads > 1);
 
   if (worker->solver->first_win_optim) {
@@ -2314,6 +2320,24 @@ void iterative_deepening(EndgameSolverWorker *worker, int plies) {
       if (eg_ply_trace) {
         printf("EGPLY %d %d %.5f\n", ply, (int)pv_value,
                ctimer_elapsed_seconds(&ids_timer));
+      }
+    }
+
+    // Sign-stability early stop (thread 0). Once the value sign (win/loss/tie)
+    // has held for sign_stable_k consecutive completed depths, the outcome
+    // label is settled; stop rather than grind to value convergence. best_pv
+    // and completed_depth above already reflect this depth.
+    if (worker->thread_index == 0 && worker->solver->sign_stable_k > 0) {
+      const int s = (pv_value > 0) - (pv_value < 0);
+      if (s == sign_run_sign) {
+        sign_run_len++;
+      } else {
+        sign_run_sign = s;
+        sign_run_len = 1;
+      }
+      if (sign_run_len >= worker->solver->sign_stable_k) {
+        atomic_store(&worker->solver->search_complete, 1);
+        break;
       }
     }
 

@@ -2575,6 +2575,10 @@ void config_fill_endgame_args(Config *config, EndgameArgs *endgame_args) {
   if (eg_hard) {
     endgame_args->hard_time_limit = atof(eg_hard);
   }
+  const char *eg_ssk = getenv("MAGPIE_ENDGAME_SIGN_STABLE_K");
+  if (eg_ssk) {
+    endgame_args->sign_stable_k = atoi(eg_ssk);
+  }
 }
 
 void config_endgame(Config *config, EndgameResults *endgame_results,

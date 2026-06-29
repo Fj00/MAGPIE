@@ -61,6 +61,13 @@ typedef struct EndgameArgs {
   // If estimated completion > hard_time_limit, stop to bank remaining time.
   double soft_time_limit;
   double hard_time_limit;
+  // Sign-stability early stop: stop iterative deepening once the value's sign
+  // (win/loss/tie) has held for this many consecutive completed depths. The
+  // sign converges far earlier than the value, so this returns a correct W/L/T
+  // label in ~settle-time rather than grinding to value-convergence. 0 = off.
+  // Used for outcome labelling (not move selection); hard_time_limit still
+  // caps the rare oscillating tail. Recommended: 2.
+  int sign_stable_k;
 } EndgameArgs;
 
 EndgameSolver *endgame_solver_create(void);

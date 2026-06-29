@@ -5193,9 +5193,9 @@ static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
 static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
                                ThreadControl *tc, Game *dg, MoveList *post_ml,
                                int worker_index, int mover, bool endgame,
-                               int eg_plies, double eg_soft, double eg_hard,
-                               int eg_diffgate, bool *is_win, bool *is_tie,
-                               int *f0, int *f1) {
+                               int eg_plies, const double *eg_caps,
+                               int eg_signstable_k, int eg_diffgate,
+                               bool *is_win, bool *is_tie, int *f0, int *f1) {
   while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
     if (endgame && bag_get_letters(game_get_bag(dg)) == 0) {
       const int on = game_get_player_on_turn_index(dg);
@@ -5205,6 +5205,13 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
       const int cur_diff = on_s - op_s;  // on-turn perspective
       int opt = 0;
       if (abs(cur_diff) < eg_diffgate) {  // diff-gate: blowouts skip the solve
+        // Per-length wall cap: key on the opponent rack size (1..7) — endgame
+        // cost scales with the unseen tiles the search must enumerate.
+        int opp_len =
+            rack_get_total_letters(player_get_rack(game_get_player(dg, 1 - on)));
+        if (opp_len < 1) opp_len = 1;
+        if (opp_len > 7) opp_len = 7;
+        const double cap = eg_caps[opp_len];
         const EndgameArgs ea = {
             .game = dg, .thread_control = tc, .plies = eg_plies,
             .tt_fraction_of_mem = 0.005,
@@ -5213,8 +5220,8 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
             .num_threads = 1, .base_thread_index = worker_index,
             .num_top_moves = 1, .use_heuristics = true,
             .per_ply_callback = NULL, .per_ply_callback_data = NULL,
-            .forced_pass_bypass = false, .soft_time_limit = eg_soft,
-            .hard_time_limit = eg_hard};
+            .forced_pass_bypass = false, .soft_time_limit = cap,
+            .hard_time_limit = cap, .sign_stable_k = eg_signstable_k};
         ErrorStack *err = error_stack_create();
         endgame_solve(es, &ea, er, err);
         if (error_stack_is_empty(err)) {
@@ -5358,21 +5365,35 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   // single-thread per solve).
   const char *endgame_env = getenv("MAGPIE_PP_ENDGAME");
   const bool endgame = endgame_env && endgame_env[0] == '1';
-  // Endgame POST tuning (defaults match the Phase-D even-4 config). Lets the
-  // per-bag chain trade solve depth/time for throughput without a rebuild.
+  // Endgame POST tuning. Default strategy: deep iterative deepening stopped by
+  // sign-stability (K consecutive same-sign depths) — the W/L/T label settles
+  // far earlier than the value converges (~0.3s mean vs ~6s). A PER-OPP-LENGTH
+  // wall cap backstops the rare oscillating tail. Caps indexed by opponent rack
+  // size 1..7 (eg_caps[len]); eg_caps[0] mirrors [1] as a fallback.
   const char *eg_plies_env = getenv("MAGPIE_PP_EG_PLIES");
-  const char *eg_soft_env = getenv("MAGPIE_PP_EG_SOFT");
-  const char *eg_hard_env = getenv("MAGPIE_PP_EG_HARD");
+  const char *eg_ssk_env = getenv("MAGPIE_PP_EG_SIGNSTABLE_K");
+  const char *eg_caps_env = getenv("MAGPIE_PP_EG_HARD_BY_LEN");
   const char *eg_gate_env = getenv("MAGPIE_PP_EG_DIFFGATE");
-  const int eg_plies = eg_plies_env ? atoi(eg_plies_env) : 4;
-  const double eg_soft = eg_soft_env ? atof(eg_soft_env) : 20.0;
-  const double eg_hard = eg_hard_env ? atof(eg_hard_env) : 45.0;
+  const int eg_plies = eg_plies_env ? atoi(eg_plies_env) : 25;
+  const int eg_signstable_k = eg_ssk_env ? atoi(eg_ssk_env) : 2;
   const int eg_diffgate = eg_gate_env ? atoi(eg_gate_env) : 80;
+  double eg_caps[8] = {0.5, 0.5, 1.0, 1.5, 3.0, 5.0, 8.0, 12.0};
+  if (eg_caps_env) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", eg_caps_env);
+    int li = 1;
+    for (char *tok = strtok(buf, ","); tok && li <= 7;
+         tok = strtok(NULL, ","), li++) {
+      eg_caps[li] = atof(tok);
+    }
+    eg_caps[0] = eg_caps[1];
+  }
   if (endgame) {
     fprintf(stderr,
-            "position_pool: endgame POST on (plies=%d soft=%.1fs hard=%.1fs "
-            "diff_gate=%d)\n",
-            eg_plies, eg_soft, eg_hard, eg_diffgate);
+            "position_pool: endgame POST on (plies=%d sign_stable_k=%d "
+            "diff_gate=%d caps[1..7]=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f)\n",
+            eg_plies, eg_signstable_k, eg_diffgate, eg_caps[1], eg_caps[2],
+            eg_caps[3], eg_caps[4], eg_caps[5], eg_caps[6], eg_caps[7]);
   }
   EndgameSolver *es = endgame ? endgame_solver_create() : NULL;
   EndgameResults *er = endgame ? endgame_results_create() : NULL;
@@ -5555,7 +5576,8 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           int f0 = 0, f1 = 0;
           const bool committable = pp_playout_outcome(
               es, er, eg_tc, dg, post_ml, worker->worker_index, on_idx, endgame,
-              eg_plies, eg_soft, eg_hard, eg_diffgate, &win, &tie, &f0, &f1);
+              eg_plies, eg_caps, eg_signstable_k, eg_diffgate, &win, &tie, &f0,
+              &f1);
           if (committable) {
             if (ft != NULL) {
               for (int kk = 0; kk < nft; kk++) {
@@ -5586,8 +5608,8 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         int f0 = 0, f1 = 0;
         const bool committable = pp_playout_outcome(
             es, er, eg_tc, gr->game, post_ml, worker->worker_index, on_idx,
-            endgame, eg_plies, eg_soft, eg_hard, eg_diffgate, &win, &tie, &f0,
-            &f1);
+            endgame, eg_plies, eg_caps, eg_signstable_k, eg_diffgate, &win, &tie,
+            &f0, &f1);
         (void)win;
         (void)tie;
         if (traj_r && gr->trajectory_buf) {
