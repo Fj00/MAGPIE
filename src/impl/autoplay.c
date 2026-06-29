@@ -5195,7 +5195,9 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
                                int worker_index, int mover, bool endgame,
                                int eg_plies, const double *eg_caps,
                                int eg_signstable_k, int eg_diffgate,
-                               bool *is_win, bool *is_tie, int *f0, int *f1) {
+                               double *eg_spent, double eg_pos_budget,
+                               double eg_overflow_cap, bool *is_win,
+                               bool *is_tie, int *f0, int *f1) {
   while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
     if (endgame && bag_get_letters(game_get_bag(dg)) == 0) {
       const int on = game_get_player_on_turn_index(dg);
@@ -5211,7 +5213,13 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
             rack_get_total_letters(player_get_rack(game_get_player(dg, 1 - on)));
         if (opp_len < 1) opp_len = 1;
         if (opp_len > 7) opp_len = 7;
-        const double cap = eg_caps[opp_len];
+        double cap = eg_caps[opp_len];
+        // Over the per-position budget -> tighten to the overflow cap so a
+        // heavy position can't tail the worker (still solver-derived sign).
+        if (eg_pos_budget > 0 && eg_spent && *eg_spent >= eg_pos_budget &&
+            eg_overflow_cap > 0 && eg_overflow_cap < cap) {
+          cap = eg_overflow_cap;
+        }
         const EndgameArgs ea = {
             .game = dg, .thread_control = tc, .plies = eg_plies,
             .tt_fraction_of_mem = 0.005,
@@ -5223,7 +5231,10 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
             .forced_pass_bypass = false, .soft_time_limit = cap,
             .hard_time_limit = cap, .sign_stable_k = eg_signstable_k};
         ErrorStack *err = error_stack_create();
+        Timer eg_timer;
+        ctimer_start(&eg_timer);
         endgame_solve(es, &ea, er, err);
+        if (eg_spent) *eg_spent += ctimer_elapsed_seconds(&eg_timer);
         if (error_stack_is_empty(err)) {
           const PVLine *pv = endgame_results_get_pvline(er, ENDGAME_RESULT_BEST);
           if (pv) opt = pv->score;
@@ -5374,9 +5385,17 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   const char *eg_ssk_env = getenv("MAGPIE_PP_EG_SIGNSTABLE_K");
   const char *eg_caps_env = getenv("MAGPIE_PP_EG_HARD_BY_LEN");
   const char *eg_gate_env = getenv("MAGPIE_PP_EG_DIFFGATE");
+  const char *eg_budget_env = getenv("MAGPIE_PP_EG_POS_BUDGET");
+  const char *eg_ovcap_env = getenv("MAGPIE_PP_EG_OVERFLOW_CAP");
   const int eg_plies = eg_plies_env ? atoi(eg_plies_env) : 25;
   const int eg_signstable_k = eg_ssk_env ? atoi(eg_ssk_env) : 2;
   const int eg_diffgate = eg_gate_env ? atoi(eg_gate_env) : 80;
+  // Per-position endgame budget: once a position's fan-out branches have spent
+  // this many wall-seconds solving, the remaining branches use a tight cap
+  // (still the solver, shallower) so one heavy position can't tail a worker.
+  // 0 = no budget. Overflow branches keep solver-derived signs (never HastyBot).
+  const double eg_pos_budget = eg_budget_env ? atof(eg_budget_env) : 25.0;
+  const double eg_overflow_cap = eg_ovcap_env ? atof(eg_ovcap_env) : 1.0;
   double eg_caps[8] = {0.5, 0.5, 1.0, 1.5, 3.0, 5.0, 8.0, 12.0};
   if (eg_caps_env) {
     char buf[256];
@@ -5391,9 +5410,11 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   if (endgame) {
     fprintf(stderr,
             "position_pool: endgame POST on (plies=%d sign_stable_k=%d "
-            "diff_gate=%d caps[1..7]=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f)\n",
+            "diff_gate=%d caps[1..7]=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f "
+            "pos_budget=%.1fs overflow_cap=%.2fs)\n",
             eg_plies, eg_signstable_k, eg_diffgate, eg_caps[1], eg_caps[2],
-            eg_caps[3], eg_caps[4], eg_caps[5], eg_caps[6], eg_caps[7]);
+            eg_caps[3], eg_caps[4], eg_caps[5], eg_caps[6], eg_caps[7],
+            eg_pos_budget, eg_overflow_cap);
   }
   EndgameSolver *es = endgame ? endgame_solver_create() : NULL;
   EndgameResults *er = endgame ? endgame_results_create() : NULL;
@@ -5531,6 +5552,9 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             equity_to_int(player_get_score(game_get_player(gr->game, g_opp)));
         static _Thread_local char seen[PP_FANOUT_MAX][24];
         int nseen = 0;
+        // Per-position endgame budget accumulator (wall-seconds spent solving
+        // this position's branches); tightens the cap once exceeded.
+        double eg_spent = 0.0;
         for (int m = 0; m < nm && nseen < PP_FANOUT_MAX; m++) {
           const Move *mv = move_list_get_move(fan_ml, m);
           char lf[RACK_SIZE + 2];
@@ -5576,8 +5600,8 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           int f0 = 0, f1 = 0;
           const bool committable = pp_playout_outcome(
               es, er, eg_tc, dg, post_ml, worker->worker_index, on_idx, endgame,
-              eg_plies, eg_caps, eg_signstable_k, eg_diffgate, &win, &tie, &f0,
-              &f1);
+              eg_plies, eg_caps, eg_signstable_k, eg_diffgate, &eg_spent,
+              eg_pos_budget, eg_overflow_cap, &win, &tie, &f0, &f1);
           if (committable) {
             if (ft != NULL) {
               for (int kk = 0; kk < nft; kk++) {
@@ -5608,8 +5632,8 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         int f0 = 0, f1 = 0;
         const bool committable = pp_playout_outcome(
             es, er, eg_tc, gr->game, post_ml, worker->worker_index, on_idx,
-            endgame, eg_plies, eg_caps, eg_signstable_k, eg_diffgate, &win, &tie,
-            &f0, &f1);
+            endgame, eg_plies, eg_caps, eg_signstable_k, eg_diffgate, NULL, 0.0,
+            0.0, &win, &tie, &f0, &f1);
         (void)win;
         (void)tie;
         if (traj_r && gr->trajectory_buf) {
