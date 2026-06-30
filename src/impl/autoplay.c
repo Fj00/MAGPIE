@@ -1810,7 +1810,7 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
                 best_leave.array[slot->subleave_mls[0]] < 2) {
               continue;
             }
-            if (slot->exchange == 0 && slot->leave_length >= 3) {
+            if (slot->leave_type != LEAVE_TYPE_ALL) {  // typed cell (L5/L6 only)
               if (!best_type_known) {
                 best_type = force_classify_leave(&best_leave, ld);
                 best_type_known = true;
@@ -1912,7 +1912,7 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
             leaves[m].array[slot->subleave_mls[0]] < 2) {
           continue;
         }
-        if (slot->exchange == 0 && slot->leave_length >= 3) {
+        if (slot->leave_type != LEAVE_TYPE_ALL) {  // typed cell (L5/L6 only)
           if (!move_type_known) {
             move_type = force_classify_leave(&leaves[m], ld);
             move_type_known = true;
@@ -3605,7 +3605,7 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
         if (fs->subleave_count == 2 &&
             fs->subleave_mls[0] == fs->subleave_mls[1] &&
             leaves[m].array[fs->subleave_mls[0]] < 2) continue;
-        if (fs->exchange == 0 && fs->leave_length >= 3) {
+        if (fs->leave_type != LEAVE_TYPE_ALL) {  // typed cell (L5/L6 only)
           if (move_type_cache[m] < 0) {
             move_type_cache[m] = (int8_t)force_classify_leave(&leaves[m], ld);
           }
@@ -3638,7 +3638,7 @@ static int eb_append_force_target_slots(AutoplayWorker *w, GameRunner *gr,
         if (fs->subleave_count == 2 &&
             fs->subleave_mls[0] == fs->subleave_mls[1] &&
             leaves[m].array[fs->subleave_mls[0]] < 2) continue;
-        if (fs->exchange == 0 && fs->leave_length >= 3) {
+        if (fs->leave_type != LEAVE_TYPE_ALL) {  // typed cell (L5/L6 only)
           if (move_type_cache[m] < 0) {
             move_type_cache[m] = (int8_t)force_classify_leave(&leaves[m], ld);
           }
@@ -3747,7 +3747,7 @@ static void eb_annotate_force_targets_to_slots(AutoplayWorker *w,
         if (fs->subleave_count == 2 &&
             fs->subleave_mls[0] == fs->subleave_mls[1] &&
             leave.array[fs->subleave_mls[0]] < 2) continue;
-        if (fs->exchange == 0 && fs->leave_length >= 3) {
+        if (fs->leave_type != LEAVE_TYPE_ALL) {  // typed cell (L5/L6 only)
           if (cached_leave_type < 0)
             cached_leave_type = force_classify_leave(&leave, ld);
           if ((LeaveType)cached_leave_type != (LeaveType)fs->leave_type)
@@ -3788,7 +3788,7 @@ static void eb_annotate_force_targets_to_slots(AutoplayWorker *w,
         if (fs->subleave_count == 2 &&
             fs->subleave_mls[0] == fs->subleave_mls[1] &&
             leave.array[fs->subleave_mls[0]] < 2) continue;
-        if (fs->exchange == 0 && fs->leave_length >= 3) {
+        if (fs->leave_type != LEAVE_TYPE_ALL) {  // typed cell (L5/L6 only)
           atomic_fetch_add_explicit(&g_eb_l3plus_type_check_hit, 1,
                                      memory_order_relaxed);
           if (cached_leave_type < 0)

@@ -11,9 +11,9 @@
 // turn      1..6 (cycle position)
 // kind      0=pass, 1=exch, 2=play
 // leave_len 0..7 (post-action rack size; pass=7, exch/play = 7-action_size)
-// TYPE      "all" for leave_len < 3 or > 6, else cons/vowel/mixed by
-//           leave letter composition (Y treated as consonant; blank is
-//           ignored in the count).
+// TYPE      "all" unless leave_len is 5 or 6, in which case cons/vowel/mixed
+//           by leave letter composition (Y treated as consonant; blank is
+//           ignored in the count). L0-L4 and L7 are "all".
 //
 // Per-row schema (turn / kind / leave_len / TYPE implicit from path):
 //

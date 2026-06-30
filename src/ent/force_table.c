@@ -292,9 +292,11 @@ bool force_target_matches_bag(const ForceTarget *target,
   if (diff < target->diff_min || diff > target->diff_max) {
     return false;
   }
-  // Type check (parallel to force_target_matches): for plays with leave_length
-  // >= 3, the leave's cons/mixed/vowel classification must match the target.
-  if (target->exchange == 0 && target->leave_length >= 3) {
+  // Type check (parallel to force_target_matches): only for genuinely typed
+  // cells (L5/L6 plays). Gate on the cell's stored type, NOT the leave length —
+  // an "all" cell (L0-L4, L7, exchanges) is never type-checked, so an L3/L4
+  // bag_tile cell matches regardless of the classified `leave_type` passed in.
+  if (target->leave_type != LEAVE_TYPE_ALL) {
     if (leave_type != target->leave_type) {
       return false;
     }

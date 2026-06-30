@@ -437,15 +437,15 @@ int vmodel_stratum_index(const VModel *m, int kind, int leave_length,
                           VModelLeaveType type, int turn) {
     // Build the stratum_key matching v_model_predict.stratum_key() and
     // train_v_model.stratum_iter():
-    //   - L=0,1,2,7 → always "all" (trainer never splits these by type)
-    //   - L=3..6: cons/mixed/vowel, unless terminal-zero collapses to "all"
+    //   - only L5/L6 split into cons/mixed/vowel; L0-L4 and L7 are always "all"
+    //     (L3/L4 are "all" like L1/L2 — see winpct_common.is_split_length)
+    //   - terminal-zero collapses the L5/L6 split to "all" too
     char key[VMODEL_KEY_MAX];
     const char *typ_str;
     bool tzs = vmodel_terminal_zero_score(turn, kind);
-    if (leave_length == 0 || leave_length == 1 ||
-        leave_length == 2 || leave_length == 7) {
+    if (leave_length != 5 && leave_length != 6) {
         typ_str = "all";
-    } else if (tzs && leave_length >= 3) {
+    } else if (tzs) {
         typ_str = "all";
     } else {
         switch (type) {
