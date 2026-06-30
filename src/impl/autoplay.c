@@ -5174,7 +5174,12 @@ static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
         leave.array[fs->subleave_mls[0]] < 2) {
       continue;
     }
-    if (fs->exchange == 0 && fs->leave_length >= 3) {
+    // Type check only for genuinely type-split cells (L5/L6 plays here). Gate
+    // on the CELL's type, not the leave length: an "all" cell (L0-L4, L7, and
+    // exchanges) is never type-checked, so L3/L4 are treated like L1/L2. Keying
+    // on length wrongly type-checked L3/L4/L7 "all" cells against a classified
+    // leave, which never matched -> those plays were silently never recorded.
+    if (fs->leave_type != LEAVE_TYPE_ALL) {
       if (ltype < 0) ltype = (int)force_classify_leave(&leave, ld);
       if ((LeaveType)ltype != (LeaveType)fs->leave_type) continue;
     }
