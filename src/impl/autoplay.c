@@ -5211,9 +5211,10 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
                                int worker_index, int mover, bool endgame,
                                int eg_plies, const double *eg_caps,
                                int eg_signstable_k, int eg_diffgate,
+                               double eg_tt_frac,
                                double *eg_spent, double eg_pos_budget,
                                double eg_overflow_cap, bool *is_win,
-                               bool *is_tie, int *f0, int *f1) {
+                               bool *is_tie, int *f0, int *f1, int *out_spread) {
   while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
     if (endgame && bag_get_letters(game_get_bag(dg)) == 0) {
       const int on = game_get_player_on_turn_index(dg);
@@ -5238,7 +5239,7 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
         }
         const EndgameArgs ea = {
             .game = dg, .thread_control = tc, .plies = eg_plies,
-            .tt_fraction_of_mem = 0.005,
+            .tt_fraction_of_mem = eg_tt_frac,
             .initial_small_move_arena_size =
                 DEFAULT_INITIAL_SMALL_MOVE_ARENA_SIZE,
             .num_threads = 1, .base_thread_index = worker_index,
@@ -5256,6 +5257,13 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
           if (pv) opt = pv->score;
         }
         error_stack_destroy(err);
+      }
+      // Endgame SPREAD (on-turn optimal margin, diff-independent) for the
+      // scoreline-cutoff experiment: win at any diff d == (d + opt > 0), so one
+      // solve gives the whole win% curve. INT_MIN sentinel = gate-skipped (opt
+      // not from a solve).
+      if (out_spread) {
+        *out_spread = (abs(cur_diff) < eg_diffgate) ? opt : -1000000;
       }
       const int final_on = cur_diff + opt;  // on-turn final spread
       // Sign-correct synthetic finals (opt attributed to on-turn; recorder
@@ -5406,6 +5414,18 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   const int eg_plies = eg_plies_env ? atoi(eg_plies_env) : 25;
   const int eg_signstable_k = eg_ssk_env ? atoi(eg_ssk_env) : 2;
   const int eg_diffgate = eg_gate_env ? atoi(eg_gate_env) : 80;
+  // MAGPIE_PP_EG_TT_FRAC: transposition-table size as a fraction of RAM per
+  // endgame solver. Default 0.005 (~1.25GB on a 251GB box) limits parallelism
+  // to ~128 solvers before OOM; set ~0.0015 to fit 256 threads (bag 8-14
+  // endgames are shallow so a small TT barely slows the solve). See #1.
+  const char *eg_ttfrac_env = getenv("MAGPIE_PP_EG_TT_FRAC");
+  const double eg_tt_frac = eg_ttfrac_env ? atof(eg_ttfrac_env) : 0.005;
+  // MAGPIE_PP_EG_SPREAD_LOG=<dir>: scoreline-cutoff experiment. When set, each
+  // solved endgame branch appends "bag,leave_len,diff,spread" to
+  // <dir>/spread.w<worker>.csv. Run with a WIDE gate (solve everything) on a
+  // natural (un-injected) bag-8 pool: leave_len spans the endgame sizes and the
+  // spread gives win% at every diff analytically.
+  const char *eg_spread_log = getenv("MAGPIE_PP_EG_SPREAD_LOG");
   // Per-position endgame budget: once a position's fan-out branches have spent
   // this many wall-seconds solving, the remaining branches use a tight cap
   // (still the solver, shallower) so one heavy position can't tail a worker.
@@ -5450,6 +5470,15 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   // is SHARED across all autoplay workers, so concurrent endgame_solve on it
   // corrupts/crashes. Each worker gets its own (num_threads=1 per solve).
   ThreadControl *eg_tc = endgame ? thread_control_create() : NULL;
+  // Scoreline-cutoff experiment: per-worker spread log.
+  FILE *spread_fp = NULL;
+  if (eg_spread_log && eg_spread_log[0]) {
+    char sp[512];
+    snprintf(sp, sizeof(sp), "%s/spread.w%d.csv", eg_spread_log,
+             worker->worker_index);
+    spread_fp = fopen(sp, "w");
+    if (spread_fp) fprintf(spread_fp, "bag,leave_len,diff,spread\n");
+  }
   // Force-table gate: when loaded (MAGPIE_FORCE_TABLE), the fan-out fills
   // per-(stratum,bucket,feature) cells to target instead of the per-leaf
   // leave_deficit. ft==NULL falls back to leave_deficit.
@@ -5629,11 +5658,16 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           eb_stage_trajectory_row(gr, gr->game, mv, on_idx);
           play_move(mv, dg, NULL);
           bool win = false, tie = false;
-          int f0 = 0, f1 = 0;
+          int f0 = 0, f1 = 0, spread = -1000000;
           const bool committable = pp_playout_outcome(
               es, er, eg_tc, dg, post_ml, worker->worker_index, on_idx, endgame,
-              eg_plies, eg_caps, eg_signstable_k, eg_diffgate, &eg_spent,
-              eg_pos_budget, eg_overflow_cap, &win, &tie, &f0, &f1);
+              eg_plies, eg_caps, eg_signstable_k, eg_diffgate, eg_tt_frac,
+              &eg_spent, eg_pos_budget, eg_overflow_cap, &win, &tie, &f0, &f1,
+              &spread);
+          if (spread_fp && spread != -1000000) {
+            fprintf(spread_fp, "%d,%d,%d,%d\n", gate_bag, (int)strlen(lf),
+                    eff_diff, spread);
+          }
           if (committable) {
             if (ft != NULL) {
               for (int kk = 0; kk < nft; kk++) {
@@ -5668,8 +5702,8 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         int f0 = 0, f1 = 0;
         const bool committable = pp_playout_outcome(
             es, er, eg_tc, gr->game, post_ml, worker->worker_index, on_idx,
-            endgame, eg_plies, eg_caps, eg_signstable_k, eg_diffgate, NULL, 0.0,
-            0.0, &win, &tie, &f0, &f1);
+            endgame, eg_plies, eg_caps, eg_signstable_k, eg_diffgate, eg_tt_frac,
+            NULL, 0.0, 0.0, &win, &tie, &f0, &f1, NULL);
         (void)win;
         (void)tie;
         if (traj_r && gr->trajectory_buf) {
@@ -5686,6 +5720,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   if (es) endgame_solver_destroy(es);
   if (er) endgame_results_destroy(er);
   if (eg_tc) thread_control_destroy(eg_tc);
+  if (spread_fp) fclose(spread_fp);
   move_list_destroy(post_ml);
   move_list_destroy(fan_ml);
 }
