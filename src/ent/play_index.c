@@ -228,9 +228,11 @@ PlayIndex *play_index_create(const char *dir_path, ForceTable *force_table,
     ForceTargetKind kind = (ForceTargetKind)c->kind;
     int subleave_count = c->sub_count;
     int diff = c->diff_min;  // any diff in range works for lookup
+    // Opener play_index cells are TILE/PAIR only (<= 2 MLs).
+    const MachineLetter sub_mls[FORCE_MAX_SUBLEAVE] = {c->sub_ml0, c->sub_ml1};
     ForceTarget *t = force_table_lookup_target_by_key(
         force_table, /*bag*/ 93, c->length, lt, kind, c->exchange,
-        c->sub_ml0, c->sub_ml1, subleave_count, diff);
+        sub_mls, subleave_count, diff);
     idx->cell_to_target[i] = t;
     if (t) resolved++;
     (void)ld;

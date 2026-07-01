@@ -26,7 +26,18 @@ typedef enum {
   // features (via _b<N> cells). Count-based decrement at game-end (same
   // path as TILE/PAIR).
   FORCE_TARGET_BAG_TILE = 3,
+  // LEAVE: enumerated full-leave cell. subleave holds the WHOLE leave (all
+  // subleave_count tiles, subleave_count == leave_length), so the cell credits
+  // only on an EXACT multiset match — not the subset-presence match that TILE
+  // (1) and PAIR (2) use. Used for the enumerated lengths L3/L4 (one cell per
+  // distinct 3-/4-tile multiset), the mid-board analog of L1 tiles / L2 pairs.
+  // L5/L6 stay factored TILE+PAIR. See winpct_common.enumerate_leaves.
+  FORCE_TARGET_LEAVE = 4,
 } ForceTargetKind;
+
+// Max tiles stored in a ForceTarget's subleave. TILE=1, PAIR/BAG_TILE=2,
+// LEAVE (enumerated L3/L4) up to 4. Sized to the largest enumerated leave.
+#define FORCE_MAX_SUBLEAVE 4
 
 // Per-game cap on simultaneous BAG_TILE matches. A move's rack composition
 // can satisfy at most 27 cells (one per tile in the bag), so 27 is the
@@ -62,7 +73,7 @@ typedef struct ForceTarget {
   int diff_min;
   int diff_max;
   int subleave_count;
-  MachineLetter subleave_mls[2];
+  MachineLetter subleave_mls[FORCE_MAX_SUBLEAVE];
   // Cold fields — only touched on a candidate match or during table
   // maintenance.
   int bag;
@@ -161,6 +172,29 @@ ForceTargetSlot *force_table_lookup_slots_by_shape(ForceTable *table, int bag,
 // for fast pre-filter.
 uint32_t *force_table_lookup_bitmaps_by_shape(ForceTable *table, int bag,
                                               int leave_length, int exchange);
+
+// Exact multiset match for an enumerated LEAVE cell: true iff `leave` equals
+// the cell's `sub` multiset (of `count` tiles). The caller has already
+// confirmed leave->number_of_letters == count (the shape bucket guarantees
+// it), so comparing each distinct sub tile's multiplicity to the leave's count
+// is sufficient — equal totals leave no room for an unmatched tile. count is
+// small (<= FORCE_MAX_SUBLEAVE) so the O(count^2) multiplicity walk is cheap.
+static inline bool force_subleave_exact_match(const MachineLetter *sub,
+                                              int count, const Rack *leave) {
+  for (int i = 0; i < count; i++) {
+    const MachineLetter t = sub[i];
+    int need = 0;
+    for (int j = 0; j < count; j++) {
+      if (sub[j] == t) {
+        need++;
+      }
+    }
+    if (leave->array[t] != need) {
+      return false;
+    }
+  }
+  return true;
+}
 
 // Check whether a candidate move's leave + score + current score-diff matches
 // the given target. `leave` is the post-move kept-tile rack. `score` is the
@@ -276,9 +310,13 @@ LeaveType force_classify_leave(const Rack *leave,
 // cell_rarity.csv); the function returns the unique target whose
 // [diff_min, diff_max] range contains it. Returns NULL if no target matches.
 // Used by the rare-rack pool loader to resolve cell keys to ForceTarget*.
+// `sub_mls` holds `subleave_count` machine letters (the cell's subleave). For
+// TILE/BAG_TILE pass 1, PAIR pass 2, LEAVE (enumerated L3/L4) pass up to
+// FORCE_MAX_SUBLEAVE; all are compared in order. For BAG_TILE, sub_mls[1] is
+// the count-marker (matched like the other kinds).
 ForceTarget *force_table_lookup_target_by_key(
     ForceTable *table, int bag, int leave_length, LeaveType type,
-    ForceTargetKind kind, int exchange, MachineLetter sub_ml0,
-    MachineLetter sub_ml1, int subleave_count, int diff);
+    ForceTargetKind kind, int exchange, const MachineLetter *sub_mls,
+    int subleave_count, int diff);
 
 #endif

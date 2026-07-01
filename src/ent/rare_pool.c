@@ -151,9 +151,11 @@ static void rare_pool_load_file(RarePool *rp, const char *csv_path,
     if (sub_ml0 == 0xFF || (sub_count >= 2 && sub_ml1 == 0xFF)) continue;
     // Force-target lookup: bag=93 (opener), exchange=0 (cells in
     // cell_rarity.csv are play-kind only — built from action_type==play).
+    // Opener rare-pool cells are TILE/PAIR (<= 2 MLs).
+    const MachineLetter sub_mls[FORCE_MAX_SUBLEAVE] = {sub_ml0, sub_ml1};
     ForceTarget *t = force_table_lookup_target_by_key(
         force_table, /*bag=*/93, length, type, kind, /*exchange=*/0,
-        sub_ml0, sub_ml1, sub_count, diff);
+        sub_mls, sub_count, diff);
     if (!t) {
       n_unresolved++;
       continue;

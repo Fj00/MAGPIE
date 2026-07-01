@@ -139,6 +139,9 @@ static ForceTargetKind parse_kind(const char *s) {
   if (strcmp(s, "bag_tile") == 0) {
     return FORCE_TARGET_BAG_TILE;
   }
+  if (strcmp(s, "leave") == 0) {
+    return FORCE_TARGET_LEAVE;
+  }
   return -1;
 }
 
@@ -237,7 +240,14 @@ bool force_target_matches(const ForceTarget *target, const Rack *leave,
     // calling us. Here we only validate subleave_mls presence.
     // (Type check is done outside this function to avoid threading ld in.)
   }
-  // Subleave checks
+  // Enumerated full-leave cell (L3/L4): require an EXACT multiset match, not
+  // the subset-presence that TILE/PAIR use (leave_length == subleave_count was
+  // guaranteed by the length check above).
+  if (target->kind == FORCE_TARGET_LEAVE) {
+    return force_subleave_exact_match(target->subleave_mls,
+                                      target->subleave_count, leave);
+  }
+  // Subleave checks (TILE/PAIR subset-presence).
   for (int i = 0; i < target->subleave_count; i++) {
     const MachineLetter needed = target->subleave_mls[i];
     if (leave->array[needed] <= 0) {
@@ -627,11 +637,11 @@ uint32_t *force_table_lookup_bitmaps_by_shape(ForceTable *table, int bag,
 
 ForceTarget *force_table_lookup_target_by_key(
     ForceTable *table, int bag, int leave_length, LeaveType type,
-    ForceTargetKind kind, int exchange, MachineLetter sub_ml0,
-    MachineLetter sub_ml1, int subleave_count, int diff) {
+    ForceTargetKind kind, int exchange, const MachineLetter *sub_mls,
+    int subleave_count, int diff) {
   if (!table || bag < 0 || bag >= FORCE_BAG_MAX) return NULL;
   // Use the by_bag bucket — small enough that a linear scan is fine
-  // (called only at rare-pool load time, not per game).
+  // (called only at rare-pool load / resume time, not per game).
   const int ex = exchange ? 1 : 0;
   const int n = table->by_bag_count[bag];
   ForceTarget **arr = table->by_bag_ptrs[bag];
@@ -642,13 +652,22 @@ ForceTarget *force_table_lookup_target_by_key(
     if ((int)t->kind != (int)kind) continue;
     if (t->exchange != ex) continue;
     if (t->subleave_count != subleave_count) continue;
-    if (subleave_count >= 1 && t->subleave_mls[0] != sub_ml0) continue;
-    if (subleave_count >= 2 && t->subleave_mls[1] != sub_ml1) continue;
-    // For BAG_TILE cells, subleave_mls[1] encodes the count marker
-    // (0 = "_free", N+1 = exact count N). Match it even though
-    // subleave_count is 1 for bag_tile.
+    // Compare every subleave ML in order. For BAG_TILE, sub_mls[1] is the
+    // count-marker (compared here too). For LEAVE, all up to
+    // subleave_count (== leave_length) are compared — the canonical order
+    // makes the comparison position-stable.
+    bool sub_ok = true;
+    for (int k = 0; k < subleave_count; k++) {
+      if (t->subleave_mls[k] != sub_mls[k]) {
+        sub_ok = false;
+        break;
+      }
+    }
+    if (!sub_ok) continue;
+    // BAG_TILE carries its count-marker in subleave_mls[1] but reports
+    // subleave_count == 1, so the loop above skips it — check explicitly.
     if (kind == FORCE_TARGET_BAG_TILE &&
-        t->subleave_mls[1] != sub_ml1) continue;
+        t->subleave_mls[1] != sub_mls[1]) continue;
     if (diff < t->diff_min || diff > t->diff_max) continue;
     return t;
   }
@@ -766,8 +785,7 @@ ForceTable *force_table_create(const char *csv_path,
     t->leave_type = type;
     t->exchange = exchange;
     t->subleave_count = 0;
-    t->subleave_mls[0] = 0;
-    t->subleave_mls[1] = 0;
+    memset(t->subleave_mls, 0, sizeof(t->subleave_mls));
     atomic_store_explicit(&t->credit_attempts, 0, memory_order_relaxed);
     // For STRATUM cells: reinterpret CSV `target` (column 8) as per-side
     // threshold T. Cell needs total_wins >= T AND total_losses >= T.
@@ -819,6 +837,32 @@ ForceTable *force_table_create(const char *csv_path,
         table->num_targets--;
         continue;
       }
+    } else if (kind == FORCE_TARGET_LEAVE) {
+      // Enumerated full-leave cell (L3/L4): subleave is the whole leave
+      // multiset in canonical order (e.g. "AEN", "??AB"). Store every tile;
+      // credited only on an exact multiset match. char_to_ml maps '?' -> 0.
+      const size_t sl_len = strlen(subleave);
+      if (sl_len < 1 || sl_len > FORCE_MAX_SUBLEAVE) {
+        log_warn("force_table: bad leave subleave %s on line %d", subleave,
+                 line_no);
+        table->num_targets--;
+        continue;
+      }
+      bool bad = false;
+      for (size_t si = 0; si < sl_len; si++) {
+        t->subleave_mls[si] = char_to_ml(ld, subleave[si]);
+        if (t->subleave_mls[si] == 0xFF) {
+          bad = true;
+          break;
+        }
+      }
+      if (bad) {
+        log_warn("force_table: unknown tile in leave %s on line %d", subleave,
+                 line_no);
+        table->num_targets--;
+        continue;
+      }
+      t->subleave_count = (int)sl_len;
     } else if (kind == FORCE_TARGET_BAG_TILE) {
       // Subleave format (bag-perspective):
       //   "<TILE>_free"  — fires when the BAG has ≥1 of TILE
@@ -1068,7 +1112,7 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
   fprintf(f, "kind,bag,length,type,exchange,subleave,current,target,deficit,"
              "forced_games_estimate,diff_min,diff_max,rarity_score,"
              "obs_w,obs_l,stratum_per_side,credit_attempts\n");
-  const char *kind_names[] = {"stratum", "tile", "pair", "bag_tile"};
+  const char *kind_names[] = {"stratum", "tile", "pair", "bag_tile", "leave"};
   const char *type_names[] = {"all", "cons", "mixed", "vowel"};
   int rows_written = 0;
   for (int i = 0; i < table->num_targets; i++) {
@@ -1091,13 +1135,11 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
                  t->subleave_mls[1] - 1);
       }
     } else {
-      if (t->subleave_count >= 1) {
-        subleave[0] = (t->subleave_mls[0] == 0) ? '?' :
-                      ld->ld_ml_to_hl[t->subleave_mls[0]][0];
-      }
-      if (t->subleave_count >= 2) {
-        subleave[1] = (t->subleave_mls[1] == 0) ? '?' :
-                      ld->ld_ml_to_hl[t->subleave_mls[1]][0];
+      // TILE (1), PAIR (2), LEAVE (up to FORCE_MAX_SUBLEAVE): render every
+      // stored tile in canonical order. Blank (ML 0) -> '?'.
+      for (int si = 0; si < t->subleave_count && si < FORCE_MAX_SUBLEAVE; si++) {
+        subleave[si] = (t->subleave_mls[si] == 0) ? '?' :
+                       ld->ld_ml_to_hl[t->subleave_mls[si]][0];
       }
     }
     // current/target: reconstructed from original_deficit so each dumped
@@ -1188,39 +1230,49 @@ int force_table_resume_from_dump(ForceTable *table, const char *csv_path,
     uint64_t obs_l = (nf > 14) ? strtoull(fields[14], NULL, 10) : 0;
     // Decode subleave_mls per the dump's encoding (matches the dump's
     // own subleave-rendering logic in force_table_dump_remaining).
-    MachineLetter sub_ml0 = 0, sub_ml1 = 0;
+    MachineLetter sub_mls[FORCE_MAX_SUBLEAVE] = {0};
     int subleave_count = 0;
+    bool sub_bad = false;
     if (kind == FORCE_TARGET_BAG_TILE) {
       // Format (bag-perspective): "<TILE>_free" OR "<TILE>_b<N>". Mirror
-      // the load-time encoding in force_table_create: sub_ml1 == 0 for
-      // "_free", sub_ml1 == N+1 for bag count N. subleave_count stays 1.
+      // the load-time encoding in force_table_create: sub_mls[1] == 0 for
+      // "_free", sub_mls[1] == N+1 for bag count N. subleave_count stays 1.
       // Old rack-perspective "<TILE>_<N>" (no 'b') is silently dropped
       // here too — only "free" or "b<digit>" parse.
       if (subleave[0]) {
-        sub_ml0 = (subleave[0] == '?') ? 0 : char_to_ml(ld, subleave[0]);
+        sub_mls[0] = (subleave[0] == '?') ? 0 : char_to_ml(ld, subleave[0]);
         subleave_count = 1;
         const size_t sl_len = strlen(subleave);
         if (sl_len >= 3 && subleave[1] == '_') {
           const char *suffix = subleave + 2;
           if (strcmp(suffix, "free") == 0) {
-            sub_ml1 = 0;
+            sub_mls[1] = 0;
           } else if (suffix[0] == 'b' && suffix[1] >= '0' &&
                      suffix[1] <= '9' && suffix[2] == '\0') {
-            sub_ml1 = (MachineLetter)((suffix[1] - '0') + 1);
+            sub_mls[1] = (MachineLetter)((suffix[1] - '0') + 1);
           }
         }
       }
     } else {
-      if (subleave[0]) {
-        sub_ml0 = (subleave[0] == '?') ? 0 : char_to_ml(ld, subleave[0]);
-        subleave_count = 1;
-      }
-      if (subleave[0] && subleave[1]) {
-        sub_ml1 = (subleave[1] == '?') ? 0 : char_to_ml(ld, subleave[1]);
-        subleave_count = 2;
+      // TILE (1) / PAIR (2) / LEAVE (up to FORCE_MAX_SUBLEAVE) / STRATUM (0):
+      // decode each canonical-order char. char_to_ml maps '?' -> 0.
+      const size_t sl_len = strlen(subleave);
+      if (sl_len > FORCE_MAX_SUBLEAVE) {
+        sub_bad = true;
+      } else {
+        for (size_t si = 0; si < sl_len; si++) {
+          sub_mls[si] =
+              (subleave[si] == '?') ? 0 : char_to_ml(ld, subleave[si]);
+          if (sub_mls[si] == (MachineLetter)0xFF) {
+            sub_bad = true;
+            break;
+          }
+        }
+        subleave_count = (int)sl_len;
       }
     }
-    if (sub_ml0 == (MachineLetter)0xFF || sub_ml1 == (MachineLetter)0xFF) {
+    if (sub_bad || sub_mls[0] == (MachineLetter)0xFF ||
+        sub_mls[1] == (MachineLetter)0xFF) {
       n_skipped++;
       continue;
     }
@@ -1228,7 +1280,7 @@ int force_table_resume_from_dump(ForceTable *table, const char *csv_path,
     // (force_table_lookup_target_by_key checks `diff_min <= diff <= diff_max`).
     ForceTarget *t = force_table_lookup_target_by_key(
         table, bag, length, type, kind, exchange,
-        sub_ml0, sub_ml1, subleave_count, diff_min);
+        sub_mls, subleave_count, diff_min);
     if (!t) {
       n_skipped++;
       continue;

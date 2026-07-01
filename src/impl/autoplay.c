@@ -5163,15 +5163,26 @@ static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
       continue;
     }
     if (k != FORCE_TARGET_PAIR && k != FORCE_TARGET_TILE &&
-        k != FORCE_TARGET_STRATUM) {
+        k != FORCE_TARGET_STRATUM && k != FORCE_TARGET_LEAVE) {
       continue;
     }
     if (bitmaps != NULL) {
       const uint32_t req = bitmaps[t];
       if ((leave_bm & req) != req) continue;
     }
-    if (fs->subleave_count == 2 && fs->subleave_mls[0] == fs->subleave_mls[1] &&
-        leave.array[fs->subleave_mls[0]] < 2) {
+    if (k == FORCE_TARGET_LEAVE) {
+      // Enumerated full-leave cell (L3/L4): the bitmap pre-filter only proves
+      // the tiles are PRESENT; require an exact multiset match so "AAB" is not
+      // credited by an "ABB" leave. The full subleave (up to FORCE_MAX_SUBLEAVE
+      // tiles) lives on the cold struct — the hot slot only carries the <=2 MLs
+      // the tile/pair same-tile check needs.
+      if (!force_subleave_exact_match(fs->cold->subleave_mls,
+                                      fs->cold->subleave_count, &leave)) {
+        continue;
+      }
+    } else if (fs->subleave_count == 2 &&
+               fs->subleave_mls[0] == fs->subleave_mls[1] &&
+               leave.array[fs->subleave_mls[0]] < 2) {
       continue;
     }
     // Type check only for genuinely type-split cells (L5/L6 plays here). Gate
