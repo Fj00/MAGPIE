@@ -5664,7 +5664,13 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
               eg_plies, eg_caps, eg_signstable_k, eg_diffgate, eg_tt_frac,
               &eg_spent, eg_pos_budget, eg_overflow_cap, &win, &tie, &f0, &f1,
               &spread);
-          if (spread_fp && spread != -1000000) {
+          // Log only BAG-EMPTYING plays: tiles_played >= physical bag
+          // (= gate_bag - 7, opp holds 7). Only those land directly in the
+          // endgame so leave_len == the endgame's mover-tile count. At bag 8
+          // every play qualifies; at 9-14 this drops the non-emptying plays
+          // whose later endgame wouldn't match their recorded leave_len.
+          if (spread_fp && spread != -1000000 &&
+              (7 - (int)strlen(lf)) >= (gate_bag - 7)) {
             fprintf(spread_fp, "%d,%d,%d,%d\n", gate_bag, (int)strlen(lf),
                     eff_diff, spread);
           }
