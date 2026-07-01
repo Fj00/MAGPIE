@@ -5412,6 +5412,18 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   // 0 = no budget. Overflow branches keep solver-derived signs (never HastyBot).
   const double eg_pos_budget = eg_budget_env ? atof(eg_budget_env) : 25.0;
   const double eg_overflow_cap = eg_ovcap_env ? atof(eg_ovcap_env) : 1.0;
+  // MAGPIE_PP_EG_MAX_SOLVES=K: cap the number of fanned-out playout/solve
+  // branches per POSITION (across rerolls). Once K branches have been played
+  // out at a position, skip the rest and move to the next position. Bounds the
+  // per-position cost — a from-scratch force table matches every branch, so
+  // without this one dense board soaks up hundreds of endgame solves (~9 min of
+  // one thread). Coverage is preserved by processing more positions: a
+  // deficient cell recurs across thousands of boards, so you don't need to
+  // drain it at one board. 0 = unlimited (default; e.g. the no-endgame
+  // enumerated fill, where each fanout branch is a cheap hasty game worth
+  // keeping).
+  const char *eg_maxsolves_env = getenv("MAGPIE_PP_EG_MAX_SOLVES");
+  const int eg_max_solves = eg_maxsolves_env ? atoi(eg_maxsolves_env) : 0;
   double eg_caps[8] = {0.5, 0.5, 1.0, 1.5, 3.0, 5.0, 8.0, 12.0};
   if (eg_caps_env) {
     char buf[256];
@@ -5427,10 +5439,10 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
     fprintf(stderr,
             "position_pool: endgame POST on (plies=%d sign_stable_k=%d "
             "diff_gate=%d caps[1..7]=%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f "
-            "pos_budget=%.1fs overflow_cap=%.2fs)\n",
+            "pos_budget=%.1fs overflow_cap=%.2fs max_solves/pos=%d)\n",
             eg_plies, eg_signstable_k, eg_diffgate, eg_caps[1], eg_caps[2],
             eg_caps[3], eg_caps[4], eg_caps[5], eg_caps[6], eg_caps[7],
-            eg_pos_budget, eg_overflow_cap);
+            eg_pos_budget, eg_overflow_cap, eg_max_solves);
   }
   EndgameSolver *es = endgame ? endgame_solver_create() : NULL;
   EndgameResults *er = endgame ? endgame_results_create() : NULL;
@@ -5457,6 +5469,10 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
       pos_id = position_pool_get_id(pp, i);
     }
 
+    // Per-position playout/solve budget (MAGPIE_PP_EG_MAX_SOLVES). Accumulates
+    // across this position's rerolls; when it trips, break to the next position.
+    int pos_playouts = 0;
+    bool pos_capped = false;
     for (int g = 0; g < games_per_pos; g++) {
       game_reset(gr->game);
       // Reset GameRunner fields normally cleared by game_runner_start, which we
@@ -5631,6 +5647,10 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             trajectory_game_buffer_discard(gr->trajectory_buf);
           }
           game_destroy(dg);
+          if (eg_max_solves > 0 && ++pos_playouts >= eg_max_solves) {
+            pos_capped = true;
+            break;  // enough branches at this position — move on
+          }
         }
       } else {
         if (traj_r && gr->trajectory_buf) {
@@ -5660,6 +5680,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           }
         }
       }
+      if (pos_capped) break;
     }
   }
   if (es) endgame_solver_destroy(es);
