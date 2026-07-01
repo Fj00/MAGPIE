@@ -5199,6 +5199,12 @@ static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
   return n;
 }
 
+// Scoreline-cutoff experiment: shared per-(bag, leave_len) sample counter for
+// MAGPIE_PP_EG_SPREAD_CAP — forces ~equal N per (unseen, tiles-played) play
+// type by skipping cells already at the cap so workers keep scanning for the
+// rare big-play/bingo cells. Indexed [bag(0..15)][leave_len(0..7)].
+static _Atomic int g_spread_counts[16][8];
+
 // Play `dg` out to game end and report the `mover`'s outcome. For the low-bag
 // endgame phase (`endgame` true), when the bag empties solve the endgame
 // (even-4, diff-gated) for the exact W/L instead of continuing HastyBot — the
@@ -5426,6 +5432,12 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   // natural (un-injected) bag-8 pool: leave_len spans the endgame sizes and the
   // spread gives win% at every diff analytically.
   const char *eg_spread_log = getenv("MAGPIE_PP_EG_SPREAD_LOG");
+  // MAGPIE_PP_EG_SPREAD_CAP=N: per (bag, leave_len) cell cap for the experiment
+  // — solve+log at most N bag-emptying plays of each type, so a large natural
+  // pool yields ~equal N across all 28 (unseen, tiles-played) cells (the rare
+  // big-play/bingo cells fill from the tail of the pool). 0 = uncapped.
+  const char *eg_spread_cap_env = getenv("MAGPIE_PP_EG_SPREAD_CAP");
+  const int spread_cap = eg_spread_cap_env ? atoi(eg_spread_cap_env) : 0;
   // Per-position endgame budget: once a position's fan-out branches have spent
   // this many wall-seconds solving, the remaining branches use a tight cap
   // (still the solver, shallower) so one heavy position can't tail a worker.
@@ -5632,6 +5644,18 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           }
           if (dup_key) continue;
           snprintf(seen[nseen++], sizeof(seen[0]), "%s", key);
+          // Experiment cell-cap: in spread-log mode only bag-emptying plays
+          // whose (bag, leave_len) cell isn't full are solved+logged, so a large
+          // natural pool yields ~equal N per play type (rare big-play cells fill
+          // from the pool tail instead of being drowned by common small plays).
+          const int llen = (int)strlen(lf);
+          if (spread_fp) {
+            if ((7 - llen) < (gate_bag - 7)) continue;  // not bag-emptying
+            if (spread_cap > 0 && gate_bag >= 0 && gate_bag < 16 && llen < 8 &&
+                atomic_load_explicit(&g_spread_counts[gate_bag][llen],
+                                     memory_order_relaxed) >= spread_cap)
+              continue;
+          }
           const int msc =
               move_get_type(mv) == GAME_EVENT_TILE_PLACEMENT_MOVE
                   ? equity_to_int(move_get_score(mv))
@@ -5664,15 +5688,13 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
               eg_plies, eg_caps, eg_signstable_k, eg_diffgate, eg_tt_frac,
               &eg_spent, eg_pos_budget, eg_overflow_cap, &win, &tie, &f0, &f1,
               &spread);
-          // Log only BAG-EMPTYING plays: tiles_played >= physical bag
-          // (= gate_bag - 7, opp holds 7). Only those land directly in the
-          // endgame so leave_len == the endgame's mover-tile count. At bag 8
-          // every play qualifies; at 9-14 this drops the non-emptying plays
-          // whose later endgame wouldn't match their recorded leave_len.
-          if (spread_fp && spread != -1000000 &&
-              (7 - (int)strlen(lf)) >= (gate_bag - 7)) {
-            fprintf(spread_fp, "%d,%d,%d,%d\n", gate_bag, (int)strlen(lf),
-                    eff_diff, spread);
+          // Log the solved bag-emptying play + bump its cell counter (the
+          // bag-emptying filter + cell cap were applied pre-solve above).
+          if (spread_fp && spread != -1000000 && gate_bag >= 0 &&
+              gate_bag < 16 && llen < 8) {
+            fprintf(spread_fp, "%d,%d,%d,%d\n", gate_bag, llen, eff_diff, spread);
+            atomic_fetch_add_explicit(&g_spread_counts[gate_bag][llen], 1,
+                                      memory_order_relaxed);
           }
           if (committable) {
             if (ft != NULL) {
