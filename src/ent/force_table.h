@@ -215,10 +215,12 @@ bool force_target_matches(const ForceTarget *target, const Rack *leave,
 // caller via the leave's length and the LeaveType pre-classified).
 // `is_exchange` is the caller's authoritative exchange flag (derived
 // from action_kind, not score) — a 0-scoring play (e.g. 2 blanks for 0
-// points) must still match exchange=0 cells. `ld` is needed to look up
-// TILE_BAG[tile] for the count check.
+// points) must still match exchange=0 cells. `unseen_t` is the caller-computed
+// count of the target's tile in the UNSEEN pool (physical bag + opp rack) =
+// TILE_BAG[t] - board_t - mover_t, matching the V-model bag_eq feature. `ld` is
+// retained for signature stability (unused).
 bool force_target_matches_bag(const ForceTarget *target,
-                              const Rack *pre_move_rack,
+                              int unseen_t,
                               int leave_length, LeaveType leave_type,
                               int is_exchange, int diff,
                               const LetterDistribution *ld);
@@ -298,6 +300,22 @@ void force_table_get_stratum_wl_by_ptr(const ForceTable *table,
 
 // Number of targets currently loaded (including satisfied ones).
 int force_table_num_targets(const ForceTable *table);
+
+// Number of targets still unsatisfied (deficit>0); 0 == exhausted. Live/atomic.
+int force_table_active_targets(const ForceTable *table);
+
+// Ordinal of a target within the flat targets[] array — the same index used by
+// force_table_get_stratum_wl / the stratum_tallies, and == the target's row
+// order in the loaded force_targets.csv. Lets a play-index refer to a cell by a
+// single int instead of re-spelling its (kind,length,type,exchange,subleave,
+// diff) key. Returns -1 if the pointer is not within this table's targets[].
+int force_table_target_index(const ForceTable *table, const ForceTarget *target);
+
+// Inverse of force_table_target_index: resolve a target ordinal (0..num_targets
+// -1, == force_targets.csv row order) back to its ForceTarget*. NULL if out of
+// range. Lets a play-index built with cell ordinals resolve cells by direct
+// index instead of by (kind,length,type,exchange,subleave,diff) key.
+ForceTarget *force_table_target_by_index(ForceTable *table, int index);
 
 // Classify a leave as all/cons/mixed/vowel per the aggregation rule.
 // Blanks (machine letter 0) ignored for the v/c count; leaves of length <= 2

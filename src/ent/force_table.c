@@ -126,6 +126,24 @@ struct ForceTable {
   StratumTally **stratum_tallies;
 };
 
+int force_table_target_index(const ForceTable *table, const ForceTarget *target) {
+  if (!table || !target) {
+    return -1;
+  }
+  const ptrdiff_t idx = target - table->targets;
+  if (idx < 0 || idx >= table->num_targets) {
+    return -1;
+  }
+  return (int)idx;
+}
+
+ForceTarget *force_table_target_by_index(ForceTable *table, int index) {
+  if (!table || index < 0 || index >= table->num_targets) {
+    return NULL;
+  }
+  return &table->targets[index];
+}
+
 static ForceTargetKind parse_kind(const char *s) {
   if (strcmp(s, "stratum") == 0) {
     return FORCE_TARGET_STRATUM;
@@ -283,10 +301,11 @@ static inline uint32_t required_bitmap_for_target(const ForceTarget *target) {
 }
 
 bool force_target_matches_bag(const ForceTarget *target,
-                              const Rack *pre_move_rack,
+                              int unseen_t,
                               int leave_length, LeaveType leave_type,
                               int is_exchange, int diff,
                               const LetterDistribution *ld) {
+  (void)ld;  // unseen count passed in now; no TILE_BAG[t] lookup needed
   if (atomic_load_explicit(&target->deficit, memory_order_relaxed) <= 0) {
     return false;
   }
@@ -311,21 +330,21 @@ bool force_target_matches_bag(const ForceTarget *target,
       return false;
     }
   }
-  // BAG_TILE predicate is split by subleave_mls[1] (bag-perspective):
-  //   0       → "_free": bag has ≥1 of t  (= rack.count(t) < TILE_BAG[t])
-  //   1..N+1  → bag has exactly N of t   (= rack.count(t) ==
-  //             TILE_BAG[t] - N, where N = subleave_mls[1] - 1)
-  const MachineLetter t = target->subleave_mls[0];
+  // BAG_TILE predicate on the UNSEEN pool (physical bag + opp rack), matching
+  // the V-model bag_eq_t_bN feature (fires when the unseen has exactly N of t;
+  // v_model_features.py). subleave_mls[1] encodes it:
+  //   0       → "_free": unseen has ≥1 of t
+  //   1..N+1  → "_bN":   unseen has exactly N of t  (N = subleave_mls[1] - 1)
+  // unseen_t = TILE_BAG[t] - board_t - mover_t, computed by the caller from the
+  // game. NOT the old rack-only opener formula (rack.count == TILE_BAG - N),
+  // which omitted the board term and only matched "mover holds all copies".
   const int count_marker = target->subleave_mls[1];
-  const int tile_bag_count = ld_get_dist(ld, t);
   if (count_marker == 0) {
-    if (pre_move_rack->array[t] >= tile_bag_count) {
+    if (unseen_t < 1) {
       return false;
     }
   } else {
-    const int required_bag_count = count_marker - 1;
-    const int required_rack_count = tile_bag_count - required_bag_count;
-    if (pre_move_rack->array[t] != required_rack_count) {
+    if (unseen_t != count_marker - 1) {
       return false;
     }
   }
@@ -687,6 +706,10 @@ int force_table_num_targets(const ForceTable *table) {
   return table->num_targets;
 }
 
+int force_table_active_targets(const ForceTable *table) {
+  return atomic_load_explicit(&table->active_targets, memory_order_relaxed);
+}
+
 // Simple CSV line split that modifies `line` in place; returns number of
 // fields stored in `fields[]` (up to max_fields).
 static int split_csv(char *line, char **fields, int max_fields) {
@@ -750,9 +773,11 @@ ForceTable *force_table_create(const char *csv_path,
     int exchange = atoi(fields[4]);
     const char *subleave = fields[5];
     int64_t deficit = strtoll(fields[8], NULL, 10);
-    if (deficit <= 0) {
-      continue;
-    }
+    // Keep deficit<=0 (already-satisfied) rows so a RESIDUAL force table stays
+    // ordinal-aligned with the FULL play index (every original cell must occupy
+    // its row: the index sampler maps cell_id -> targets[cell_id]). Satisfied
+    // cells are retired right after setup (see below) so the samplers, active
+    // counts, and "% filled" display all skip them.
     // Optional diff range (columns 11-12, 1-indexed). Backward-compat:
     // 10-column CSVs default to no constraint.
     int diff_min = INT_MIN;
@@ -1073,6 +1098,20 @@ ForceTable *force_table_create(const char *csv_path,
 
   atomic_store_explicit(&table->active_targets, table->num_targets,
                         memory_order_relaxed);
+
+  // Retire cells that loaded already satisfied (deficit<=0) so active_targets,
+  // the by_bag/by_shape active prefixes, and the "% filled" progress line all
+  // exclude them. Mirrors the runtime deficit-hits-zero path (~L465-474). This
+  // is what lets a residual solve run off the FULL play index: satisfied cells
+  // stay in targets[] for ordinal alignment, but iteration/sampling skip them.
+  for (int i = 0; i < table->num_targets; i++) {
+    ForceTarget *t = &table->targets[i];
+    if (atomic_load_explicit(&t->deficit, memory_order_relaxed) <= 0) {
+      atomic_fetch_sub_explicit(&table->active_targets, 1, memory_order_relaxed);
+      swap_to_back_bag(table, t);
+      swap_to_back_shape(table, t);
+    }
+  }
 
   // Allocate per-cell W/L tallies for stratum-kind targets. Single packed
   // (wins:32, losses:32) atomic counter per cell — no per-bucket

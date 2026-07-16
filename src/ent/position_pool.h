@@ -13,9 +13,13 @@
 // board_cgp column of trajectory positions/bag_<NN>.csv. Blank lines and
 // lines beginning with '#' are skipped. A leading "<id>\t" is optional;
 // if present it is parsed as the position id, else the line index is used.
+// An optional trailing "\t<opp_leave>" carries the opponent's strategic leave
+// (the tiles it kept last turn); the fill preserves those tiles instead of
+// fully re-drawing the opponent. Absent -> empty leave -> caller full-swaps.
 //
 //   <cgp>
 //   <id>\t<cgp>
+//   <cgp>\t<opp_leave>
 //
 // Env var: MAGPIE_POSITION_POOL=<manifest_path>
 
@@ -35,6 +39,10 @@ const char *position_pool_get_cgp(const PositionPool *pp, int i);
 // Returns the position id for entry i (the parsed leading id, or i itself
 // when no id column was present).
 uint64_t position_pool_get_id(const PositionPool *pp, int i);
+
+// Returns the opponent's strategic leave (tiles it kept last turn) for entry i,
+// or "" when the pool line carried no leave field. Pointer owned by the pool.
+const char *position_pool_get_opp_leave(const PositionPool *pp, int i);
 
 // Opener-conditioned pool (MAGPIE_OPENER_POOL): for the opening bags, replay a
 // specific opener move to synthesize a (bag, diff) board the natural pool never

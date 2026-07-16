@@ -9,22 +9,27 @@
 
 struct PositionPool {
   char **cgps;
+  char **leaves;
   uint64_t *ids;
   int count;
   int cap;
 };
 
-static void pp_push(PositionPool *pp, uint64_t id, const char *cgp) {
+static void pp_push(PositionPool *pp, uint64_t id, const char *cgp,
+                    const char *leave) {
   if (pp->count == pp->cap) {
     pp->cap = pp->cap ? pp->cap * 2 : 1024;
     pp->cgps = realloc(pp->cgps, (size_t)pp->cap * sizeof(char *));
+    pp->leaves = realloc(pp->leaves, (size_t)pp->cap * sizeof(char *));
     pp->ids = realloc(pp->ids, (size_t)pp->cap * sizeof(uint64_t));
-    if (!pp->cgps || !pp->ids) {
+    if (!pp->cgps || !pp->leaves || !pp->ids) {
       log_fatal("position_pool: realloc failed at cap %d", pp->cap);
     }
   }
   pp->cgps[pp->count] = malloc_or_die(strlen(cgp) + 1);
   strcpy(pp->cgps[pp->count], cgp);
+  pp->leaves[pp->count] = malloc_or_die(strlen(leave) + 1);
+  strcpy(pp->leaves[pp->count], leave);
   pp->ids[pp->count] = id;
   pp->count++;
 }
@@ -37,6 +42,7 @@ PositionPool *position_pool_create(const char *path) {
   }
   PositionPool *pp = malloc_or_die(sizeof(PositionPool));
   pp->cgps = NULL;
+  pp->leaves = NULL;
   pp->ids = NULL;
   pp->count = 0;
   pp->cap = 0;
@@ -58,7 +64,7 @@ PositionPool *position_pool_create(const char *path) {
     // all digits (a CGP itself contains spaces, never a leading numeric+tab).
     char *tab = strchr(line, '\t');
     uint64_t id = line_idx;
-    const char *cgp = line;
+    char *cgp = line;
     if (tab) {
       bool numeric = tab > line;
       for (char *p = line; p < tab; p++) {
@@ -73,7 +79,16 @@ PositionPool *position_pool_create(const char *path) {
         cgp = tab + 1;
       }
     }
-    pp_push(pp, id, cgp);
+    // Optional trailing "\t<opp_leave>" after the board cgp (leave-preserving
+    // pool format). A CGP is space-separated and never contains a tab, so the
+    // first tab in `cgp` cleanly delimits the leave; absent in older pools.
+    const char *opp_leave = "";
+    char *ltab = strchr(cgp, '\t');
+    if (ltab) {
+      *ltab = '\0';
+      opp_leave = ltab + 1;
+    }
+    pp_push(pp, id, cgp, opp_leave);
     line_idx++;
   }
   free(line);
@@ -87,8 +102,10 @@ void position_pool_destroy(PositionPool *pp) {
   if (!pp) return;
   for (int i = 0; i < pp->count; i++) {
     free(pp->cgps[i]);
+    free(pp->leaves[i]);
   }
   free(pp->cgps);
+  free(pp->leaves);
   free(pp->ids);
   free(pp);
 }
@@ -100,6 +117,11 @@ int position_pool_count(const PositionPool *pp) {
 const char *position_pool_get_cgp(const PositionPool *pp, int i) {
   if (!pp || i < 0 || i >= pp->count) return NULL;
   return pp->cgps[i];
+}
+
+const char *position_pool_get_opp_leave(const PositionPool *pp, int i) {
+  if (!pp || i < 0 || i >= pp->count) return NULL;
+  return pp->leaves[i];
 }
 
 uint64_t position_pool_get_id(const PositionPool *pp, int i) {

@@ -34,6 +34,7 @@
 #include "../ent/rare_pool.h"
 #include "../ent/t6_baseline.h"
 #include "../ent/trajectory_recorder.h"
+#include "../ent/late_play_index.h"
 #include "../ent/position_pool.h"
 #include "../ent/leave_deficit.h"
 #include "../ent/inference_args.h"
@@ -291,7 +292,9 @@ typedef struct AutoplaySharedData {
   // trajectory recorder (same positions/bag_<NN>.csv format → combines with
   // natural). position_pool_next is the shared work-stealing cursor.
   PositionPool *position_pool;
-  _Atomic int position_pool_next;
+  // Shared work-stealing cursor; counts PAST the pool size when recycling
+  // (pass = idx/n, i = idx%n), so it is long to avoid int overflow.
+  _Atomic long position_pool_next;
   // Per-(bag,leave,diff-bin) deficit table gating the position-pool fan-out
   // for the L0-L4 per-leave track (NULL = no gating). Env MAGPIE_PP_LEAVE_*.
   LeaveDeficit *leave_deficit;
@@ -2615,6 +2618,77 @@ static void eb_stage_trajectory_row(GameRunner *game_runner, Game *game,
   free(cgp_str);
 }
 
+// Stage-1 late play-index build: emit one play-record row (position, injected
+// rack, bag-emptying play, and the force-cell ordinals it credits) to a
+// per-worker per-bag shard, WITHOUT solving. idx_fhs[bag] is lazily opened;
+// mirrors the per-worker shard pattern of trajectory_recorder.c:tr_get_own_file.
+// action_repr/rack/leave are comma-free (letters, digits, spaces), so the CSV
+// needs no quoting.
+static void pp_index_emit(FILE **idx_fhs, const char *dir, int worker_index,
+                          int bag, int pool_idx, uint64_t pos_id, Game *game,
+                          int on_idx, const Move *mv, int score,
+                          const char *leave, int leave_len, int eff_diff,
+                          ForceTable *ft, ForceTarget **ftgts, int nft,
+                          int sign, int band) {
+  if (bag < 0 || bag >= 16) {
+    return;
+  }
+  FILE *fh = idx_fhs[bag];
+  if (fh == NULL) {
+    char path[600];
+    snprintf(path, sizeof(path), "%s/late_play.bag_%02d.w%d.csv", dir, bag,
+             worker_index);
+    fh = fopen(path, "w");
+    if (!fh) {
+      return;
+    }
+    // sign: HastyBot playout, mover view (1=win,0=loss,2=tie).
+    // band: 1 = eff_diff inside the EG_CUTOFF contested band (needs endgame solve),
+    //       0 = deterministic (outside band; HastyBot sign is exact -> final label).
+    fprintf(fh, "pool_idx,pos_id,rack,action_kind,score,action_repr,leave,"
+                "leave_len,eff_diff,cell_ords,sign,band\n");
+    idx_fhs[bag] = fh;
+  }
+  const LetterDistribution *ld = game_get_ld(game);
+  // On-turn rack in human letters (blanks -> '?').
+  char rack_str[RACK_SIZE + 2] = {0};
+  const Rack *rk = player_get_rack(game_get_player(game, on_idx));
+  int rn = 0;
+  const uint16_t ds = rack_get_dist_size(rk);
+  for (uint16_t t = 1; t < ds && rn < RACK_SIZE; t++) {
+    const int c = rack_get_letter(rk, t);
+    for (int k = 0; k < c && rn < RACK_SIZE; k++) {
+      rack_str[rn++] = ld->ld_ml_to_hl[t][0];
+    }
+  }
+  const int nb = rack_get_letter(rk, 0);
+  for (int k = 0; k < nb && rn < RACK_SIZE; k++) {
+    rack_str[rn++] = '?';
+  }
+  rack_str[rn] = '\0';
+  const game_event_t mt = move_get_type(mv);
+  const int act_kind =
+      (mt == GAME_EVENT_PASS) ? 0 : (mt == GAME_EVENT_EXCHANGE) ? 1 : 2;
+  char act_repr[64];
+  StringBuilder *sb = string_builder_create();
+  string_builder_add_move(sb, game_get_board(game), mv, ld, false);
+  size_t al = 0;
+  char *ad = string_builder_dump(sb, &al);
+  snprintf(act_repr, sizeof(act_repr), "%s", ad ? ad : "");
+  free(ad);
+  string_builder_destroy(sb);
+  fprintf(fh, "%d,%llu,%s,%d,%d,%s,%s,%d,%d,", pool_idx,
+          (unsigned long long)pos_id, rack_str, act_kind, score, act_repr, leave,
+          leave_len, eff_diff);
+  for (int k = 0; k < nft; k++) {
+    if (k) {
+      fputc(';', fh);
+    }
+    fprintf(fh, "%d", force_table_target_index(ft, ftgts[k]));
+  }
+  fprintf(fh, ",%d,%d\n", sign, band);
+}
+
 const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
                                   GameRunner *game_runner) {
   if (game_runner_is_game_over(game_runner)) {
@@ -3054,7 +3128,12 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
               (int)s->kind != FORCE_TARGET_BAG_TILE) {
             continue;
           }
-          if (force_target_matches_bag(s->cold, player_rack, leave_len,
+          const MachineLetter bt_snap = s->cold->subleave_mls[0];
+          const int unseen_snap =
+              bag_get_letter(game_get_bag(game), bt_snap) +
+              player_get_rack(game_get_player(game, 1 - player_on_turn_index))
+                  ->array[bt_snap];
+          if (force_target_matches_bag(s->cold, unseen_snap, leave_len,
                                        ltype_snap, is_exch_snap, eff_diff_snap,
                                        ld_eb)) {
             game_runner->eb_snap_bag_targets[slot][bag_n++] = s->cold;
@@ -4276,6 +4355,46 @@ static bool swap_player_rack(Game *game, int p, const char *target_rack) {
   return false;
 }
 
+// Leave-preserving opponent redraw for the rack injection. The default oppswap
+// dumps the opponent's ENTIRE rack and redraws 7 random tiles, destroying the
+// opponent's strategic leave and inflating mover win% (task #24). This instead
+// returns only the tiles the opponent DREW last turn (current_rack - opp_leave)
+// to the bag, keeping the strategic leave on-rack; the caller then injects the
+// mover and calls draw_to_full_rack to redraw exactly that drawn count. Returns
+// true iff the leave was kept; false (rack untouched) when opp_leave is
+// empty/unparseable or not a submultiset of the current rack (bingo-out, join
+// miss, tile mismatch), so the caller falls back to a full return_rack_to_bag.
+static bool return_drawn_keep_leave(Game *game, int opp_idx,
+                                    const char *opp_leave) {
+  if (!opp_leave || !opp_leave[0]) {
+    return false;
+  }
+  const LetterDistribution *ld = game_get_ld(game);
+  Rack leave_rack;
+  rack_set_dist_size_and_reset(&leave_rack, ld_get_size(ld));
+  if (rack_set_to_string(ld, &leave_rack, opp_leave) <= 0) {
+    return false;
+  }
+  Rack *opp_rack = player_get_rack(game_get_player(game, opp_idx));
+  const uint16_t dist_size = rack_get_dist_size(opp_rack);
+  for (uint16_t ml = 0; ml < dist_size; ml++) {
+    if (rack_get_letter(&leave_rack, ml) > rack_get_letter(opp_rack, ml)) {
+      return false;  // leave is not a submultiset of the current rack
+    }
+  }
+  Bag *bag = game_get_bag(game);
+  const int draw_index = game_get_player_draw_index(game, opp_idx);
+  for (uint16_t ml = 0; ml < dist_size; ml++) {
+    const int drawn = (int)rack_get_letter(opp_rack, ml) -
+                      (int)rack_get_letter(&leave_rack, ml);
+    for (int j = 0; j < drawn; j++) {
+      rack_take_letter(opp_rack, ml);
+      bag_add_letter(bag, ml, draw_index);
+    }
+  }
+  return true;
+}
+
 // Inject a rack from a single explicit category. Returns true iff a
 // rack was successfully drawn. Used by both the legacy single-pick
 // injector and the 5-way fork at TARGET (one branch per category).
@@ -5156,7 +5275,13 @@ static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
     const int k = (int)fs->kind;
     if (k == FORCE_TARGET_BAG_TILE) {
       if (ltype < 0) ltype = (int)force_classify_leave(&leave, ld);
-      if (force_target_matches_bag(fs->cold, pre_rack, leave_len,
+      // Unseen count of the target's tile (physical bag + opp rack), matching
+      // the V-model bag_eq feature — NOT the mover's rack count.
+      const MachineLetter bt = fs->cold->subleave_mls[0];
+      const int unseen_t =
+          bag_get_letter(game_get_bag(game), bt) +
+          player_get_rack(game_get_player(game, 1 - on_idx))->array[bt];
+      if (force_target_matches_bag(fs->cold, unseen_t, leave_len,
                                    (LeaveType)ltype, is_exch, eff_diff, ld)) {
         out[n++] = fs->cold;
       }
@@ -5204,6 +5329,83 @@ static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
 // type by skipping cells already at the cap so workers keep scanning for the
 // rare big-play/bingo cells. Indexed [bag(0..15)][leave_len(0..7)].
 static _Atomic int g_spread_counts[16][8];
+// MAGPIE_PP_EG_TAIL_MIN: run each cell until BOTH its loss tail (spread<tail_lo)
+// and win tail (spread>tail_hi) have >= tail_min solved samples, then skip it —
+// so the cutoff quantiles are pinned by a guaranteed tail sample count instead
+// of a fixed total cap. Supply-limited cells (bingos) stop at pool exhaustion.
+static _Atomic int g_tail_lo[16][8];
+static _Atomic int g_tail_hi[16][8];
+// MAGPIE_PP_EG_REFINE=<eg_cutoff_table.csv>: cutoff-refinement mode. For each
+// pool position take the BEST play; if it empties the bag AND the resulting diff
+// lands within +/-refine_w of that cell's ORIGINAL cutoff, solve the endgame and
+// log (diff, win) — otherwise skip the solve entirely (the diff, known from
+// movegen, already says the outcome is decided or mid-range). Runs each window
+// until it has refine_min samples. g_refine_lo/hi = loss/win window counts.
+static _Atomic int g_refine_lo[16][8];
+static _Atomic int g_refine_hi[16][8];
+static bool load_cutoff_table(const char *path, int loss[16][8], int win[16][8]) {
+  for (int b = 0; b < 16; b++)
+    for (int l = 0; l < 8; l++) { loss[b][l] = -100000; win[b][l] = 100000; }
+  FILE *f = fopen(path, "r");
+  if (!f) return false;
+  char line[512];
+  if (!fgets(line, sizeof(line), f)) { fclose(f); return false; }  // header
+  int rows = 0;
+  while (fgets(line, sizeof(line), f)) {
+    int u, tp, ll, mv, n, l05, l1, w99, w995, mn, mx;
+    if (sscanf(line, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", &u, &tp, &ll, &mv, &n,
+               &l05, &l1, &w99, &w995, &mn, &mx) == 11 &&
+        u >= 0 && u < 16 && ll >= 0 && ll < 8) {
+      loss[u][ll] = l05;   // P0.5 loss cutoff = loss-window center
+      win[u][ll] = w995;   // P99.5 win cutoff = win-window center
+      rows++;
+    }
+  }
+  fclose(f);
+  return rows > 0;
+}
+// MAGPIE_PP_EG_REFINE_RESUME=<counts.csv (bag,leave_len,loss,win)>: prior run's
+// per-cell window counts, added to this run's so a cell already at refine_min is
+// skipped — lets a top-up pass fill only the unfilled (L0) cells, no re-solving.
+static void load_resume_base(const char *path, int base[16][8][2]) {
+  for (int b = 0; b < 16; b++)
+    for (int l = 0; l < 8; l++) { base[b][l][0] = 0; base[b][l][1] = 0; }
+  FILE *f = fopen(path, "r");
+  if (!f) return;
+  char line[256];
+  if (!fgets(line, sizeof(line), f)) { fclose(f); return; }  // header
+  int b, l, lo, hi;
+  while (fgets(line, sizeof(line), f))
+    if (sscanf(line, "%d,%d,%d,%d", &b, &l, &lo, &hi) == 4 &&
+        b >= 0 && b < 16 && l >= 0 && l < 8) {
+      base[b][l][0] = lo;
+      base[b][l][1] = hi;
+    }
+  fclose(f);
+}
+// MAGPIE_PP_EG_CUTOFF=<band.csv (bag,leave_len,lo,hi)>: production solve/HastyBot
+// router. A bag-emptying play whose eff_diff is INSIDE [lo, hi] is contested ->
+// solve the endgame; OUTSIDE (near-certain) -> hand it to HastyBot, a real
+// playout, never a sign(diff) label. Cells absent from the table default to
+// [-100000, 100000] = always solve (safe: correct labels, just slower).
+static bool load_cutoff_band(const char *path, int lo[16][8], int hi[16][8]) {
+  for (int b = 0; b < 16; b++)
+    for (int l = 0; l < 8; l++) { lo[b][l] = -100000; hi[b][l] = 100000; }
+  FILE *f = fopen(path, "r");
+  if (!f) return false;
+  char line[256];
+  if (!fgets(line, sizeof(line), f)) { fclose(f); return false; }  // header
+  int b, l, lband, hband, rows = 0;
+  while (fgets(line, sizeof(line), f))
+    if (sscanf(line, "%d,%d,%d,%d", &b, &l, &lband, &hband) == 4 && b >= 0 &&
+        b < 16 && l >= 0 && l < 8) {
+      lo[b][l] = lband;
+      hi[b][l] = hband;
+      rows++;
+    }
+  fclose(f);
+  return rows > 0;
+}
 
 // Play `dg` out to game end and report the `mover`'s outcome. For the low-bag
 // endgame phase (`endgame` true), when the bag empties solve the endgame
@@ -5229,7 +5431,10 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
           equity_to_int(player_get_score(game_get_player(dg, 1 - on)));
       const int cur_diff = on_s - op_s;  // on-turn perspective
       int opt = 0;
-      if (abs(cur_diff) < eg_diffgate) {  // diff-gate: blowouts skip the solve
+      bool solve_ok = false;
+      (void)eg_diffgate;  // blowout sign-shortcut removed: solve-vs-HastyBot is
+                          // routed upstream, so reaching here means we solve.
+      {
         // Per-length wall cap: key on the opponent rack size (1..7) — endgame
         // cost scales with the unseen tiles the search must enumerate.
         int opp_len =
@@ -5258,9 +5463,18 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
         ctimer_start(&eg_timer);
         endgame_solve(es, &ea, er, err);
         if (eg_spent) *eg_spent += ctimer_elapsed_seconds(&eg_timer);
-        if (error_stack_is_empty(err)) {
+        // Only trust the result if the solver completed >=1 depth. An
+        // interrupt before depth 1 (tight time cap) never calls
+        // endgame_results_set_best_pvline, leaving depth==-1 and a stale
+        // pv->score (uninitialized heap bytes, e.g. 741552685 = ASCII "-23,").
+        // Recording that as a spread flips the outcome (win == eff_diff > opt).
+        if (error_stack_is_empty(err) &&
+            endgame_results_get_depth(er, ENDGAME_RESULT_BEST) >= 1) {
           const PVLine *pv = endgame_results_get_pvline(er, ENDGAME_RESULT_BEST);
-          if (pv) opt = pv->score;
+          if (pv) {
+            opt = pv->score;
+            solve_ok = true;
+          }
         }
         error_stack_destroy(err);
       }
@@ -5269,7 +5483,9 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
       // solve gives the whole win% curve. INT_MIN sentinel = gate-skipped (opt
       // not from a solve).
       if (out_spread) {
-        *out_spread = (abs(cur_diff) < eg_diffgate) ? opt : -1000000;
+        // -1000000 sentinel = no solved spread (interrupted solve, no depth
+        // completed); the recorder drops these rows.
+        *out_spread = solve_ok ? opt : -1000000;
       }
       const int final_on = cur_diff + opt;  // on-turn final spread
       // Sign-correct synthetic finals (opt attributed to on-turn; recorder
@@ -5280,7 +5496,10 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
       const bool on_win = final_on > 0, on_tie = final_on == 0;
       *is_tie = on_tie;
       *is_win = (on == mover) ? on_win : (!on_win && !on_tie);
-      return true;
+      // No valid solve (interrupted before depth 1) -> not committable; discard
+      // rather than record a guessed outcome. Decided games never reach here —
+      // they are routed to the HastyBot playout below (endgame == false).
+      return solve_ok;
     }
     const Move *pm = get_top_equity_move(dg, worker_index, post_ml);
     play_move(pm, dg, NULL);
@@ -5387,6 +5606,29 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   // the best move. Composes with REROLLS (each re-rolled rack is fanned out).
   const char *fanout_env = getenv("MAGPIE_PP_FANOUT");
   const bool fanout = fanout_env && fanout_env[0] == '1';
+  // MAGPIE_PP_INDEX_BUILD=1 + MAGPIE_PP_INDEX_DIR=<dir>: Stage-1 late play-index
+  // build. Runs the fanout movegen but, for each bag-emptying play that matches
+  // a force cell, records (pool_idx, pos_id, injected rack, play, eff_diff, and
+  // the credited force-cell ordinals) to a per-worker shard and SKIPS the
+  // endgame solve — a cheap (~5 ms movegen, no ~140 ms solve) coverage pass
+  // whose output build_late_play_index.py inverts into a cell->plays index.
+  // Implies the fanout enumeration.
+  const char *pp_index_dir = getenv("MAGPIE_PP_INDEX_DIR");
+  const char *pp_index_build_env = getenv("MAGPIE_PP_INDEX_BUILD");
+  const bool index_build = pp_index_dir && pp_index_build_env &&
+                           pp_index_build_env[0] == '1';
+  // MAGPIE_PP_PAIRED_RACK=1: cell-first cataloger worklist mode. Each pool line
+  // is cgp\t<rack> (the paired rack sits in the opp_leave slot); inject THAT
+  // exact rack on THAT exact board — the planner already matched the board's
+  // spread to the rack's play so eff_diff lands in the target cell's bucket.
+  // Replaces the pass-0-natural / pass-1-cover flip; run one pass, each entry
+  // once (MAGPIE_PP_MAX_PASSES=1).
+  const char *pp_paired_env = getenv("MAGPIE_PP_PAIRED_RACK");
+  // Enabled in BOTH the index-build catalog path AND the playout path: a
+  // precomputed set-cover worklist (cgp\track position pool) injects the exact
+  // paired rack, then (with ENDGAME=0) HastyBot-plays-out + records the fanout.
+  const bool paired = pp_paired_env && pp_paired_env[0] == '1';
+  FILE *pp_index_fhs[16] = {NULL};  // per-bag lazy-opened index shards
   // MAGPIE_PP_REROLLS=K: if K>0, inject K randomly re-rolled on-turn racks per
   // position (rack injection for coverage), each a separate playout. K=0 (or
   // unset) = baseline: one playout with the loaded natural rack. The re-roll
@@ -5395,6 +5637,12 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   const char *rerolls_env = getenv("MAGPIE_PP_REROLLS");
   const int rerolls = rerolls_env ? atoi(rerolls_env) : 0;
   const int games_per_pos = rerolls > 0 ? rerolls : 1;
+  // MAGPIE_PP_MAX_PASSES=P: recycle the whole position pool up to P times
+  // (pass = cursor/n; each pass re-varies the injection via a pass-dependent
+  // seed). Default 1 = single pass. Combine with MAGPIE_FORCE_STOP_ON_EXHAUST to
+  // recycle until the force table's active target count reaches 0.
+  const char *pp_passes_env = getenv("MAGPIE_PP_MAX_PASSES");
+  const long pp_max_passes = pp_passes_env ? atol(pp_passes_env) : 1;
   // Opp-swap threshold (unseen tiles): at/below this bag the own+bag pool is
   // too small to draw an injected rack, so the opponent's rack is also
   // returned to the bag (widening the pool) and redrawn afterward. Default 14.
@@ -5456,6 +5704,51 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   // keeping).
   const char *eg_maxsolves_env = getenv("MAGPIE_PP_EG_MAX_SOLVES");
   const int eg_max_solves = eg_maxsolves_env ? atoi(eg_maxsolves_env) : 0;
+  // MAGPIE_PP_EG_EDGE_LO / _HI: edge-prefilter middle band. When HI > LO, each
+  // bag-emptying candidate first gets a CHEAP greedy-playout spread proxy; if
+  // the proxy lands in [LO, HI] the (expensive, over-sampled) endgame solve is
+  // skipped and the position is only COUNTED (edge_ncell), so the solve budget
+  // pours into the rare near-edge positions that actually set the never/always
+  // cutoffs. Set [LO, HI] just inside the tightest cell's edges (loss_cut ..
+  // win_cut) with a margin covering the greedy proxy's error. Spread log then
+  // holds only edge solves; counts.w*.csv carries N per cell for the quantile.
+  const char *eg_edge_lo_env = getenv("MAGPIE_PP_EG_EDGE_LO");
+  const char *eg_edge_hi_env = getenv("MAGPIE_PP_EG_EDGE_HI");
+  const int edge_lo = eg_edge_lo_env ? atoi(eg_edge_lo_env) : 0;
+  const int edge_hi = eg_edge_hi_env ? atoi(eg_edge_hi_env) : 0;
+  const bool edge_prefilter = (edge_hi > edge_lo);
+  // Tail-count stop: solve a cell until both tails reach tail_min, then skip it.
+  const char *eg_tail_min_env = getenv("MAGPIE_PP_EG_TAIL_MIN");
+  const int tail_min = eg_tail_min_env ? atoi(eg_tail_min_env) : 0;
+  const char *eg_tail_lo_env = getenv("MAGPIE_PP_EG_TAIL_LO");
+  const int tail_lo = eg_tail_lo_env ? atoi(eg_tail_lo_env) : 0;
+  const char *eg_tail_hi_env = getenv("MAGPIE_PP_EG_TAIL_HI");
+  const int tail_hi = eg_tail_hi_env ? atoi(eg_tail_hi_env) : 100;
+  // Cutoff-refine mode: solve the best bag-emptying play only when its diff is
+  // within +/-refine_w of the cell's original cutoff; run until refine_min.
+  const char *eg_refine_env = getenv("MAGPIE_PP_EG_REFINE");
+  const char *eg_refine_w_env = getenv("MAGPIE_PP_EG_REFINE_W");
+  const int refine_w = eg_refine_w_env ? atoi(eg_refine_w_env) : 25;
+  const char *eg_refine_min_env = getenv("MAGPIE_PP_EG_REFINE_MIN");
+  const int refine_min = eg_refine_min_env ? atoi(eg_refine_min_env) : 5000;
+  int refine_loss[16][8], refine_win[16][8];
+  const bool refine_mode =
+      eg_refine_env && eg_refine_env[0] &&
+      load_cutoff_table(eg_refine_env, refine_loss, refine_win);
+  const char *eg_refine_resume_env = getenv("MAGPIE_PP_EG_REFINE_RESUME");
+  int refine_base[16][8][2];
+  memset(refine_base, 0, sizeof(refine_base));
+  if (refine_mode && eg_refine_resume_env && eg_refine_resume_env[0])
+    load_resume_base(eg_refine_resume_env, refine_base);
+  // Production solve/HastyBot router band (see load_cutoff_band).
+  const char *eg_cutoff_env = getenv("MAGPIE_PP_EG_CUTOFF");
+  int eg_cut_lo[16][8], eg_cut_hi[16][8];
+  const bool eg_cut_loaded = eg_cutoff_env && eg_cutoff_env[0] &&
+                             load_cutoff_band(eg_cutoff_env, eg_cut_lo,
+                                              eg_cut_hi);
+  if (eg_cut_loaded && worker->worker_index == 0)
+    fprintf(stderr, "eg_cutoff: solve/HastyBot band loaded from %s\n",
+            eg_cutoff_env);
   double eg_caps[8] = {0.5, 0.5, 1.0, 1.5, 3.0, 5.0, 8.0, 12.0};
   if (eg_caps_env) {
     char buf[256];
@@ -5489,32 +5782,99 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
     snprintf(sp, sizeof(sp), "%s/spread.w%d.csv", eg_spread_log,
              worker->worker_index);
     spread_fp = fopen(sp, "w");
-    if (spread_fp) fprintf(spread_fp, "bag,leave_len,diff,spread\n");
+    if (spread_fp)
+      fprintf(spread_fp, refine_mode ? "bag,leave_len,diff,outcome,spread\n"
+                                      : "bag,leave_len,diff,spread,proxy\n");
   }
+  // Per-worker N per (bag, leave_len) for the edge-prefilter: counts every
+  // bag-emptying candidate (middle skipped + edge solved) so the tail quantile
+  // has the right denominator. Dumped to counts.w*.csv at worker exit.
+  int edge_ncell[16][8];
+  memset(edge_ncell, 0, sizeof(edge_ncell));
   // Force-table gate: when loaded (MAGPIE_FORCE_TABLE), the fan-out fills
   // per-(stratum,bucket,feature) cells to target instead of the per-leaf
   // leave_deficit. ft==NULL falls back to leave_deficit.
   ForceTable *ft = sd->force_table;
+  // MAGPIE_LATE_PLAY_INDEX_DIR: Stage-3 index-driven fill. When set (with a force
+  // table loaded), the late play index picks each (position, rack) from a still-
+  // deficient cell instead of the work-stealing cursor + cover pool, so every
+  // injected position is high-yield and the fill runs straight through (no
+  // cover-pool re-aim). The fanout+solve+gate tail below is unchanged.
+  const char *lpi_dir = getenv("MAGPIE_LATE_PLAY_INDEX_DIR");
+  LatePlayIndex *lpi =
+      (lpi_dir && lpi_dir[0] && ft) ? late_play_index_create(lpi_dir, ft) : NULL;
+  // Index-driven no-progress backstop: stop when active_targets stops dropping
+  // for a while — only unfillable cells remain (structural gaps with no indexed
+  // plays, or stratum cells that can't get both a W and an L, which otherwise
+  // loop forever and flood the recorder). Production drains to 0 and
+  // STOP_ON_EXHAUST fires first; this only guards the genuinely-stuck tail.
+  int lpi_last_active = 0x7fffffff;
+  long lpi_stuck = 0;
   for (;;) {
     if (thread_control_get_status(tc) == THREAD_CONTROL_STATUS_USER_INTERRUPT) {
       break;
     }
-    const int i = atomic_fetch_add_explicit(&sd->position_pool_next, 1,
-                                             memory_order_relaxed);
-    if (i >= n) break;
+    if (sd->stop_on_force_exhaust && ft != NULL &&
+        force_table_is_exhausted(ft)) {
+      break;  // recycle-until-exhausted: force table's active targets hit 0
+    }
+    if (lpi) {
+      const int act = force_table_active_targets(ft);
+      if (act < lpi_last_active) {
+        lpi_last_active = act;
+        lpi_stuck = 0;
+      } else if (++lpi_stuck > 10000) {
+        break;  // no drain progress -> only unfillable cells remain
+      }
+    }
+    const long idx = atomic_fetch_add_explicit(&sd->position_pool_next, 1,
+                                               memory_order_relaxed);
+    const long pass = n > 0 ? idx / n : idx;
+    if (!lpi && pass >= pp_max_passes) break;  // recycled MAGPIE_PP_MAX_PASSES times
+    int i;
+    const char *lpi_rack = NULL;
+    if (lpi) {
+      // Index-driven: sample a still-deficient cell -> a (position, rack) that
+      // produces it. Returns false once all deficit is drained -> done.
+      uint32_t lpi_pool = 0;
+      if (!late_play_index_sample(
+              lpi, (uint64_t)idx * 1000003ULL + (uint64_t)worker->worker_index,
+              &lpi_pool, &lpi_rack)) {
+        break;
+      }
+      i = (int)lpi_pool;
+    } else {
+      i = n > 0 ? (int)(idx % n) : (int)idx;
+    }
+    // Live progress at the -pf interval (like the standard autoplay progress
+    // line): elapsed seconds + force-table cells still deficient (-> 0 == done).
+    if (ft != NULL && sd->print_interval > 0 &&
+        idx % sd->print_interval == 0) {
+      const int act = force_table_active_targets(ft);
+      const int tot = force_table_num_targets(ft);
+      fprintf(stderr,
+              "force_table: %.0fs  pass %ld  pos %ld  %d/%d cells remaining "
+              "(%.1f%% filled)\n",
+              ctimer_elapsed_seconds(&sd->timer), pass, idx, act, tot,
+              tot > 0 ? 100.0 * (tot - act) / tot : 0.0);
+    }
     const char *cgp = NULL;
     uint64_t pos_id = (uint64_t)i;
+    const char *opp_leave = "";  // opponent's strategic leave (leave-preserving
+                                 // oppswap); "" -> full swap
     if (!op) {
       cgp = position_pool_get_cgp(pp, i);
       if (!cgp) continue;
       pos_id = position_pool_get_id(pp, i);
+      opp_leave = position_pool_get_opp_leave(pp, i);
     }
 
     // Per-position playout/solve budget (MAGPIE_PP_EG_MAX_SOLVES). Accumulates
     // across this position's rerolls; when it trips, break to the next position.
     int pos_playouts = 0;
     bool pos_capped = false;
-    for (int g = 0; g < games_per_pos; g++) {
+    const int idx_gpp = index_build ? 1 : games_per_pos;
+    for (int g = 0; g < idx_gpp; g++) {
       game_reset(gr->game);
       // Reset GameRunner fields normally cleared by game_runner_start, which we
       // bypass (mirrors t6_baseline_run_worker).
@@ -5540,7 +5900,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
       // refill draws are deterministic per entry.
       game_seed(gr->game,
                 (uint64_t)worker->worker_index * 0x9e3779b97f4a7c15ULL +
-                    (uint64_t)i * 1000003ULL + (uint64_t)g);
+                    (uint64_t)idx * 1000003ULL + (uint64_t)g);
       if (op) {
         // Opener-conditioned: replay the opener to synthesize the board.
         if (!pp_setup_opener(worker, gr, fan_ml, post_ml,
@@ -5566,20 +5926,42 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
       // Rack injection. With a targeted rack pool, inject a sampled pool rack
       // via swap_player_rack (retry on undrawable); else if rerolls>0, random
       // re-roll. At low bag the own+bag pool is too small to draw an arbitrary
-      // rack, so opp-swap: return the opponent's rack to the bag (widening the
-      // pool), inject, then redraw the opponent. Bag-gated so high-bag keeps
-      // the opponent natural (no synthetic-opp bias).
-      const bool do_inject = (sd->rack_pool != NULL) || (rerolls > 0);
+      // rack, so opp-swap widens the pool by returning opponent tiles to the bag
+      // (inject, then redraw the opponent). Bag-gated so high-bag keeps the
+      // opponent natural. Leave-preserving (task #24): return only the tiles the
+      // opponent DREW last turn, keeping its strategic leave; fall back to a full
+      // dump when no valid leave is available (bingo-out / join miss / old pool).
+      // Index-build flip: pass 0 uses each board's own natural rack (no
+      // injection — representative common-cell data); pass 1+ inject rare cover
+      // racks for the tail natural play can't reach. The deficient gate skips
+      // the natural-filled cells in the rare passes, so data stays natural-
+      // weighted while rare racks only credit what natural missed.
+      const bool idx_natural = index_build && !paired && (pass == 0);
+      const bool do_inject =
+          paired ? true
+                 : (idx_natural ? false
+                                : ((lpi_rack != NULL) || (sd->rack_pool != NULL) ||
+                                   (rerolls > 0)));
       const int inj_unseen =
           bag_get_letters(game_get_bag(gr->game)) +
           rack_get_total_letters(
               player_get_rack(game_get_player(gr->game, opp_idx)));
       const bool oppswap = do_inject && inj_unseen <= oppswap_maxbag;
-      if (oppswap) return_rack_to_bag(gr->game, opp_idx);
-      if (sd->rack_pool != NULL) {
+      if (oppswap &&
+          (paired || !return_drawn_keep_leave(gr->game, opp_idx, opp_leave))) {
+        return_rack_to_bag(gr->game, opp_idx);  // paired: opp_leave carries the
+                                                // mover rack -> full opp dump
+      }
+      if (paired) {
+        swap_player_rack(gr->game, on_idx, opp_leave);  // the exact paired rack
+      } else if (idx_natural) {
+        // no injection: use the board's own (natural) mover rack from the cgp
+      } else if (lpi_rack) {
+        swap_player_rack(gr->game, on_idx, lpi_rack);  // index-driven injection
+      } else if (sd->rack_pool != NULL) {
         const int rpn = position_pool_count(sd->rack_pool);
         uint64_t rseed = (uint64_t)worker->worker_index * 0x9e3779b97f4a7c15ULL +
-                         (uint64_t)i * 1000003ULL + (uint64_t)g;
+                         (uint64_t)idx * 1000003ULL + (uint64_t)g;
         for (int retry = 0; retry < 32 && rpn > 0; retry++) {
           rseed = rseed * 6364136223846793005ULL + 1442695040888963407ULL;
           const char *rk =
@@ -5592,9 +5974,11 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         return_rack_to_bag(gr->game, on_idx);
         draw_to_full_rack(gr->game, on_idx);
       }
-      if (oppswap) draw_to_full_rack(gr->game, opp_idx);  // redraw the opponent
+      if (oppswap)
+        draw_to_full_rack(gr->game, opp_idx);  // refill: the drawn count (leave
+                                               // kept) or a full random rack
 
-      if (fanout) {
+      if (fanout || index_build) {
         // Branch a playout per distinct (kind,score,leave) cell of the rack's
         // move list. Movegen once on gr->game; each branch clones the position
         // (game_duplicate), plays the move, and POSTs to end on the clone, so
@@ -5628,33 +6012,88 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         // Per-position endgame budget accumulator (wall-seconds spent solving
         // this position's branches); tightens the cap once exceeded.
         double eg_spent = 0.0;
-        for (int m = 0; m < nm && nseen < PP_FANOUT_MAX; m++) {
+        // Refine: at most one bag-emptying play per (leave_len, window-side) per
+        // position, so a blank's many bingos don't flood a cell with correlated
+        // samples. [leave_len][0=loss window, 1=win window].
+        bool ref_logged[8][2] = {{false}};
+        // Round-robin the per-position record budget across leave lengths,
+        // longest play (shortest leave) first, in force-fill mode. Movegen is
+        // equity-sorted (MOVE_SORT_EQUITY), which at bag 8 buries the low-equity
+        // long plays: the eg_max_solves budget is spent on the combinatorially
+        // abundant short plays before the rare bag-emptying long plays are ever
+        // reached (measured L2 at ~0.7% despite 100% of boards having an open
+        // 5-line and 37% of racks making a 5-word). Emitting moves in rounds of
+        // one-per-leave_len (L0..L7) gives every length equal footing so the
+        // deficient-cell gate can balance them. Other modes (spread-log/refine,
+        // which have their own per-leave_len caps) keep movegen order.
+        static _Thread_local int rr_order[PP_FANOUT_MAX];
+        int rr_n = 0;
+        if (ft != NULL && !refine_mode && spread_fp == NULL) {
+          static _Thread_local int by_len[8][PP_FANOUT_MAX];
+          int by_len_n[8] = {0};
+          int maxrep = 0;
+          for (int m = 0; m < nm; m++) {
+            const Move *bm = move_list_get_move(fan_ml, m);
+            char lfb[RACK_SIZE + 2];
+            pp_render_leave(bm, gr->game, lfb, sizeof(lfb));
+            const int ll = (int)strlen(lfb);
+            if (ll < 0 || ll > 7) continue;
+            if (by_len_n[ll] < PP_FANOUT_MAX) by_len[ll][by_len_n[ll]++] = m;
+            if (by_len_n[ll] > maxrep) maxrep = by_len_n[ll];
+          }
+          for (int r = 0; r < maxrep && rr_n < PP_FANOUT_MAX; r++)
+            for (int ll = 0; ll < 8 && rr_n < PP_FANOUT_MAX; ll++)
+              if (r < by_len_n[ll]) rr_order[rr_n++] = by_len[ll][r];
+        } else {
+          for (int m = 0; m < nm && rr_n < PP_FANOUT_MAX; m++) rr_order[rr_n++] = m;
+        }
+        // Index-build catalogs EVERY matching play, not the top-512 by equity:
+        // the play that dumps tiles for 10 pts and KEEPS ?? (or holds both X's)
+        // is buried far below the rack's bingos in equity order, yet it is the
+        // only play that produces the rare feature cell. Quality is irrelevant —
+        // the V-model learns it loses — so iterate all movegen moves and skip
+        // the per-signature dedup (the cell decrement bounds the record count).
+        // paired (set-cover worklist) iterates ALL plays like index-build, so a
+        // buried low-equity target play (keep-??, dump-for-a-cell) isn't missed.
+        const bool all_plays = index_build || paired;
+        const int pp_iter_n = all_plays ? nm : rr_n;
+        for (int oi = 0; oi < pp_iter_n &&
+                         (all_plays || nseen < PP_FANOUT_MAX); oi++) {
+          const int m = all_plays ? oi : rr_order[oi];
           const Move *mv = move_list_get_move(fan_ml, m);
           char lf[RACK_SIZE + 2];
           pp_render_leave(mv, gr->game, lf, sizeof(lf));
-          char key[24];
-          snprintf(key, sizeof(key), "%d_%d_%s", (int)move_get_type(mv),
-                   (int)equity_to_int(move_get_score(mv)), lf);
-          bool dup_key = false;
-          for (int s = 0; s < nseen; s++) {
-            if (strcmp(seen[s], key) == 0) {
-              dup_key = true;
-              break;
+          const int llen = (int)strlen(lf);
+          if (!all_plays) {
+            char key[24];
+            snprintf(key, sizeof(key), "%d_%d_%s", (int)move_get_type(mv),
+                     (int)equity_to_int(move_get_score(mv)), lf);
+            bool dup_key = false;
+            for (int s = 0; s < nseen; s++) {
+              if (strcmp(seen[s], key) == 0) {
+                dup_key = true;
+                break;
+              }
             }
+            if (dup_key) continue;
+            snprintf(seen[nseen++], sizeof(seen[0]), "%s", key);
           }
-          if (dup_key) continue;
-          snprintf(seen[nseen++], sizeof(seen[0]), "%s", key);
           // Experiment cell-cap: in spread-log mode only bag-emptying plays
           // whose (bag, leave_len) cell isn't full are solved+logged, so a large
           // natural pool yields ~equal N per play type (rare big-play cells fill
           // from the pool tail instead of being drowned by common small plays).
-          const int llen = (int)strlen(lf);
           if (spread_fp) {
             if ((7 - llen) < (gate_bag - 7)) continue;  // not bag-emptying
             if (spread_cap > 0 && gate_bag >= 0 && gate_bag < 16 && llen < 8 &&
                 atomic_load_explicit(&g_spread_counts[gate_bag][llen],
                                      memory_order_relaxed) >= spread_cap)
               continue;
+            if (tail_min > 0 && gate_bag >= 0 && gate_bag < 16 && llen < 8 &&
+                atomic_load_explicit(&g_tail_lo[gate_bag][llen],
+                                     memory_order_relaxed) >= tail_min &&
+                atomic_load_explicit(&g_tail_hi[gate_bag][llen],
+                                     memory_order_relaxed) >= tail_min)
+              continue;  // both tails have enough samples — cell done
           }
           const int msc =
               move_get_type(mv) == GAME_EVENT_TILE_PLACEMENT_MOVE
@@ -5667,10 +6106,70 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           // credited (no point spending a playout on a satisfied cell).
           ForceTarget *ftgts[PP_FT_MAX];
           int nft = 0;
-          if (ft != NULL) {
+          bool ref_lo = false, ref_hi = false;
+          if (refine_mode) {
+            // Cutoff-refine gate: solve this bag-emptying play only if its diff
+            // is within +/-refine_w of the cell's original cutoff and that window
+            // still needs samples. eff_diff is known from movegen, so every other
+            // play is skipped before any endgame solve.
+            if (gate_bag < 0 || gate_bag >= 16 || llen >= 8) continue;
+            const int lc = refine_loss[gate_bag][llen];
+            const int wc = refine_win[gate_bag][llen];
+            ref_lo = eff_diff >= lc - refine_w && eff_diff <= lc + refine_w &&
+                     refine_base[gate_bag][llen][0] +
+                             atomic_load_explicit(&g_refine_lo[gate_bag][llen],
+                                                  memory_order_relaxed) <
+                         refine_min;
+            ref_hi = eff_diff >= wc - refine_w && eff_diff <= wc + refine_w &&
+                     refine_base[gate_bag][llen][1] +
+                             atomic_load_explicit(&g_refine_hi[gate_bag][llen],
+                                                  memory_order_relaxed) <
+                         refine_min;
+            if (ref_lo && ref_logged[llen][0]) ref_lo = false;  // already have one
+            if (ref_hi && ref_logged[llen][1]) ref_hi = false;  // for this pos/side
+            if (!ref_lo && !ref_hi) continue;
+          } else if (ft != NULL) {
             nft = pp_match_force_cells(ft, gr->game, mv, on_idx, eff_diff,
                                        is_exch_mv, ftgts, PP_FT_MAX);
             if (nft == 0) continue;
+            if (index_build) {
+              // Stage-1 SIGN-AWARE catalog: HastyBot-play the position out (endgame
+              // OFF -> pure greedy playout returning a real win/loss) to record the
+              // SIGN, and tag whether eff_diff is inside the EG_CUTOFF contested band.
+              //   band=0 (outside): HastyBot sign == exact -> a FINAL label, no solve.
+              //   band=1 (inside):  contested -> the Stage-3 endgame solve refines it.
+              // Credit per-(cell,side) via force_table_credit_game so BOTH the win and
+              // loss sides of each stratum bank ~K*target candidates (load this catalog
+              // force table with per_side = K*target); features stay count-based.
+              Game *cg = game_duplicate(gr->game);
+              play_move(mv, cg, NULL);
+              bool iwin = false, itie = false;
+              int if0 = 0, if1 = 0;
+              double ispent = 0.0;
+              const bool ok = pp_playout_outcome(
+                  es, er, eg_tc, cg, post_ml, worker->worker_index, on_idx,
+                  /*endgame=*/false, eg_plies, eg_caps, eg_signstable_k, eg_diffgate,
+                  eg_tt_frac, &ispent, eg_pos_budget, eg_overflow_cap, &iwin, &itie,
+                  &if0, &if1, NULL);
+              game_destroy(cg);
+              if (ok) {
+                const int sign = itie ? 2 : (iwin ? 1 : 0);
+                int band = 0;
+                if (eg_cut_loaded && gate_bag >= 0 && gate_bag < 16 && llen < 8) {
+                  band = (eff_diff >= eg_cut_lo[gate_bag][llen] &&
+                          eff_diff <= eg_cut_hi[gate_bag][llen])
+                             ? 1
+                             : 0;
+                }
+                pp_index_emit(pp_index_fhs, pp_index_dir, worker->worker_index,
+                              gate_bag, i, pos_id, gr->game, on_idx, mv, msc, lf,
+                              llen, eff_diff, ft, ftgts, nft, sign, band);
+                for (int fk = 0; fk < nft; fk++) {
+                  force_table_credit_game(ft, ftgts[fk], eff_diff, iwin, itie);
+                }
+              }
+              continue;
+            }
           } else if (!leave_deficit_take(sd->leave_deficit, gate_bag, lf,
                                          eff_diff)) {
             continue;
@@ -5683,18 +6182,87 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           play_move(mv, dg, NULL);
           bool win = false, tie = false;
           int f0 = 0, f1 = 0, spread = -1000000;
+          int proxy = -1000000;  // greedy proxy; logged with the solved spread
+                                 // so the band offset can be calibrated.
+          // Edge-prefilter: a cheap greedy playout gives a spread proxy; if it
+          // lands in the middle band, skip the expensive solve (the over-sampled
+          // slow-to-solve middle) and only count the position. Only near-edge
+          // positions get the real solve+log, so the budget concentrates on the
+          // rare tails that set the cutoffs. proxy = eff_diff - (mover - opp)
+          // greedy final margin, same frame as the solved spread.
+          if (edge_prefilter && spread_fp && gate_bag >= 0 && gate_bag < 16 &&
+              llen < 8) {
+            edge_ncell[gate_bag][llen]++;  // every bag-emptying candidate -> N
+            Game *pg = game_duplicate(dg);
+            bool pw = false, pt = false;
+            int pf0 = 0, pf1 = 0;
+            pp_playout_outcome(es, er, eg_tc, pg, post_ml, worker->worker_index,
+                               on_idx, false, eg_plies, eg_caps, eg_signstable_k,
+                               eg_diffgate, eg_tt_frac, NULL, 0.0, 0.0, &pw, &pt,
+                               &pf0, &pf1, NULL);
+            game_destroy(pg);
+            const int pm = (on_idx == 0) ? pf0 : pf1;
+            const int po = (on_idx == 0) ? pf1 : pf0;
+            proxy = eff_diff - (pm - po);
+            if (proxy >= edge_lo && proxy <= edge_hi) {  // middle -> skip solve
+              if (traj_r && gr->trajectory_buf)
+                trajectory_game_buffer_discard(gr->trajectory_buf);
+              game_destroy(dg);
+              if (eg_max_solves > 0 && ++pos_playouts >= eg_max_solves) {
+                pos_capped = true;
+                break;
+              }
+              continue;
+            }
+          }
+          // Route solve vs HastyBot on the cell's [lo,hi] band: eff_diff inside
+          // (contested) -> solve; outside (near-certain) -> HastyBot plays it
+          // out (real outcome, never sign(diff)). No band loaded -> solve all.
+          bool eg_solve = endgame;
+          if (endgame && eg_cut_loaded && !refine_mode && gate_bag >= 0 &&
+              gate_bag < 16 && llen < 8)
+            eg_solve = (eff_diff >= eg_cut_lo[gate_bag][llen] &&
+                        eff_diff <= eg_cut_hi[gate_bag][llen]);
           const bool committable = pp_playout_outcome(
-              es, er, eg_tc, dg, post_ml, worker->worker_index, on_idx, endgame,
+              es, er, eg_tc, dg, post_ml, worker->worker_index, on_idx, eg_solve,
               eg_plies, eg_caps, eg_signstable_k, eg_diffgate, eg_tt_frac,
               &eg_spent, eg_pos_budget, eg_overflow_cap, &win, &tie, &f0, &f1,
               &spread);
           // Log the solved bag-emptying play + bump its cell counter (the
-          // bag-emptying filter + cell cap were applied pre-solve above).
+          // bag-emptying filter + cell cap were applied pre-solve above). In
+          // prefilter mode N is tracked in edge_ncell (bumped above), not here.
           if (spread_fp && spread != -1000000 && gate_bag >= 0 &&
               gate_bag < 16 && llen < 8) {
-            fprintf(spread_fp, "%d,%d,%d,%d\n", gate_bag, llen, eff_diff, spread);
-            atomic_fetch_add_explicit(&g_spread_counts[gate_bag][llen], 1,
-                                      memory_order_relaxed);
+            if (refine_mode) {
+              // Refine: log the diff + outcome (2=win/1=tie/0=loss) and bump the
+              // window that admitted this play.
+              fprintf(spread_fp, "%d,%d,%d,%d,%d\n", gate_bag, llen, eff_diff,
+                      win ? 2 : (tie ? 1 : 0), spread);
+              if (ref_lo) {
+                atomic_fetch_add_explicit(&g_refine_lo[gate_bag][llen], 1,
+                                          memory_order_relaxed);
+                ref_logged[llen][0] = true;
+              }
+              if (ref_hi) {
+                atomic_fetch_add_explicit(&g_refine_hi[gate_bag][llen], 1,
+                                          memory_order_relaxed);
+                ref_logged[llen][1] = true;
+              }
+            } else {
+              fprintf(spread_fp, "%d,%d,%d,%d,%d\n", gate_bag, llen, eff_diff,
+                      spread, proxy);
+              if (!edge_prefilter)
+                atomic_fetch_add_explicit(&g_spread_counts[gate_bag][llen], 1,
+                                          memory_order_relaxed);
+              if (tail_min > 0) {
+                if (spread < tail_lo)
+                  atomic_fetch_add_explicit(&g_tail_lo[gate_bag][llen], 1,
+                                            memory_order_relaxed);
+                else if (spread > tail_hi)
+                  atomic_fetch_add_explicit(&g_tail_hi[gate_bag][llen], 1,
+                                            memory_order_relaxed);
+              }
+            }
           }
           if (committable) {
             if (ft != NULL) {
@@ -5749,6 +6317,25 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   if (er) endgame_results_destroy(er);
   if (eg_tc) thread_control_destroy(eg_tc);
   if (spread_fp) fclose(spread_fp);
+  for (int b = 0; b < 16; b++)
+    if (pp_index_fhs[b]) fclose(pp_index_fhs[b]);  // Stage-1 index shards
+  if (lpi) late_play_index_destroy(lpi);
+  // Edge-prefilter: dump per-(bag, leave_len) candidate counts so the analysis
+  // has N (total, including skipped middle) for placing the tail quantile.
+  if (edge_prefilter && eg_spread_log && eg_spread_log[0]) {
+    char cp[512];
+    snprintf(cp, sizeof(cp), "%s/counts.w%d.csv", eg_spread_log,
+             worker->worker_index);
+    FILE *cf = fopen(cp, "w");
+    if (cf) {
+      fprintf(cf, "bag,leave_len,n\n");
+      for (int b = 0; b < 16; b++)
+        for (int l = 0; l < 8; l++)
+          if (edge_ncell[b][l])
+            fprintf(cf, "%d,%d,%d\n", b, l, edge_ncell[b][l]);
+      fclose(cf);
+    }
+  }
   move_list_destroy(post_ml);
   move_list_destroy(fan_ml);
 }
