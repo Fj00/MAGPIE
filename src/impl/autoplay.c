@@ -5407,6 +5407,24 @@ static bool load_cutoff_band(const char *path, int lo[16][8], int hi[16][8]) {
   return rows > 0;
 }
 
+// Natural-ratio crediting gate: a STRATUM cell's force-table target is a
+// distinct-POSITION count, so the same position's fanned plays must credit
+// it only once (the recorded win% would otherwise be weighted by fan count,
+// which is outcome-correlated). Returns true if this (position, cell) should
+// credit: always for feature kinds (count-based), first-play-only for
+// stratum kinds. credited[]/n track this position's already-credited stratum
+// ordinals; fail-open when full (over-credit is harmless, 256 never hits).
+static bool pp_credit_once(const ForceTable *ft, const ForceTarget *t,
+                           int *credited, int *n) {
+  if (t->kind != FORCE_TARGET_STRATUM) return true;
+  const int ord = force_table_target_index(ft, t);
+  for (int i = 0; i < *n; i++) {
+    if (credited[i] == ord) return false;
+  }
+  if (*n < 256) credited[(*n)++] = ord;
+  return true;
+}
+
 // Play `dg` out to game end and report the `mover`'s outcome. For the low-bag
 // endgame phase (`endgame` true), when the bag empties solve the endgame
 // (even-4, diff-gated) for the exact W/L instead of continuing HastyBot — the
@@ -6012,6 +6030,14 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         // Per-position endgame budget accumulator (wall-seconds spent solving
         // this position's branches); tightens the cap once exceeded.
         double eg_spent = 0.0;
+        // Natural-ratio crediting: a STRATUM cell is credited at most ONCE
+        // per position (its target is a distinct-position count). Track the
+        // stratum cell ordinals already credited by this position's fanned
+        // plays; recording stays per-play. Feature cells stay count-based.
+        // Fail-open on overflow (over-credit is harmless; 256 never hits —
+        // a position reaches < 64 distinct stratum cells).
+        int credited_cells[256];
+        int n_credited = 0;
         // Refine: at most one bag-emptying play per (leave_len, window-side) per
         // position, so a blank's many bingos don't flood a cell with correlated
         // samples. [leave_len][0=loss window, 1=win window].
@@ -6165,7 +6191,11 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
                               gate_bag, i, pos_id, gr->game, on_idx, mv, msc, lf,
                               llen, eff_diff, ft, ftgts, nft, sign, band);
                 for (int fk = 0; fk < nft; fk++) {
-                  force_table_credit_game(ft, ftgts[fk], eff_diff, iwin, itie);
+                  if (pp_credit_once(ft, ftgts[fk], credited_cells,
+                                     &n_credited)) {
+                    force_table_credit_game(ft, ftgts[fk], eff_diff, iwin,
+                                            itie);
+                  }
                 }
               }
               continue;
@@ -6267,7 +6297,10 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           if (committable) {
             if (ft != NULL) {
               for (int kk = 0; kk < nft; kk++) {
-                force_table_credit_game(ft, ftgts[kk], eff_diff, win, tie);
+                if (pp_credit_once(ft, ftgts[kk], credited_cells,
+                                   &n_credited)) {
+                  force_table_credit_game(ft, ftgts[kk], eff_diff, win, tie);
+                }
               }
             }
             if (traj_r && gr->trajectory_buf) {

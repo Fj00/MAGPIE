@@ -35,7 +35,8 @@ struct TrajectoryRecorder {
 static const char *TR_CSV_HEADER =
     "game_id,turn,bag,on_turn,p1_rack,p2_rack,p1_score,p2_score,"
     "board_cgp,action_kind,action_repr,action_size,"
-    "move_score,score_diff_pre,score_diff_post,leave,eventual_outcome\n";
+    "move_score,score_diff_pre,score_diff_post,leave,eventual_outcome,"
+    "final_spread\n";
 
 // Pre-formatted CSV line (without trailing newline / eventual_outcome)
 // + which per-bag file it routes to + which player is on turn. The
@@ -242,17 +243,21 @@ void trajectory_game_buffer_commit(
                        ? TR_OPENER_BAG
                        : bag_idx + TR_BAG_MIN;
     const int outcome = b->rows[i].on_turn ? p2_outcome : p1_outcome;
+    // Final game-end spread from the row's on_turn player's perspective
+    // (positive = that player finished ahead). Same frame as `outcome`.
+    const int spread = b->rows[i].on_turn ? (final_p2_score - final_p1_score)
+                                          : (final_p1_score - final_p2_score);
     if (r->shard) {
       // Per-worker shard file — this worker owns it, no lock needed.
       FILE *fh = tr_get_own_file(r, b, bag_idx, bag);
       fputs(b->rows[i].line, fh);
-      fprintf(fh, ",%d\n", outcome);
+      fprintf(fh, ",%d,%d\n", outcome, spread);
     } else {
       FILE *fh = tr_get_file(r, bag_idx, bag);
       if (!fh) continue;
       pthread_mutex_lock(&r->mutexes[bag_idx]);
       fputs(b->rows[i].line, fh);
-      fprintf(fh, ",%d\n", outcome);
+      fprintf(fh, ",%d,%d\n", outcome, spread);
       pthread_mutex_unlock(&r->mutexes[bag_idx]);
     }
   }

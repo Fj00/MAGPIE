@@ -503,57 +503,34 @@ void force_table_credit_game(ForceTable *table, ForceTarget *target,
     atomic_fetch_add_explicit(&g_stratum_credits_by_len[ll], 1,
                               memory_order_relaxed);
   }
-  // Ties don't change min(wins, losses). Treat them as a non-credit, but
-  // still try to drain progress so a stratum with many ties doesn't stall.
-  // A tie at the boundary (w == l) would have left min unchanged anyway, so
-  // skipping the decrement is correct for the EPV metric. We still update
-  // the tally so future games see accurate state.
+  // NATURAL-RATIO semantics: the stratum target (col 7) is a DISTINCT-
+  // POSITION count N_pos, not a per-side min(W,L) threshold. The caller
+  // (autoplay fanout) credits a cell at most ONCE PER POSITION (first
+  // matching play), so each credit here is one position → one deficit
+  // decrement, regardless of outcome. W/L/ties are never targeted
+  // separately — the recorded ratio is whatever falls out naturally.
+  // The StratumTally still accumulates W/L (tie = one of each) purely as
+  // a diagnostic of the observed ratio.
   const int idx = (int)(target - table->targets);
   StratumTally *st = (table->stratum_tallies != NULL)
                          ? table->stratum_tallies[idx]
                          : NULL;
-  if (st == NULL) {
-    atomic_fetch_add_explicit(&g_stratum_no_bump, 1, memory_order_relaxed);
-    return;
+  if (st != NULL) {
+    const bool inc_w = is_tie || is_win;
+    const bool inc_l = is_tie || !is_win;
+    uint64_t increment = 0;
+    if (inc_w) increment |= ((uint64_t)1 << 32);
+    if (inc_l) increment |= (uint64_t)1;
+    if (increment != 0) {
+      atomic_fetch_add_explicit(&st->wl, increment, memory_order_relaxed);
+    }
   }
-  // Per-side per-cell accounting: track total wins and losses. Cell drains
-  // when both totals >= target->stratum_per_side (T). Each credit
-  // increments W and/or L; the deficit decrements once per side that
-  // crosses T for the first time.
-  //   win  → W += 1
-  //   loss → L += 1
-  //   tie  → W += 1 AND L += 1 (counts as one of each)
-  const bool inc_w = is_tie || is_win;
-  const bool inc_l = is_tie || !is_win;
-  uint64_t increment = 0;
-  if (inc_w) increment |= ((uint64_t)1 << 32);
-  if (inc_l) increment |= (uint64_t)1;
-  if (increment == 0) return;  // defensive — shouldn't happen
-  const uint64_t old = atomic_fetch_add_explicit(
-      &st->wl, increment, memory_order_relaxed);
-  const uint32_t old_w = (uint32_t)(old >> 32);
-  const uint32_t old_l = (uint32_t)(old & 0xFFFFFFFFu);
-  const int32_t per_side = target->stratum_per_side;
-  // Stratum-by-length bump counters (kept for diagnostics — increment per
-  // side that crossed threshold).
   int ll = target->leave_length;
   if (ll < 0) ll = 0;
   if (ll > 5) ll = 5;
-  // Was W previously below per-side target, and this credit advanced W?
-  if (inc_w && per_side > 0 && (int32_t)old_w < per_side) {
-    atomic_fetch_add_explicit(&g_stratum_bumps_by_len[ll], 1,
-                              memory_order_relaxed);
-    force_table_decrement_target(table, target);
-  } else if (inc_w) {
-    atomic_fetch_add_explicit(&g_stratum_no_bump, 1, memory_order_relaxed);
-  }
-  if (inc_l && per_side > 0 && (int32_t)old_l < per_side) {
-    atomic_fetch_add_explicit(&g_stratum_bumps_by_len[ll], 1,
-                              memory_order_relaxed);
-    force_table_decrement_target(table, target);
-  } else if (inc_l) {
-    atomic_fetch_add_explicit(&g_stratum_no_bump, 1, memory_order_relaxed);
-  }
+  atomic_fetch_add_explicit(&g_stratum_bumps_by_len[ll], 1,
+                            memory_order_relaxed);
+  force_table_decrement_target(table, target);
 }
 
 void force_table_get_stratum_wl(const ForceTable *table, int target_idx,
@@ -812,18 +789,20 @@ ForceTable *force_table_create(const char *csv_path,
     t->subleave_count = 0;
     memset(t->subleave_mls, 0, sizeof(t->subleave_mls));
     atomic_store_explicit(&t->credit_attempts, 0, memory_order_relaxed);
-    // For STRATUM cells: reinterpret CSV `target` (column 8) as per-side
-    // threshold T. Cell needs total_wins >= T AND total_losses >= T.
-    // Initial in-memory deficit = 2T (one unit per side per event needed).
-    // Decrements 0/1/2 per credit depending on which sides were already
-    // satisfied. For non-STRATUM kinds: deficit/target semantics unchanged.
+    // For STRATUM cells: CSV `target` (col 7) is N_pos — the number of
+    // DISTINCT POSITIONS this cell still needs (natural-ratio semantics).
+    // In-memory deficit = N_pos; the fanout credits a cell once per
+    // position (first matching play), each credit decrements once. W/L
+    // are never targeted separately (that over-sampled the minority side
+    // and compressed the recorded win%). stratum_per_side is kept only
+    // as the dump/report column. For non-STRATUM kinds: unchanged.
     if (kind == FORCE_TARGET_STRATUM) {
       int64_t target_total = strtoll(fields[7], NULL, 10);
       if (target_total <= 0) target_total = deficit;
       t->stratum_per_side = (int32_t)target_total;
-      atomic_store_explicit(&t->deficit, 2 * target_total,
+      atomic_store_explicit(&t->deficit, target_total,
                             memory_order_relaxed);
-      t->original_deficit = 2 * target_total;
+      t->original_deficit = target_total;
     } else {
       t->stratum_per_side = 0;
       atomic_store_explicit(&t->deficit, deficit, memory_order_relaxed);
@@ -1183,8 +1162,8 @@ void force_table_dump_remaining(const ForceTable *table, const char *csv_path,
     }
     // current/target: reconstructed from original_deficit so each dumped
     // row is self-consistent (current + deficit == target) instead of the
-    // old 0,0 placeholders. STRATUM cells emit the per-side target T (col
-    // 7 is reload-safe — the regular loader reconstructs deficit = 2T);
+    // old 0,0 placeholders. STRATUM cells emit the position target N_pos
+    // (col 7 is reload-safe — the regular loader sets deficit = N_pos);
     // non-STRATUM emit original_deficit, with current = work done so far.
     // forced_games_estimate genuinely isn't tracked at runtime — stays 0.
     // For STRATUM cells also emit per-cell W/L tally and per-side target
@@ -1325,21 +1304,23 @@ int force_table_resume_from_dump(ForceTable *table, const char *csv_path,
       continue;
     }
     if (kind == FORCE_TARGET_STRATUM) {
-      // Replay W and L credits inline. Each side credit increments the
-      // tally and decrements deficit if the side was below per_side.
-      if (table->stratum_tallies && obs_w + obs_l > 0) {
+      // Replay progress inline. Under natural-ratio semantics each credit
+      // was one distinct POSITION (deficit = N_pos), so the replayed
+      // decrement count is credit_attempts (dump col 16), capped at the
+      // target. The W/L tally is restored purely as a diagnostic.
+      if (table->stratum_tallies && (obs_w + obs_l > 0 || nf > 16)) {
         const int idx = (int)(t - table->targets);
         StratumTally *st = table->stratum_tallies[idx];
         if (st) {
           uint64_t packed = ((obs_w & 0xFFFFFFFFULL) << 32) |
                             (obs_l & 0xFFFFFFFFULL);
           atomic_store_explicit(&st->wl, packed, memory_order_relaxed);
-          // Adjust deficit: subtract one per side-credit that lands
-          // below per_side. Same logic as credit_game but in bulk.
           int per_side = t->stratum_per_side;
-          int eff_w = (int)(obs_w < (uint64_t)per_side ? obs_w : per_side);
-          int eff_l = (int)(obs_l < (uint64_t)per_side ? obs_l : per_side);
-          int decrements = eff_w + eff_l;
+          uint64_t attempts =
+              (nf > 16) ? strtoull(fields[16], NULL, 10) : (obs_w + obs_l);
+          int decrements =
+              (int)(attempts < (uint64_t)per_side ? attempts
+                                                  : (uint64_t)per_side);
           if (decrements > 0) {
             int64_t cur = atomic_load_explicit(&t->deficit,
                                                 memory_order_relaxed);
