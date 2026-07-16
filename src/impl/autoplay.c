@@ -6100,8 +6100,12 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         // deficient plays are still kept (count-based coverage). index_build
         // (catalog) still sees ALL plays -- it needs full sign/supply coverage.
         static _Thread_local bool pp_keep[PP_FANOUT_MAX];
+        // Applies to BOTH the paired solve path (declusters the base rate) and
+        // the index_build catalog (the scout only needs one HastyBot sign per
+        // cell per position for p-hat + supply; ~9x fewer playouts + a ~9x
+        // smaller on-disk catalog, so the full natural pool is affordable).
         const bool pp_fan1 =
-            paired && !index_build && ft != NULL && !refine_mode &&
+            (paired || index_build) && ft != NULL && !refine_mode &&
             spread_fp == NULL;
         if (pp_fan1) {
           const int nlim = nm < PP_FANOUT_MAX ? nm : PP_FANOUT_MAX;
