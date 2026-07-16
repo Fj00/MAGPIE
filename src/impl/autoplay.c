@@ -5414,6 +5414,14 @@ static bool load_cutoff_band(const char *path, int lo[16][8], int hi[16][8]) {
 // credit: always for feature kinds (count-based), first-play-only for
 // stratum kinds. credited[]/n track this position's already-credited stratum
 // ordinals; fail-open when full (over-credit is harmless, 256 never hits).
+// Deterministic pseudo-random hash for outcome-blind play selection (fan-to-1).
+static inline uint64_t pp_splitmix64(uint64_t x) {
+  x += 0x9E3779B97F4A7C15ULL;
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+  return x ^ (x >> 31);
+}
+
 static bool pp_credit_once(const ForceTable *ft, const ForceTarget *t,
                            int *credited, int *n) {
   if (t->kind != FORCE_TARGET_STRATUM) return true;
@@ -6083,9 +6091,77 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         // buried low-equity target play (keep-??, dump-for-a-cell) isn't missed.
         const bool all_plays = index_build || paired;
         const int pp_iter_n = all_plays ? nm : rr_n;
+        // fan-to-1-random (paired SOLVE path only): pre-pick ONE play per still-
+        // deficient stratum cell, chosen by play-identity hash (blind to
+        // outcome). This declusters the base rate (one representative play per
+        // position per cell -> the CI counts distinct positions) and cuts
+        // endgame solves ~5x vs solving every fanned play. Random, not fanout/
+        // equity order, so it doesn't skew toward best-plays. Feature-only
+        // deficient plays are still kept (count-based coverage). index_build
+        // (catalog) still sees ALL plays -- it needs full sign/supply coverage.
+        static _Thread_local bool pp_keep[PP_FANOUT_MAX];
+        const bool pp_fan1 =
+            paired && !index_build && ft != NULL && !refine_mode &&
+            spread_fp == NULL;
+        if (pp_fan1) {
+          const int nlim = nm < PP_FANOUT_MAX ? nm : PP_FANOUT_MAX;
+          for (int mm = 0; mm < nlim; mm++) pp_keep[mm] = false;
+          int rc_ord[PP_FANOUT_MAX];
+          uint64_t rc_h[PP_FANOUT_MAX];
+          int rc_m[PP_FANOUT_MAX];
+          int rc_n = 0;
+          for (int mm = 0; mm < nlim; mm++) {
+            const Move *pv = move_list_get_move(fan_ml, mm);
+            char plf[RACK_SIZE + 2];
+            pp_render_leave(pv, gr->game, plf, sizeof(plf));
+            if ((int)strlen(plf) > 7) continue;
+            const int pmsc = move_get_type(pv) == GAME_EVENT_TILE_PLACEMENT_MOVE
+                                 ? equity_to_int(move_get_score(pv))
+                                 : 0;
+            const int ped = pre_diff + pmsc;
+            const bool pex = move_get_type(pv) == GAME_EVENT_EXCHANGE;
+            ForceTarget *mt[PP_FT_MAX];
+            const int mn =
+                pp_match_force_cells(ft, gr->game, pv, on_idx, ped, pex, mt,
+                                     PP_FT_MAX);
+            if (mn == 0) continue;
+            int sord = -1;
+            bool feat = false;
+            for (int k = 0; k < mn; k++) {
+              if (mt[k]->kind == FORCE_TARGET_STRATUM)
+                sord = force_table_target_index(ft, mt[k]);
+              else
+                feat = true;
+            }
+            if (sord < 0) {
+              if (feat) pp_keep[mm] = true;  // feature-only: count-based coverage
+              continue;
+            }
+            const uint64_t h = pp_splitmix64(
+                ((uint64_t)pos_id << 20) ^ ((uint64_t)(uint32_t)sord << 1) ^
+                (uint64_t)(uint32_t)mm);
+            int slot = -1;
+            for (int r = 0; r < rc_n; r++)
+              if (rc_ord[r] == sord) {
+                slot = r;
+                break;
+              }
+            if (slot < 0) {
+              rc_ord[rc_n] = sord;
+              rc_h[rc_n] = h;
+              rc_m[rc_n] = mm;
+              rc_n++;
+            } else if (h < rc_h[slot]) {
+              rc_h[slot] = h;
+              rc_m[slot] = mm;
+            }
+          }
+          for (int r = 0; r < rc_n; r++) pp_keep[rc_m[r]] = true;
+        }
         for (int oi = 0; oi < pp_iter_n &&
                          (all_plays || nseen < PP_FANOUT_MAX); oi++) {
           const int m = all_plays ? oi : rr_order[oi];
+          if (pp_fan1 && (m >= PP_FANOUT_MAX || !pp_keep[m])) continue;
           const Move *mv = move_list_get_move(fan_ml, m);
           char lf[RACK_SIZE + 2];
           pp_render_leave(mv, gr->game, lf, sizeof(lf));
