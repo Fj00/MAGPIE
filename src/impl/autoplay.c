@@ -6130,17 +6130,16 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
                                      PP_FT_MAX);
             if (mn == 0) continue;
             int sord = -1;
-            bool feat = false;
             for (int k = 0; k < mn; k++) {
               if (mt[k]->kind == FORCE_TARGET_STRATUM)
                 sord = force_table_target_index(ft, mt[k]);
-              else
-                feat = true;
             }
-            if (sord < 0) {
-              if (feat) pp_keep[mm] = true;  // feature-only: count-based coverage
-              continue;
-            }
+            // Only DEFICIENT stratum cells are returned by the matcher, so once
+            // a cell hits target its plays get sord<0. Drop them entirely (do
+            // NOT keep for a deficient feature): keeping them piled multiple
+            // plays into an already-satisfied cell (39.7% duplicate rows on
+            // bag 8). Features get byproduct coverage from the stratum picks.
+            if (sord < 0) continue;
             const uint64_t h = pp_splitmix64(
                 ((uint64_t)pos_id << 20) ^ ((uint64_t)(uint32_t)sord << 1) ^
                 (uint64_t)(uint32_t)mm);
