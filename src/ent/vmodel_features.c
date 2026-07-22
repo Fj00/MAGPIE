@@ -111,11 +111,35 @@ static int append_feat(float *buf, int cap, int idx, float v) {
     return idx + 1;
 }
 
+// Fill `unseen[27]` (and its total) for the on-turn player. With `unseen_vec`
+// (endgame) copy it directly; otherwise derive `TILE_BAG - own_rack` (opener,
+// bag==93 only). Returns false if derivation is requested at bag!=93 (unsafe).
+static bool fill_unseen(const int *unseen_vec, const uint8_t *rack_counts,
+                        int bag, const char *key, int *unseen, int *total) {
+    int t = 0;
+    if (unseen_vec) {
+        for (t = 0; t < 27; t++) unseen[t] = unseen_vec[t];
+    } else {
+        if (bag != 93) {
+            log_warn("vmodel_features: unseen derivation only correct at "
+                     "bag=93; got bag=%d (stratum %s) with no unseen_vec",
+                     bag, key);
+            return false;
+        }
+        for (t = 0; t < 27; t++) unseen[t] = TILE_BAG[t] - rack_counts[t];
+    }
+    int tot = 0;
+    for (t = 0; t < 27; t++) tot += unseen[t];
+    *total = tot;
+    return true;
+}
+
 int vmodel_extract_features(float *buf, int cap,
                              const VStratum *s, const VBucket *b,
                              const uint8_t *rack_indices, int rack_len,
                              const uint8_t *leave_indices, int leave_len,
                              int diff, int bag, int turn,
+                             const int *unseen_vec,
                              const StaticLeaves *sl) {
     bool tzs = terminal_zero_score(turn, s->kind);
     int wi = 0;
@@ -140,21 +164,17 @@ int vmodel_extract_features(float *buf, int cap,
             if (wi < 0) return -1;
         }
         if (s->kind == 1) {
-            if (bag != 93) {
-                log_warn("vmodel_features: unseen derivation only correct "
-                         "at bag=93; got bag=%d (stratum %s)", bag, s->key);
-                return -1;
-            }
             uint8_t rack_counts[27];
             count_tiles(rack_indices, rack_len, rack_counts);
             int unseen_total = 0;
             int unseen[27];
+            if (!fill_unseen(unseen_vec, rack_counts, bag, s->key,
+                             unseen, &unseen_total)) {
+                return -1;
+            }
             double weighted = 0.0;
             for (int t = 0; t < 27; t++) {
-                int u = TILE_BAG[t] - rack_counts[t];
-                unseen[t] = u;
-                unseen_total += u;
-                weighted += (double)u * (double)TILE_VALUE[t];
+                weighted += (double)unseen[t] * (double)TILE_VALUE[t];
             }
             double d = 0.0;
             int tp = tiles_played_count(unseen_total, leave_len);
@@ -229,19 +249,13 @@ int vmodel_extract_features(float *buf, int cap,
     // bag_exp: skip for K0_L7 (pass — tiles_played=0).
     bool emit_bag_block = !(s->kind == 0 && s->leave_length == VMODEL_RACK_SIZE);
     if (emit_bag_block) {
-        if (bag != 93) {
-            log_warn("vmodel_features: unseen derivation only correct "
-                     "at bag=93; got bag=%d (stratum %s)", bag, s->key);
-            return -1;
-        }
         uint8_t rack_counts[27];
         count_tiles(rack_indices, rack_len, rack_counts);
         int unseen[27];
         int unseen_total = 0;
-        for (int t = 0; t < 27; t++) {
-            int u = TILE_BAG[t] - rack_counts[t];
-            unseen[t] = u;
-            unseen_total += u;
+        if (!fill_unseen(unseen_vec, rack_counts, bag, s->key,
+                         unseen, &unseen_total)) {
+            return -1;
         }
         int tp = (unseen_total > 0) ? tiles_played_count(unseen_total, s->leave_length) : 0;
         // bag_exp for tiles NOT in bag_indicators.
@@ -259,11 +273,11 @@ int vmodel_extract_features(float *buf, int cap,
         for (int i = 0; i < b->n_bag; i++) {
             uint8_t t = b->bag_tiles[i];
             int8_t c = b->bag_counts[i];
-            // Indicator fires when bag has exactly c of tile t, i.e. rack
-            // has (TILE_BAG[t] - c) of tile t.
-            int rack_target = TILE_BAG[t] - c;
+            // Indicator fires when the UNSEEN pile has exactly c of tile t.
+            // (At the opener unseen[t] == TILE_BAG[t] - rack[t]; in the endgame
+            // it is bag+opp from unseen_vec — fill_unseen handled the source.)
             wi = append_feat(buf, cap, wi,
-                              (rack_counts[t] == rack_target) ? 1.0f : 0.0f);
+                              (unseen[t] == (int)c) ? 1.0f : 0.0f);
             if (wi < 0) return -1;
         }
     }
@@ -297,6 +311,7 @@ float vmodel_predict(const VModel *m,
                       const uint8_t *rack_indices, int rack_len,
                       const uint8_t *leave_indices, int leave_len,
                       int kind, int diff, int turn,
+                      const int *unseen_vec,
                       const StaticLeaves *sl) {
     // The `turn` arg controls the terminal-zero-score gate (which
     // collapses K1_L3..6 to "all" and switches K0/K1 to the compact pts
@@ -318,7 +333,7 @@ float vmodel_predict(const VModel *m,
     int n = vmodel_extract_features(feats, (int)(sizeof(feats)/sizeof(feats[0])),
                                      s, b, rack_indices, rack_len,
                                      leave_indices, leave_len,
-                                     diff, m->bag, turn, sl);
+                                     diff, m->bag, turn, unseen_vec, sl);
     if (n < 0) return -1.0f;
     double z = b->intercept;
     for (int i = 0; i < n; i++) {

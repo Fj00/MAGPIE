@@ -2389,6 +2389,7 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
           rack_idx, rack_len,
           leave_idx, leave_len,
           kind, diff, game_turn,
+          NULL,  // opener (bag==93): derive unseen from own rack
           shared->vmodel_static_leaves);
       vmcache_put(cache, (uint8_t)kind, cleave, cleave_len, diff, p);
       local_misses++;
@@ -2422,6 +2423,7 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
           model, rack_idx, rack_len,
           rack_idx, rack_len,  // pass: leave == rack
           0, pre_diff, game_turn,
+          NULL,  // opener (bag==93)
           shared->vmodel_static_leaves);
       vmcache_put(cache, 0, pass_cleave, pass_clen, pre_diff, p_pass);
       local_misses++;
