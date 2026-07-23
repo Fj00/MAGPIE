@@ -5410,6 +5410,10 @@ static void pp_render_leave(const Move *move, const Game *game, char *out,
 }
 
 #define PP_FANOUT_MAX 512  // max distinct (kind,score,leave) branches per rack
+// MAGPIE_PP_FEATURE_FANOUT scans the WHOLE equity-sorted move list (fan_ml is
+// created at 8192), not just the top-512: a rare-leave play (keep-??, keep BB)
+// is low-equity and buried far below the rack's bingos, so the 512 cap hides it.
+#define PP_FEAT_MAX 8192
 #define PP_FT_MAX 32       // max force cells credited per fan-out branch
 
 // Match a fan-out move's force-table cells: leave cells (stratum/tile/pair via
@@ -6282,7 +6286,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         // equity order, so it doesn't skew toward best-plays. Feature-only
         // deficient plays are still kept (count-based coverage). index_build
         // (catalog) still sees ALL plays -- it needs full sign/supply coverage.
-        static _Thread_local bool pp_keep[PP_FANOUT_MAX];
+        static _Thread_local bool pp_keep[PP_FEAT_MAX];
         // Applies to BOTH the paired solve path (declusters the base rate) and
         // the index_build catalog (the scout only needs one HastyBot sign per
         // cell per position for p-hat + supply; ~9x fewer playouts + a ~9x
@@ -6298,11 +6302,16 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           pp_feat_fan_cache = getenv("MAGPIE_PP_FEATURE_FANOUT") ? 1 : 0;
         const bool pp_feat_fan = pp_fan1 && pp_feat_fan_cache;
         if (pp_fan1) {
-          const int nlim = nm < PP_FANOUT_MAX ? nm : PP_FANOUT_MAX;
+          // Feature-fanout scans the full move list (rare keep-?? / keep-BB
+          // plays are buried far below the top-512 by equity); the stratum-only
+          // path keeps the 512 cap (a representative play is all declustering
+          // needs, and the deep tail would only add solves).
+          const int fcap = pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX;
+          const int nlim = nm < fcap ? nm : fcap;
           for (int mm = 0; mm < nlim; mm++) pp_keep[mm] = false;
-          int rc_ord[PP_FANOUT_MAX];
-          uint64_t rc_h[PP_FANOUT_MAX];
-          int rc_m[PP_FANOUT_MAX];
+          int rc_ord[PP_FEAT_MAX];
+          uint64_t rc_h[PP_FEAT_MAX];
+          int rc_m[PP_FEAT_MAX];
           int rc_n = 0;
           for (int mm = 0; mm < nlim; mm++) {
             const Move *pv = move_list_get_move(fan_ml, mm);
@@ -6352,7 +6361,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
                   break;
                 }
               if (slot < 0) {
-                if (rc_n < PP_FANOUT_MAX) {
+                if (rc_n < PP_FEAT_MAX) {
                   rc_ord[rc_n] = cord;
                   rc_h[rc_n] = h;
                   rc_m[rc_n] = mm;
@@ -6369,7 +6378,9 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         for (int oi = 0; oi < pp_iter_n &&
                          (all_plays || nseen < PP_FANOUT_MAX); oi++) {
           const int m = all_plays ? oi : rr_order[oi];
-          if (pp_fan1 && (m >= PP_FANOUT_MAX || !pp_keep[m])) continue;
+          if (pp_fan1 && (m >= (pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX) ||
+                          !pp_keep[m]))
+            continue;
           const Move *mv = move_list_get_move(fan_ml, m);
           char lf[RACK_SIZE + 2];
           pp_render_leave(mv, gr->game, lf, sizeof(lf));
