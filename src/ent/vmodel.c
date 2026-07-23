@@ -160,6 +160,13 @@ static bool parse_header(FILE *f, VModel *m) {
 
     if (!read_line(buf, sizeof(buf), f)) return false;
     p = buf;
+    // Optional L34ENUM (L3/L4 representation: 1=enumerated, 0=factored). We do
+    // not branch on it — the C extractor emits factored L3/L4, which matches the
+    // endgame (bag<15) models. Consume it if present; NSTRATA follows.
+    if (strncmp(p, "L34ENUM", 7) == 0) {
+        if (!read_line(buf, sizeof(buf), f)) return false;
+        p = buf;
+    }
     if (!expect_token(&p, "NSTRATA") || !parse_int(&p, &m->n_strata)) return false;
     return true;
 }
@@ -328,6 +335,9 @@ static bool parse_stratum(FILE *f, VStratum *s) {
                     b->bag_tiles[j] = (uint8_t)idx;
                     b->bag_counts[j] = (int8_t)cnt;
                 }
+            } else if (strcmp(tok, "SI") == 0 || strcmp(tok, "SP") == 0) {
+                // Spread head (E[final_spread] tiebreaker) — not used by
+                // inference; the whole line is already read, so skip it.
             } else {
                 // Not an indicator record — rewind and let the outer loop
                 // pick it up. Use fseek with the saved mark.
