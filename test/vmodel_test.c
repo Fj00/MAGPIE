@@ -203,7 +203,7 @@ void test_vmodel_verify(void) {
         }
         float c_win = vmodel_predict(m, rack_idx, rack_len,
                                       leave_idx, leave_len,
-                                      kind, diff, turn, sl);
+                                      kind, diff, turn, NULL, sl);
         if (c_win < 0.0f) {
             printf("test_vmodel_verify: predict failed line %d "
                    "rack=%s leave=%s kind=%d diff=%d\n",

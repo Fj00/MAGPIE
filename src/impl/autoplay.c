@@ -65,6 +65,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <dirent.h>
 #include <stdlib.h>
 
 // Diagnostic counter — incremented once per eb_emit_leaf call that gets
@@ -142,6 +143,10 @@ typedef struct LeavegenSharedData {
   AutoplayResults *primary_autoplay_results;
   AutoplayResults **autoplay_results_list;
 } LeavegenSharedData;
+
+// Bag-keyed V-model registry size: index by bag (== unseen count, physical bag
+// + RACK_SIZE). Endgame chain uses 8..91; slot 93 is the opener. 94 covers all.
+#define VMODEL_MAX_BAG 94
 
 typedef struct AutoplaySharedData {
   int num_threads;
@@ -272,6 +277,14 @@ typedef struct AutoplaySharedData {
   VModel *vmodels[7];   // indexed by game turn (1..6); slot 0 unused
   StaticLeaves *vmodel_static_leaves;
   int vmodel_any_loaded;
+  // Endgame chain: per-bag (== unseen-count) models, indexed by BAG (8..91).
+  // MAGPIE_VMODEL_BAGS=<dir> loads every v_model_bag<NN>.vmt in the dir; each
+  // declares its bag (m->bag) and goes into the matching slot. The endgame
+  // pre-endgame playout picks moves with the model for the current unseen
+  // count (see pp_playout_outcome), replacing HastyBot below the bag it's
+  // filling — the T2-T6-style chain, one rung at a time.
+  VModel *vmodels_by_bag[VMODEL_MAX_BAG];
+  int vmodel_bags_any_loaded;
   // Precomputed rack -> chosen move lookup tables, one slot per game
   // turn. Each .picks file declares its training turn; the loader
   // places it in the matching slot. When set, `try_vmodel_picks_pick`
@@ -1063,6 +1076,63 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
     free(combined);
   }
 
+  // Bag-keyed V-model registry (endgame chain). MAGPIE_VMODEL_BAGS=<dir> loads
+  // every *.vmt in the dir into vmodels_by_bag[m->bag]. The pre-endgame playout
+  // (pp_playout_outcome) then picks moves with the model for the CURRENT unseen
+  // count, replacing HastyBot below the bag being filled.
+  for (int i = 0; i < VMODEL_MAX_BAG; i++) shared_data->vmodels_by_bag[i] = NULL;
+  shared_data->vmodel_bags_any_loaded = 0;
+  {
+    const char *bags_dir = getenv("MAGPIE_VMODEL_BAGS");
+    if (bags_dir && bags_dir[0] != '\0') {
+      if (!shared_data->vmodel_static_leaves) {
+        const char *l6 = getenv("MAGPIE_VMODEL_LEAVES_6");
+        const char *l7 = getenv("MAGPIE_VMODEL_LEAVES_7");
+        shared_data->vmodel_static_leaves = static_leaves_create(l6, l7);
+        if (!shared_data->vmodel_static_leaves) {
+          log_fatal("vmodel: static_leaves_create failed for MAGPIE_VMODEL_BAGS "
+                    "(leaves_6=%s leaves_7=%s)", l6 ? l6 : "(null)",
+                    l7 ? l7 : "(null)");
+        }
+      }
+      DIR *d = opendir(bags_dir);
+      if (!d) log_fatal("vmodel: cannot open MAGPIE_VMODEL_BAGS dir %s", bags_dir);
+      struct dirent *de;
+      int loaded = 0;
+      while ((de = readdir(d)) != NULL) {
+        const char *nm = de->d_name;
+        size_t nl = strlen(nm);
+        if (nl < 5 || strcmp(nm + nl - 4, ".vmt") != 0) continue;
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", bags_dir, nm);
+        VModel *m = vmodel_create(path);
+        if (!m) log_fatal("vmodel: failed to load %s", path);
+        if (m->bag < 0 || m->bag >= VMODEL_MAX_BAG) {
+          log_fatal("vmodel: model %s has bag %d out of range [0,%d)", path,
+                    m->bag, VMODEL_MAX_BAG);
+        }
+        if (shared_data->vmodels_by_bag[m->bag]) {
+          log_fatal("vmodel: duplicate model for bag %d (existing + %s)",
+                    m->bag, path);
+        }
+        shared_data->vmodels_by_bag[m->bag] = m;
+        shared_data->vmodel_bags_any_loaded = 1;
+        loaded++;
+      }
+      closedir(d);
+      // Banner: which bags are loaded (mis-config visibility).
+      char banner[512];
+      int bi = snprintf(banner, sizeof(banner), "vmodel: MAGPIE_VMODEL_BAGS "
+                        "loaded %d model(s), bags:", loaded);
+      for (int b = 0; b < VMODEL_MAX_BAG && bi < (int)sizeof(banner) - 8; b++) {
+        if (shared_data->vmodels_by_bag[b]) {
+          bi += snprintf(banner + bi, sizeof(banner) - bi, " %d", b);
+        }
+      }
+      fprintf(stderr, "%s\n", banner);
+    }
+  }
+
   // V-model picks (precomputed rack→move lookup tables). Same env-var
   // shape as MAGPIE_VMODEL_PATHS: colon-separated .picks files. Each
   // file declares its training turn in its header; loader places it
@@ -1215,6 +1285,8 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
     vmodel_log_stats();
   }
   for (int i = 0; i < 7; i++) vmodel_destroy(shared_data->vmodels[i]);
+  for (int i = 0; i < VMODEL_MAX_BAG; i++)
+    vmodel_destroy(shared_data->vmodels_by_bag[i]);
   for (int i = 0; i < 7; i++) vmodel_picks_destroy(shared_data->vmodel_picks[i]);
   static_leaves_destroy(shared_data->vmodel_static_leaves);
   free(shared_data);
@@ -2519,6 +2591,84 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
     atomic_fetch_add_explicit(&g_vmodel_no_pick, 1, memory_order_relaxed);
   }
   return best_move;
+}
+
+// Endgame chain pick: at a PRE-endgame rollout state (bag not yet empty), score
+// every legal move with the V-model for the CURRENT unseen bag and return the
+// win%-argmax — replacing HastyBot's equity pick. Unlike vmodel_pick_top_move
+// this works on a NON-empty board: it selects the model by unseen count (==
+// physical bag + RACK_SIZE, the force-table convention) and feeds the true
+// unseen vector (physical bag + opponent rack). Returns NULL if no model is
+// loaded for this unseen count (caller keeps HastyBot). Pass is not scored
+// (matches get_top_equity_move's movegen candidate set); a refinement.
+static const Move *vmodel_endgame_pick_move(Game *game,
+                                            VModel *const *vmodels_by_bag,
+                                            const StaticLeaves *sl,
+                                            int worker_index, MoveList *ml) {
+  const Bag *bag = game_get_bag(game);
+  const int bag_key = bag_get_letters(bag) + (RACK_SIZE);
+  if (bag_key < 0 || bag_key >= VMODEL_MAX_BAG) return NULL;
+  const VModel *model = vmodels_by_bag[bag_key];
+  if (!model) return NULL;
+
+  const int on = game_get_player_on_turn_index(game);
+  Rack *player_rack = player_get_rack(game_get_player(game, on));
+  // Unseen (on-turn perspective) = physical bag + opponent rack.
+  int unseen[27] = {0};
+  int ds = rack_get_dist_size(player_rack);
+  if (ds > 27) ds = 27;
+  for (int t = 0; t < ds; t++) unseen[t] += bag_get_letter(bag, t);
+  rack_increment_unseen_count(player_get_rack(game_get_player(game, 1 - on)),
+                              unseen);
+
+  const MoveGenArgs gen_args = {
+      .game = game, .move_list = ml, .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_EQUITY, .override_kwg = NULL,
+      .thread_index = worker_index, .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
+      .tiles_played_bv = NULL, .initial_tiles_bv = 0};
+  generate_moves(&gen_args);
+  move_list_sort_moves(ml);
+  const int n_moves = move_list_get_count(ml);
+  if (n_moves == 0) return NULL;
+
+  uint8_t rack_idx[16];
+  int rack_len = vmodel_extract_rack_indices(player_rack, rack_idx, 16);
+  const int pre_diff =
+      equity_to_int(player_get_score(game_get_player(game, on))) -
+      equity_to_int(player_get_score(game_get_player(game, 1 - on)));
+
+  Move *best_move = NULL;
+  float best_win = -1.0f;
+  Rack leave_rack;
+  rack_set_dist_size(&leave_rack, rack_get_dist_size(player_rack));
+
+  for (int i = 0; i < n_moves; i++) {
+    Move *m = move_list_get_move(ml, i);
+    int kind;
+    switch (move_get_type(m)) {
+      case GAME_EVENT_PASS:                kind = 0; break;
+      case GAME_EVENT_EXCHANGE:            kind = 1; break;
+      case GAME_EVENT_TILE_PLACEMENT_MOVE: kind = 2; break;
+      default: continue;
+    }
+    rack_reset(&leave_rack);
+    get_leave_for_move(m, game, &leave_rack);
+    uint8_t leave_idx[16];
+    int leave_len = vmodel_extract_rack_indices(&leave_rack, leave_idx, 16);
+    int diff = pre_diff;
+    if (kind == 2) diff += equity_to_int(move_get_score(m));
+    float p = vmodel_predict(model, rack_idx, rack_len, leave_idx, leave_len,
+                             kind, diff, model->turn, unseen, sl);
+    if (p < 0.0f) continue;  // unscored (stratum/bucket missing)
+    const float p_round = roundf(p * 10000.0f) / 10000.0f;
+    if (p_round > best_win) {  // strict > keeps equity-sorted tie order
+      best_win = p_round;
+      best_move = m;
+    }
+  }
+  return best_move;  // NULL -> nothing scoreable -> caller keeps HastyBot
 }
 
 // Returns the played move
@@ -5450,7 +5600,9 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
                                double eg_tt_frac,
                                double *eg_spent, double eg_pos_budget,
                                double eg_overflow_cap, bool *is_win,
-                               bool *is_tie, int *f0, int *f1, int *out_spread) {
+                               bool *is_tie, int *f0, int *f1, int *out_spread,
+                               VModel *const *vmodels_by_bag,
+                               const StaticLeaves *vmodel_sl) {
   while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
     if (endgame && bag_get_letters(game_get_bag(dg)) == 0) {
       const int on = game_get_player_on_turn_index(dg);
@@ -5529,7 +5681,16 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
       // they are routed to the HastyBot playout below (endgame == false).
       return solve_ok;
     }
-    const Move *pm = get_top_equity_move(dg, worker_index, post_ml);
+    // Pre-endgame move: use the V-model for the current unseen bag if one is
+    // loaded (the chain — replaces HastyBot below the bag being filled); else
+    // HastyBot equity. Only fires while the bag has tiles; the 0-in-bag tail is
+    // exact-solved above.
+    const Move *pm = NULL;
+    if (vmodels_by_bag) {
+      pm = vmodel_endgame_pick_move(dg, vmodels_by_bag, vmodel_sl,
+                                    worker_index, post_ml);
+    }
+    if (!pm) pm = get_top_equity_move(dg, worker_index, post_ml);
     play_move(pm, dg, NULL);
   }
   if (game_get_game_end_reason(dg) != GAME_END_REASON_STANDARD) return false;
@@ -6257,7 +6418,9 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
                   es, er, eg_tc, cg, post_ml, worker->worker_index, on_idx,
                   /*endgame=*/false, eg_plies, eg_caps, eg_signstable_k, eg_diffgate,
                   eg_tt_frac, &ispent, eg_pos_budget, eg_overflow_cap, &iwin, &itie,
-                  &if0, &if1, NULL);
+                  &if0, &if1, NULL,
+                  sd->vmodel_bags_any_loaded ? sd->vmodels_by_bag : NULL,
+                  sd->vmodel_static_leaves);
               game_destroy(cg);
               if (ok) {
                 const int sign = itie ? 2 : (iwin ? 1 : 0);
@@ -6310,7 +6473,10 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             pp_playout_outcome(es, er, eg_tc, pg, post_ml, worker->worker_index,
                                on_idx, false, eg_plies, eg_caps, eg_signstable_k,
                                eg_diffgate, eg_tt_frac, NULL, 0.0, 0.0, &pw, &pt,
-                               &pf0, &pf1, NULL);
+                               &pf0, &pf1, NULL,
+                               sd->vmodel_bags_any_loaded ? sd->vmodels_by_bag
+                                                          : NULL,
+                               sd->vmodel_static_leaves);
             game_destroy(pg);
             const int pm = (on_idx == 0) ? pf0 : pf1;
             const int po = (on_idx == 0) ? pf1 : pf0;
@@ -6338,7 +6504,9 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
               es, er, eg_tc, dg, post_ml, worker->worker_index, on_idx, eg_solve,
               eg_plies, eg_caps, eg_signstable_k, eg_diffgate, eg_tt_frac,
               &eg_spent, eg_pos_budget, eg_overflow_cap, &win, &tie, &f0, &f1,
-              &spread);
+              &spread,
+              sd->vmodel_bags_any_loaded ? sd->vmodels_by_bag : NULL,
+              sd->vmodel_static_leaves);
           // Log the solved bag-emptying play + bump its cell counter (the
           // bag-emptying filter + cell cap were applied pre-solve above). In
           // prefilter mode N is tracked in edge_ncell (bumped above), not here.
@@ -6413,7 +6581,9 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         const bool committable = pp_playout_outcome(
             es, er, eg_tc, gr->game, post_ml, worker->worker_index, on_idx,
             endgame, eg_plies, eg_caps, eg_signstable_k, eg_diffgate, eg_tt_frac,
-            NULL, 0.0, 0.0, &win, &tie, &f0, &f1, NULL);
+            NULL, 0.0, 0.0, &win, &tie, &f0, &f1, NULL,
+            sd->vmodel_bags_any_loaded ? sd->vmodels_by_bag : NULL,
+            sd->vmodel_static_leaves);
         (void)win;
         (void)tie;
         if (traj_r && gr->trajectory_buf) {
