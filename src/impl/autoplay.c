@@ -6290,6 +6290,13 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         const bool pp_fan1 =
             (paired || index_build) && ft != NULL && !refine_mode &&
             spread_fp == NULL;
+        // Residual feature-coverage top-up: keep one representative play per
+        // deficient FEATURE cell too (see the registration loop below). Off by
+        // default so the natural fill stays fan-to-1-per-stratum.
+        static _Thread_local int pp_feat_fan_cache = -1;
+        if (pp_feat_fan_cache < 0)
+          pp_feat_fan_cache = getenv("MAGPIE_PP_FEATURE_FANOUT") ? 1 : 0;
+        const bool pp_feat_fan = pp_fan1 && pp_feat_fan_cache;
         if (pp_fan1) {
           const int nlim = nm < PP_FANOUT_MAX ? nm : PP_FANOUT_MAX;
           for (int mm = 0; mm < nlim; mm++) pp_keep[mm] = false;
@@ -6312,34 +6319,49 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
                 pp_match_force_cells(ft, gr->game, pv, on_idx, ped, pex, mt,
                                      PP_FT_MAX);
             if (mn == 0) continue;
-            int sord = -1;
+            // Register this play as a candidate representative for the cells it
+            // credits. Default: STRATUM cells only (one representative play per
+            // deficient stratum cell -> the CI counts distinct positions;
+            // features get byproduct coverage). The matcher returns only
+            // DEFICIENT cells, so a cell at target contributes no ord here.
+            //
+            // With MAGPIE_PP_FEATURE_FANOUT, ALSO register every deficient
+            // FEATURE cell (pair/tile) it credits. This fixes rare-leave
+            // starvation: the uniform one-per-stratum pick drops the keep-??,
+            // keep-BB/CC, keep-QZ play (a rare leave is a tiny minority of the
+            // stratum's plays, and once the stratum fills its plays vanish),
+            // so blank/doubled/stranded-tile pair features never reach the EPV
+            // floor and collapse in the fit. Registering per feature cell keeps
+            // one representative rare-leave play per position. Feature cells are
+            // count-based and the stratum still credits once (pp_credit_once),
+            // so the stratum win% is unchanged -- only rare-feature COVERAGE is
+            // added. Meant for a residual top-up pass (feature-only force
+            // table), where the deficient-cell set is already just the rare
+            // tail, so the extra kept plays are bounded to that tail.
             for (int k = 0; k < mn; k++) {
-              if (mt[k]->kind == FORCE_TARGET_STRATUM)
-                sord = force_table_target_index(ft, mt[k]);
-            }
-            // Only DEFICIENT stratum cells are returned by the matcher, so once
-            // a cell hits target its plays get sord<0. Drop them entirely (do
-            // NOT keep for a deficient feature): keeping them piled multiple
-            // plays into an already-satisfied cell (39.7% duplicate rows on
-            // bag 8). Features get byproduct coverage from the stratum picks.
-            if (sord < 0) continue;
-            const uint64_t h = pp_splitmix64(
-                ((uint64_t)pos_id << 20) ^ ((uint64_t)(uint32_t)sord << 1) ^
-                (uint64_t)(uint32_t)mm);
-            int slot = -1;
-            for (int r = 0; r < rc_n; r++)
-              if (rc_ord[r] == sord) {
-                slot = r;
-                break;
+              const bool is_strat = (mt[k]->kind == FORCE_TARGET_STRATUM);
+              if (!is_strat && !pp_feat_fan) continue;
+              const int cord = force_table_target_index(ft, mt[k]);
+              const uint64_t h = pp_splitmix64(
+                  ((uint64_t)pos_id << 20) ^ ((uint64_t)(uint32_t)cord << 1) ^
+                  (uint64_t)(uint32_t)mm);
+              int slot = -1;
+              for (int r = 0; r < rc_n; r++)
+                if (rc_ord[r] == cord) {
+                  slot = r;
+                  break;
+                }
+              if (slot < 0) {
+                if (rc_n < PP_FANOUT_MAX) {
+                  rc_ord[rc_n] = cord;
+                  rc_h[rc_n] = h;
+                  rc_m[rc_n] = mm;
+                  rc_n++;
+                }
+              } else if (h < rc_h[slot]) {
+                rc_h[slot] = h;
+                rc_m[slot] = mm;
               }
-            if (slot < 0) {
-              rc_ord[rc_n] = sord;
-              rc_h[rc_n] = h;
-              rc_m[rc_n] = mm;
-              rc_n++;
-            } else if (h < rc_h[slot]) {
-              rc_h[slot] = h;
-              rc_m[slot] = mm;
             }
           }
           for (int r = 0; r < rc_n; r++) pp_keep[rc_m[r]] = true;
