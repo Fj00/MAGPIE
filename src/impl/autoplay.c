@@ -1281,7 +1281,8 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   leave_deficit_destroy(shared_data->leave_deficit);
   void vmodel_log_stats(void);  // defined later in this TU
   if (shared_data->vmodel_any_loaded ||
-      shared_data->vmodel_picks_any_loaded) {
+      shared_data->vmodel_picks_any_loaded ||
+      shared_data->vmodel_bags_any_loaded) {
     vmodel_log_stats();
   }
   for (int i = 0; i < 7; i++) vmodel_destroy(shared_data->vmodels[i]);
@@ -2096,6 +2097,8 @@ static _Atomic uint64_t g_vmodel_invocations  = 0;  // function entered (turn ma
 static _Atomic uint64_t g_vmodel_total_calls  = 0;  // best_move successfully picked
 static _Atomic uint64_t g_vmodel_no_pick      = 0;  // turn matched but no scoreable move
 static _Atomic uint64_t g_vmodel_disagreements = 0; // best_move != equity-top
+static _Atomic uint64_t g_vmodel_eg_called    = 0;  // endgame pick: model found for unseen
+static _Atomic uint64_t g_vmodel_eg_picked    = 0;  // endgame pick: returned a model move
 static _Atomic uint64_t g_vmodel_pick_pass    = 0;  // best_move was a pass
 static _Atomic uint64_t g_vmodel_pick_exch    = 0;  // best_move was an exchange
 static _Atomic uint64_t g_vmodel_pick_play    = 0;  // best_move was a play
@@ -2216,6 +2219,20 @@ static int vmodel_indices_to_pts(const uint8_t *idx, int n) {
 }
 
 void vmodel_log_stats(void) {
+  // Endgame chain: pre-endgame model picks (MAGPIE_VMODEL_BAGS). "found" =
+  // a model existed for the current unseen bag; "picked" = it returned a move.
+  {
+    const uint64_t egc = atomic_load_explicit(&g_vmodel_eg_called,
+                                              memory_order_relaxed);
+    if (egc) {
+      const uint64_t egp = atomic_load_explicit(&g_vmodel_eg_picked,
+                                                memory_order_relaxed);
+      fprintf(stderr, "vmodel: endgame pre-endgame picks: model found %llu, "
+              "returned a move %llu (%.1f%%)\n",
+              (unsigned long long)egc, (unsigned long long)egp,
+              100.0 * (double)egp / (double)egc);
+    }
+  }
   // Always emit picks stats up-front — when picks cover every rack the
   // inference path may have zero invocations, in which case we'd skip
   // the rest of this function but still want to report the picks usage.
@@ -2610,6 +2627,7 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   if (bag_key < 0 || bag_key >= VMODEL_MAX_BAG) return NULL;
   const VModel *model = vmodels_by_bag[bag_key];
   if (!model) return NULL;
+  atomic_fetch_add_explicit(&g_vmodel_eg_called, 1, memory_order_relaxed);
 
   const int on = game_get_player_on_turn_index(game);
   Rack *player_rack = player_get_rack(game_get_player(game, on));
@@ -2668,6 +2686,8 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       best_move = m;
     }
   }
+  if (best_move)
+    atomic_fetch_add_explicit(&g_vmodel_eg_picked, 1, memory_order_relaxed);
   return best_move;  // NULL -> nothing scoreable -> caller keeps HastyBot
 }
 
