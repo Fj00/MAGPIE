@@ -2099,6 +2099,12 @@ static _Atomic uint64_t g_vmodel_no_pick      = 0;  // turn matched but no score
 static _Atomic uint64_t g_vmodel_disagreements = 0; // best_move != equity-top
 static _Atomic uint64_t g_vmodel_eg_called    = 0;  // endgame pick: model found for unseen
 static _Atomic uint64_t g_vmodel_eg_picked    = 0;  // endgame pick: returned a model move
+// MAGPIE_VMODEL_PLAYOUT_NO_PASS=1: the V-model playout policy never picks a pass
+// (kind 0). Used when RE-LABELLING a pass stratum: the on-turn mover's pass is
+// the recorded move, and the opponent's reply is chosen by the bag model but
+// restricted to real moves, so the (self-referential) pass sub-model is never
+// consulted in its own label. -1 = uninitialized (lazy getenv on first pick).
+static _Atomic int g_vmodel_playout_no_pass   = -1;
 static _Atomic uint64_t g_vmodel_pick_pass    = 0;  // best_move was a pass
 static _Atomic uint64_t g_vmodel_pick_exch    = 0;  // best_move was an exchange
 static _Atomic uint64_t g_vmodel_pick_play    = 0;  // best_move was a play
@@ -2629,6 +2635,17 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   if (!model) return NULL;
   atomic_fetch_add_explicit(&g_vmodel_eg_called, 1, memory_order_relaxed);
 
+  // Lazy one-time read of the play-only playout flag (benign race: every thread
+  // resolves the same env value). When set, this pick skips passes below.
+  int no_pass = atomic_load_explicit(&g_vmodel_playout_no_pass,
+                                     memory_order_relaxed);
+  if (no_pass < 0) {
+    const char *e = getenv("MAGPIE_VMODEL_PLAYOUT_NO_PASS");
+    no_pass = (e && e[0] && e[0] != '0') ? 1 : 0;
+    atomic_store_explicit(&g_vmodel_playout_no_pass, no_pass,
+                          memory_order_relaxed);
+  }
+
   const int on = game_get_player_on_turn_index(game);
   Rack *player_rack = player_get_rack(game_get_player(game, on));
   // Unseen (on-turn perspective) = physical bag + opponent rack.
@@ -2671,6 +2688,7 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       case GAME_EVENT_TILE_PLACEMENT_MOVE: kind = 2; break;
       default: continue;
     }
+    if (kind == 0 && no_pass) continue;  // play-only playout (pass relabel)
     rack_reset(&leave_rack);
     get_leave_for_move(m, game, &leave_rack);
     uint8_t leave_idx[16];
