@@ -5661,26 +5661,40 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
     atomic_store_explicit(&g_pp_mover_force_pass, force_mover_pass,
                           memory_order_relaxed);
   }
+  // Force-pass state: the mover passes again only while the opponent is ALSO
+  // passing (a standoff heading to the six-pass end). The moment the opponent
+  // plays a real move, the mover stops passing and plays out from then on.
+  bool mover_plays_out = false;
   while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
     if (force_mover_pass) {
-      // Pass-relabel playout: the mover keeps passing; the opponent optimally
-      // responds, with a deterministic six-pass pass-back option. No exact
-      // solve (the mover is intentionally not playing optimally) — play out to
-      // the natural terminus; play_move applies the CONSECUTIVE_ZEROS rack
-      // penalty automatically.
+      // Pass-relabel playout. The mover passes again ONLY while the opponent is
+      // also passing (a standoff heading to the six-pass end); the moment the
+      // opponent plays a real move, the mover stops passing and plays out. No
+      // exact solve — play to the natural terminus (play_move applies the
+      // CONSECUTIVE_ZEROS rack penalty automatically).
       const int on = game_get_player_on_turn_index(dg);
       if (on == mover) {
-        Move *sp = move_list_get_spare_move(post_ml);
-        move_set_as_pass(sp);
-        play_move(sp, dg, NULL);
+        if (mover_plays_out) {
+          const Move *pm = NULL;
+          if (vmodels_by_bag)
+            pm = vmodel_endgame_pick_move(dg, vmodels_by_bag, vmodel_sl,
+                                          worker_index, post_ml);
+          if (!pm) pm = get_top_equity_move(dg, worker_index, post_ml);
+          play_move(pm, dg, NULL);
+        } else {
+          Move *sp = move_list_get_spare_move(post_ml);
+          move_set_as_pass(sp);
+          play_move(sp, dg, NULL);
+        }
         continue;
       }
       // Opponent: pass back iff it STRICTLY wins the six-pass rack-sum tally,
       // worst-case for it — the mover holds the lowest-scoring 7 of its 8
       // unseen tiles (sum(unseen) - the single highest unseen tile value, which
-      // is assumed to sit in the bag). Ties -> play (the worst case already
-      // makes strong assumptions; don't settle for a draw). Otherwise play the
-      // best move (bag model if loaded, else HastyBot equity).
+      // is assumed to sit in the bag). Ties -> play (worst case is already
+      // conservative). Otherwise play the best move (bag model if loaded, else
+      // HastyBot). A REAL opponent move (not a forced pass) breaks the standoff,
+      // so the mover plays out from then on.
       const LetterDistribution *ld = game_get_ld(dg);
       const int opp_s =
           equity_to_int(player_get_score(game_get_player(dg, on)));
@@ -5710,7 +5724,9 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
           pm = vmodel_endgame_pick_move(dg, vmodels_by_bag, vmodel_sl,
                                         worker_index, post_ml);
         if (!pm) pm = get_top_equity_move(dg, worker_index, post_ml);
+        const game_event_t opp_mt = move_get_type(pm);
         play_move(pm, dg, NULL);
+        if (opp_mt != GAME_EVENT_PASS) mover_plays_out = true;
       }
       continue;
     }
