@@ -6034,6 +6034,17 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   const char *lpi_dir = getenv("MAGPIE_LATE_PLAY_INDEX_DIR");
   LatePlayIndex *lpi =
       (lpi_dir && lpi_dir[0] && ft) ? late_play_index_create(lpi_dir, ft) : NULL;
+  // MAGPIE_PP_PASS_ONLY=1: fan out and record ONLY the pass (kind 0), skipping
+  // every play/exchange. Used to RE-LABEL a pass stratum cheaply: the mover's
+  // pass is the one recorded move per position (solved via pp_playout_outcome:
+  // opponent replies, then exact endgame), so the pass sub-model is refit on
+  // model-refuted labels without re-solving the exact plays (which are
+  // playout-independent). Pair with MAGPIE_VMODEL_BAGS + PLAYOUT_NO_PASS.
+  const char *pass_only_env = getenv("MAGPIE_PP_PASS_ONLY");
+  const bool pass_only =
+      pass_only_env && pass_only_env[0] && pass_only_env[0] != '0';
+  if (pass_only && worker->worker_index == 0)
+    fprintf(stderr, "position_pool: PASS-ONLY recording (relabel mode)\n");
   // Index-driven no-progress backstop: stop when active_targets stops dropping
   // for a while — only unfillable cells remain (structural gaps with no indexed
   // plays, or stratum cells that can't get both a W and an L, which otherwise
@@ -6400,6 +6411,8 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
                           !pp_keep[m]))
             continue;
           const Move *mv = move_list_get_move(fan_ml, m);
+          if (pass_only && move_get_type(mv) != GAME_EVENT_PASS)
+            continue;  // pass-only relabel: skip plays/exchanges
           char lf[RACK_SIZE + 2];
           pp_render_leave(mv, gr->game, lf, sizeof(lf));
           const int llen = (int)strlen(lf);
