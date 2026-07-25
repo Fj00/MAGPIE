@@ -2105,6 +2105,13 @@ static _Atomic uint64_t g_vmodel_eg_picked    = 0;  // endgame pick: returned a 
 // restricted to real moves, so the (self-referential) pass sub-model is never
 // consulted in its own label. -1 = uninitialized (lazy getenv on first pick).
 static _Atomic int g_vmodel_playout_no_pass   = -1;
+// MAGPIE_PP_MOVER_FORCE_PASS=1: in pp_playout_outcome, FORCE the mover (the
+// player who made the recorded move) to keep passing every turn while the
+// opponent optimally responds with a deterministic six-pass pass-back option
+// (rack-sum tally, worst-case mover rack). Drives the game to the CONSECUTIVE_
+// ZEROS terminus so a pass while behind actually loses. Used to RE-LABEL K0_L7.
+// -1 = uninitialized (lazy getenv on first outcome).
+static _Atomic int g_pp_mover_force_pass      = -1;
 static _Atomic uint64_t g_vmodel_pick_pass    = 0;  // best_move was a pass
 static _Atomic uint64_t g_vmodel_pick_exch    = 0;  // best_move was an exchange
 static _Atomic uint64_t g_vmodel_pick_play    = 0;  // best_move was a play
@@ -5645,7 +5652,68 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
                                bool *is_tie, int *f0, int *f1, int *out_spread,
                                VModel *const *vmodels_by_bag,
                                const StaticLeaves *vmodel_sl) {
+  // Lazy one-time read of the forced-mover-pass relabel flag.
+  int force_mover_pass = atomic_load_explicit(&g_pp_mover_force_pass,
+                                              memory_order_relaxed);
+  if (force_mover_pass < 0) {
+    const char *e = getenv("MAGPIE_PP_MOVER_FORCE_PASS");
+    force_mover_pass = (e && e[0] && e[0] != '0') ? 1 : 0;
+    atomic_store_explicit(&g_pp_mover_force_pass, force_mover_pass,
+                          memory_order_relaxed);
+  }
   while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
+    if (force_mover_pass) {
+      // Pass-relabel playout: the mover keeps passing; the opponent optimally
+      // responds, with a deterministic six-pass pass-back option. No exact
+      // solve (the mover is intentionally not playing optimally) — play out to
+      // the natural terminus; play_move applies the CONSECUTIVE_ZEROS rack
+      // penalty automatically.
+      const int on = game_get_player_on_turn_index(dg);
+      if (on == mover) {
+        Move *sp = move_list_get_spare_move(post_ml);
+        move_set_as_pass(sp);
+        play_move(sp, dg, NULL);
+        continue;
+      }
+      // Opponent: pass back iff it STRICTLY wins the six-pass rack-sum tally,
+      // worst-case for it — the mover holds the lowest-scoring 7 of its 8
+      // unseen tiles (sum(unseen) - the single highest unseen tile value, which
+      // is assumed to sit in the bag). Ties -> play (the worst case already
+      // makes strong assumptions; don't settle for a draw). Otherwise play the
+      // best move (bag model if loaded, else HastyBot equity).
+      const LetterDistribution *ld = game_get_ld(dg);
+      const int opp_s =
+          equity_to_int(player_get_score(game_get_player(dg, on)));
+      const int mov_s =
+          equity_to_int(player_get_score(game_get_player(dg, mover)));
+      const int opp_rack = equity_to_int(
+          rack_get_score(ld, player_get_rack(game_get_player(dg, on))));
+      const Bag *b = game_get_bag(dg);
+      const Rack *mrk = player_get_rack(game_get_player(dg, mover));
+      int uns_sum = 0, uns_max = 0;
+      const int ds = rack_get_dist_size(mrk);
+      for (int t = 0; t < ds; t++) {
+        const int cnt = bag_get_letter(b, t) + rack_get_letter(mrk, t);
+        if (cnt <= 0) continue;
+        const int v = equity_to_int(ld_get_score(ld, t));
+        uns_sum += cnt * v;
+        if (v > uns_max) uns_max = v;
+      }
+      const int mover_min_rack = uns_sum - uns_max;
+      if ((opp_s - opp_rack) > (mov_s - mover_min_rack)) {
+        Move *sp = move_list_get_spare_move(post_ml);
+        move_set_as_pass(sp);
+        play_move(sp, dg, NULL);
+      } else {
+        const Move *pm = NULL;
+        if (vmodels_by_bag)
+          pm = vmodel_endgame_pick_move(dg, vmodels_by_bag, vmodel_sl,
+                                        worker_index, post_ml);
+        if (!pm) pm = get_top_equity_move(dg, worker_index, post_ml);
+        play_move(pm, dg, NULL);
+      }
+      continue;
+    }
     if (endgame && bag_get_letters(game_get_bag(dg)) == 0) {
       const int on = game_get_player_on_turn_index(dg);
       const int on_s = equity_to_int(player_get_score(game_get_player(dg, on)));
@@ -5735,13 +5803,20 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
     if (!pm) pm = get_top_equity_move(dg, worker_index, post_ml);
     play_move(pm, dg, NULL);
   }
-  if (game_get_game_end_reason(dg) != GAME_END_REASON_STANDARD) return false;
+  // Commit a natural terminus: a standard out OR the six-pass (CONSECUTIVE_
+  // ZEROS) end — the latter is the forced-mover-pass relabel's target, where
+  // play_move has already applied each side's rack penalty.
+  const game_end_reason_t end_reason = game_get_game_end_reason(dg);
+  if (end_reason != GAME_END_REASON_STANDARD &&
+      end_reason != GAME_END_REASON_CONSECUTIVE_ZEROS)
+    return false;
   const int mf = equity_to_int(player_get_score(game_get_player(dg, mover)));
   const int of = equity_to_int(player_get_score(game_get_player(dg, 1 - mover)));
   *f0 = equity_to_int(player_get_score(game_get_player(dg, 0)));
   *f1 = equity_to_int(player_get_score(game_get_player(dg, 1)));
   *is_tie = (mf == of);
   *is_win = (mf > of);
+  if (out_spread) *out_spread = mf - of;  // mover's final spread (playout end)
   return true;
 }
 
