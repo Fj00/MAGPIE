@@ -5446,6 +5446,41 @@ static void pp_render_leave(const Move *move, const Game *game, char *out,
 // Collects targets that still have deficit into out[]; returns the count. 0 =>
 // no deficient cell matches, so the fan-out gate skips this branch. Mirrors the
 // EB matcher (eb_append_force_target_slots, autoplay.c) for the position pool.
+// Six-pass tally diff for a PASS (K0_L7): the score margin after a forced
+// six-pass ending, worst-case for the mover. = pre_diff - mover_rack_pts +
+// opp_min_rack_pts, opp_min_rack = the RACK_SIZE lowest-value unseen tiles
+// (bag + opponent rack). Mirrors v_model_features.sixpass_diff so the force
+// table (built on the 6pass_d layout) matches a pass by its tally, not its
+// lead. Bag-independent -> generalizes to bags 9+.
+static int pp_sixpass_diff(const Game *game, int mover, int pre_diff) {
+  const LetterDistribution *ld = game_get_ld(game);
+  const Rack *mrk = player_get_rack(game_get_player(game, mover));
+  const int mover_pts = equity_to_int(rack_get_score(ld, mrk));
+  const Bag *b = game_get_bag(game);
+  const Rack *opp = player_get_rack(game_get_player(game, 1 - mover));
+  int ds = rack_get_dist_size(mrk);
+  int vals[128];
+  int nv = 0;
+  for (int t = 0; t < ds && nv < 128; t++) {
+    const int cnt = bag_get_letter(b, t) + rack_get_letter(opp, t);
+    if (cnt <= 0) continue;
+    const int v = equity_to_int(ld_get_score(ld, t));
+    for (int k = 0; k < cnt && nv < 128; k++) vals[nv++] = v;
+  }
+  const int take = nv < RACK_SIZE ? nv : RACK_SIZE;
+  int opp_min = 0;  // sum of the `take` smallest (partial selection sort)
+  for (int i = 0; i < take; i++) {
+    int mi = i;
+    for (int j = i + 1; j < nv; j++)
+      if (vals[j] < vals[mi]) mi = j;
+    const int tmp = vals[i];
+    vals[i] = vals[mi];
+    vals[mi] = tmp;
+    opp_min += vals[i];
+  }
+  return pre_diff - mover_pts + opp_min;
+}
+
 static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
                                 int on_idx, int eff_diff, bool is_exch,
                                 ForceTarget **out, int cap) {
@@ -6134,6 +6169,13 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   const char *pass_only_env = getenv("MAGPIE_PP_PASS_ONLY");
   const bool pass_only =
       pass_only_env && pass_only_env[0] && pass_only_env[0] != '0';
+  // MAGPIE_PP_PASS_SIXPASS=1: match a PASS to force-table cells by its six-pass
+  // tally (pp_sixpass_diff) instead of its raw lead. Set when the force table's
+  // K0_L7 cells are keyed on 6pass_d (so the tally extremes get floored ->
+  // clean 1%/5% pass buckets).
+  const char *pass_sixpass_env = getenv("MAGPIE_PP_PASS_SIXPASS");
+  const bool pass_sixpass =
+      pass_sixpass_env && pass_sixpass_env[0] && pass_sixpass_env[0] != '0';
   if (pass_only && worker->worker_index == 0)
     fprintf(stderr, "position_pool: PASS-ONLY recording (relabel mode)\n");
   // Index-driven no-progress backstop: stop when active_targets stops dropping
@@ -6441,7 +6483,9 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             const int pmsc = move_get_type(pv) == GAME_EVENT_TILE_PLACEMENT_MOVE
                                  ? equity_to_int(move_get_score(pv))
                                  : 0;
-            const int ped = pre_diff + pmsc;
+            int ped = pre_diff + pmsc;
+            if (pass_sixpass && move_get_type(pv) == GAME_EVENT_PASS)
+              ped = pp_sixpass_diff(gr->game, on_idx, pre_diff);
             const bool pex = move_get_type(pv) == GAME_EVENT_EXCHANGE;
             ForceTarget *mt[PP_FT_MAX];
             const int mn =
@@ -6542,7 +6586,9 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
               move_get_type(mv) == GAME_EVENT_TILE_PLACEMENT_MOVE
                   ? equity_to_int(move_get_score(mv))
                   : 0;
-          const int eff_diff = pre_diff + msc;
+          int eff_diff = pre_diff + msc;
+          if (pass_sixpass && move_get_type(mv) == GAME_EVENT_PASS)
+            eff_diff = pp_sixpass_diff(gr->game, on_idx, pre_diff);
           const bool is_exch_mv = move_get_type(mv) == GAME_EVENT_EXCHANGE;
           // Gate: force-table cells (T2-T6 spec) when loaded, else the per-leaf
           // leave_deficit. Skip the branch if no deficient cell would be
