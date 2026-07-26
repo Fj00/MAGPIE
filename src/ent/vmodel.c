@@ -167,6 +167,17 @@ static bool parse_header(FILE *f, VModel *m) {
         if (!read_line(buf, sizeof(buf), f)) return false;
         p = buf;
     }
+    // Optional PASS6 (1 = the PASS stratum K0_L7 is bucketed on the six-pass
+    // tally; vmodel_predict converts the raw lead -> sixpass_diff before lookup).
+    // Default 0 (older lead-bucketed models). NSTRATA follows.
+    m->pass_sixpass = false;
+    if (strncmp(p, "PASS6", 5) == 0) {
+        int v = 0;
+        if (!expect_token(&p, "PASS6") || !parse_int(&p, &v)) return false;
+        m->pass_sixpass = (v != 0);
+        if (!read_line(buf, sizeof(buf), f)) return false;
+        p = buf;
+    }
     if (!expect_token(&p, "NSTRATA") || !parse_int(&p, &m->n_strata)) return false;
     return true;
 }

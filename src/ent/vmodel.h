@@ -63,6 +63,11 @@ typedef struct VModel {
     int       turn;
     int       bag;
     int       n_strata;
+    // PASS (K0_L7) bucketed on the six-pass endgame tally: when true,
+    // vmodel_predict converts the incoming raw lead into sixpass_diff before the
+    // stratum/bucket lookup and the move_score feature. Set from the .vmt PASS6
+    // header flag (export_v_model_text.py); false for older lead-bucketed models.
+    bool      pass_sixpass;
     VStratum *strata;              // [n_strata]
 } VModel;
 

@@ -320,6 +320,28 @@ float vmodel_predict(const VModel *m,
     // coefs. Override unconditionally so callers can pass game-turn as
     // a documentation hint without affecting inference.
     turn = m->turn;
+    // PASS (K0_L7) bucketed on the six-pass tally: convert the incoming raw lead
+    // into sixpass_diff so the stratum/bucket lookup AND the move_score feature
+    // match how the stratum was fit. sixpass_diff = lead - (mover rack pts) +
+    // (sum of the RACK_SIZE lowest-value unseen tiles = opponent's best-case rack
+    // in a six-pass standoff). Mirrors v_model_features.sixpass_diff. Gated on the
+    // model's PASS6 flag; needs the unseen vector (present for bag != 93).
+    if (m->pass_sixpass && kind == 0 && leave_len == VMODEL_RACK_SIZE &&
+        unseen_vec) {
+        int mover = leave_pts_total(leave_indices, leave_len);
+        int need = VMODEL_RACK_SIZE, add = 0;
+        for (int v = 0; v <= 10 && need > 0; v++) {
+            for (int t = 0; t < 27 && need > 0; t++) {
+                if (TILE_VALUE[t] != v) continue;
+                int c = unseen_vec[t];
+                if (c <= 0) continue;
+                int take = c < need ? c : need;
+                add += take * v;
+                need -= take;
+            }
+        }
+        diff = diff - mover + add;
+    }
     VModelLeaveType lt = vmodel_classify_leave(leave_indices, leave_len);
     int si = vmodel_stratum_index(m, kind, leave_len, lt, turn);
     if (si < 0) return -1.0f;
