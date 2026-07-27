@@ -5696,16 +5696,19 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
     atomic_store_explicit(&g_pp_mover_force_pass, force_mover_pass,
                           memory_order_relaxed);
   }
-  // Force-pass state: the mover passes again only while the opponent is ALSO
-  // passing (a standoff heading to the six-pass end). The moment the opponent
-  // plays a real move, the mover stops passing and plays out from then on.
+  // Force-pass state: the mover stays committed to passing until the BAG IS
+  // EMPTY — the strategic meaning of a late-game pass is "refuse to open the
+  // bag" (e.g. holding a bingo + lead), and that commitment survives the
+  // opponent making small plays that leave tiles in the bag. Only once the
+  // opponent's plays have emptied the bag does the mover play out. If the
+  // opponent passes too, the standoff runs to the six-pass end.
   bool mover_plays_out = false;
   while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
     if (force_mover_pass) {
-      // Pass-relabel playout. The mover passes again ONLY while the opponent is
-      // also passing (a standoff heading to the six-pass end); the moment the
-      // opponent plays a real move, the mover stops passing and plays out. No
-      // exact solve — play to the natural terminus (play_move applies the
+      // Pass-relabel playout. The mover passes again until the bag is EMPTY
+      // (opponent plays that leave tiles in the bag do NOT break the
+      // commitment); once the bag empties, the mover plays out. No exact
+      // solve — play to the natural terminus (play_move applies the
       // CONSECUTIVE_ZEROS rack penalty automatically).
       const int on = game_get_player_on_turn_index(dg);
       if (on == mover) {
@@ -5728,8 +5731,8 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
       // unseen tiles (sum(unseen) - the single highest unseen tile value, which
       // is assumed to sit in the bag). Ties -> play (worst case is already
       // conservative). Otherwise play the best move (bag model if loaded, else
-      // HastyBot). A REAL opponent move (not a forced pass) breaks the standoff,
-      // so the mover plays out from then on.
+      // HastyBot). A real opponent move releases the mover only once it has
+      // EMPTIED the bag (see the mover-commitment note above).
       const LetterDistribution *ld = game_get_ld(dg);
       const int opp_s =
           equity_to_int(player_get_score(game_get_player(dg, on)));
@@ -5761,7 +5764,15 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
         if (!pm) pm = get_top_equity_move(dg, worker_index, post_ml);
         const game_event_t opp_mt = move_get_type(pm);
         play_move(pm, dg, NULL);
-        if (opp_mt != GAME_EVENT_PASS) mover_plays_out = true;
+        // The mover's pass commitment holds while tiles remain in the bag:
+        // an opponent play that does NOT empty the bag leaves the mover
+        // passing (e.g. 2 in the bag, mover holds a bingo + lead — opp
+        // playing one tile must not bait the mover into opening the bag).
+        // Checked AFTER play_move so the opponent's replenishment draw is
+        // counted; only an emptied bag releases the mover to play out.
+        if (opp_mt != GAME_EVENT_PASS &&
+            bag_get_letters(game_get_bag(dg)) == 0)
+          mover_plays_out = true;
       }
       continue;
     }
