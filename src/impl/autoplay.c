@@ -2105,6 +2105,13 @@ static _Atomic uint64_t g_vmodel_eg_picked    = 0;  // endgame pick: returned a 
 // This counter sizes that hole: pass-picks / eg-picks says whether the existing
 // labels need re-collecting.
 static _Atomic uint64_t g_vmodel_eg_pass_picked = 0;
+// Split the pass-picks by how much they actually matter, so the raw rate is not
+// mistaken for impact: MARGIN = pass win% minus the best play's, LIVE = the
+// pass is not in a decided position (0.02 < p < 0.98). A pass that wins by
+// 0.001 in a hopeless position is noise; one that wins by 0.1 while the mover
+// is ahead is the real thing.
+static _Atomic uint64_t g_vmodel_eg_pass_big  = 0;  // margin >= 0.05
+static _Atomic uint64_t g_vmodel_eg_pass_live = 0;  // 0.02 < pass p < 0.98
 // MAGPIE_VMODEL_PLAYOUT_NO_PASS=1: the V-model playout policy never picks a pass
 // (kind 0). Used when RE-LABELLING a pass stratum: the on-turn mover's pass is
 // the recorded move, and the opponent's reply is chosen by the bag model but
@@ -2254,6 +2261,16 @@ void vmodel_log_stats(void) {
               100.0 * (double)egp / (double)egc,
               (unsigned long long)egpp,
               egp ? 100.0 * (double)egpp / (double)egp : 0.0);
+      const uint64_t egpb = atomic_load_explicit(&g_vmodel_eg_pass_big,
+                                                 memory_order_relaxed);
+      const uint64_t egpl = atomic_load_explicit(&g_vmodel_eg_pass_live,
+                                                 memory_order_relaxed);
+      fprintf(stderr, "vmodel:   of those passes: margin>=0.05 %llu (%.2f%% of "
+              "picks), live(0.02<p<0.98) %llu (%.2f%% of picks)\n",
+              (unsigned long long)egpb,
+              egp ? 100.0 * (double)egpb / (double)egp : 0.0,
+              (unsigned long long)egpl,
+              egp ? 100.0 * (double)egpl / (double)egp : 0.0);
     }
   }
   // Always emit picks stats up-front — when picks cover every rack the
@@ -2741,10 +2758,17 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       // Strict > so a tie keeps the play: in a decided position the spread head
       // decides, and its MAE (20-25 pts) exceeds the gaps it would adjudicate.
       if (p_round > best_win) {
+        const float margin = p_round - best_win;   // best_win = best PLAY here
         best_win = p_round;
         best_move = spare;
         atomic_fetch_add_explicit(&g_vmodel_eg_pass_picked, 1,
                                   memory_order_relaxed);
+        if (margin >= 0.05f)
+          atomic_fetch_add_explicit(&g_vmodel_eg_pass_big, 1,
+                                    memory_order_relaxed);
+        if (p_round > 0.02f && p_round < 0.98f)
+          atomic_fetch_add_explicit(&g_vmodel_eg_pass_live, 1,
+                                    memory_order_relaxed);
       }
     }
   }
