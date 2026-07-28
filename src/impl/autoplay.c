@@ -2658,6 +2658,10 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
 // unseen vector (physical bag + opponent rack). Returns NULL if no model is
 // loaded for this unseen count (caller keeps HastyBot). Pass is not scored
 // (matches get_top_equity_move's movegen candidate set); a refinement.
+// Defined further down (near the position-pool code); needed here for the
+// standoff guard.
+static int pp_sixpass_diff(const Game *game, int mover, int pre_diff);
+
 static const Move *vmodel_endgame_pick_move(Game *game,
                                             VModel *const *vmodels_by_bag,
                                             const StaticLeaves *sl,
@@ -2746,7 +2750,32 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   // installed models, a pass beats every play in 8.77% of contested-ahead bag-8
   // positions (2.69% bag 9, 0.29% bag 10, 0.03% bag 11). Score the pass here
   // too, unless the caller asked for a play-only playout.
-  if (!no_pass) {
+  // STANDOFF GUARD (hard rule, not model): the pass model's features are
+  // (rack, unseen, tally) — it has NO idea how many consecutive scoreless turns
+  // have already happened, so it scores a pass at zero-count 0 identically to
+  // one at zero-count 5 that ENDS THE GAME. Those are different decisions, and
+  // without this the bot passes into a loss.
+  //
+  // A six-pass ending is won iff sixpass_diff > 0, i.e.
+  //   (my_score - my_rack_pts) > (opp_score - sum(7 lowest UNSEEN))
+  // taking the opponent's rack as the lowest-value unseen tiles (worst case for
+  // us, since it minimises their end-rack penalty).
+  //
+  // So: if a pass would put the count at 5 or 6, the game can be ended by the
+  // opponent (or by us) on the next zero — only pass there if we win the
+  // ending. Below that the model decides. Symmetric: both sides run this
+  // picker, so whoever LOSES the tally breaks the standoff on what would be
+  // their third pass.
+  bool pass_allowed = !no_pass;
+  if (pass_allowed) {
+    const int zeros = game_get_consecutive_scoreless_turns(game);
+    const int maxz = game_get_max_scoreless_turns(game);
+    if (zeros + 1 >= maxz - 1) {   // this pass reaches the end, or lets opp end it
+      const int s6 = pp_sixpass_diff(game, on, pre_diff);
+      if (s6 <= 0) pass_allowed = false;   // we would lose the six-pass ending
+    }
+  }
+  if (pass_allowed) {
     Move *spare = move_list_get_spare_move(ml);
     move_set_as_pass(spare);
     // A pass keeps the whole rack, so leave == rack, and the score diff is
