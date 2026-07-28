@@ -2099,6 +2099,12 @@ static _Atomic uint64_t g_vmodel_no_pick      = 0;  // turn matched but no score
 static _Atomic uint64_t g_vmodel_disagreements = 0; // best_move != equity-top
 static _Atomic uint64_t g_vmodel_eg_called    = 0;  // endgame pick: model found for unseen
 static _Atomic uint64_t g_vmodel_eg_picked    = 0;  // endgame pick: returned a model move
+// How often the endgame picker CHOSE the pass. Before 2026-07-28 the picker
+// could not pass at all (movegen emits none and, unlike the opener picker, it
+// never added one), so every bags-9+ fill playout embedded a never-pass policy.
+// This counter sizes that hole: pass-picks / eg-picks says whether the existing
+// labels need re-collecting.
+static _Atomic uint64_t g_vmodel_eg_pass_picked = 0;
 // MAGPIE_VMODEL_PLAYOUT_NO_PASS=1: the V-model playout policy never picks a pass
 // (kind 0). Used when RE-LABELLING a pass stratum: the on-turn mover's pass is
 // the recorded move, and the opponent's reply is chosen by the bag model but
@@ -2240,10 +2246,14 @@ void vmodel_log_stats(void) {
     if (egc) {
       const uint64_t egp = atomic_load_explicit(&g_vmodel_eg_picked,
                                                 memory_order_relaxed);
+      const uint64_t egpp = atomic_load_explicit(&g_vmodel_eg_pass_picked,
+                                                 memory_order_relaxed);
       fprintf(stderr, "vmodel: endgame pre-endgame picks: model found %llu, "
-              "returned a move %llu (%.1f%%)\n",
+              "returned a move %llu (%.1f%%), of which PASS %llu (%.2f%%)\n",
               (unsigned long long)egc, (unsigned long long)egp,
-              100.0 * (double)egp / (double)egc);
+              100.0 * (double)egp / (double)egc,
+              (unsigned long long)egpp,
+              egp ? 100.0 * (double)egpp / (double)egp : 0.0);
     }
   }
   // Always emit picks stats up-front — when picks cover every rack the
@@ -2709,6 +2719,33 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     if (p_round > best_win) {  // strict > keeps equity-sorted tie order
       best_win = p_round;
       best_move = m;
+    }
+  }
+  // Movegen does NOT emit a pass, so (unlike vmodel_pick_top_move, which adds
+  // one explicitly) this picker could never choose to pass — the GAME_EVENT_PASS
+  // case above was dead. That is a biased policy hole, not a neutral one:
+  // passing is best exactly when the mover is AHEAD with an unplayable rack, so
+  // never passing systematically costs the leading player. Measured on the
+  // installed models, a pass beats every play in 8.77% of contested-ahead bag-8
+  // positions (2.69% bag 9, 0.29% bag 10, 0.03% bag 11). Score the pass here
+  // too, unless the caller asked for a play-only playout.
+  if (!no_pass) {
+    Move *spare = move_list_get_spare_move(ml);
+    move_set_as_pass(spare);
+    // A pass keeps the whole rack, so leave == rack, and the score diff is
+    // unchanged (kind 0 scores nothing).
+    float p = vmodel_predict(model, rack_idx, rack_len, rack_idx, rack_len,
+                             0, pre_diff, model->turn, unseen, sl);
+    if (p >= 0.0f) {
+      const float p_round = roundf(p * 10000.0f) / 10000.0f;
+      // Strict > so a tie keeps the play: in a decided position the spread head
+      // decides, and its MAE (20-25 pts) exceeds the gaps it would adjudicate.
+      if (p_round > best_win) {
+        best_win = p_round;
+        best_move = spare;
+        atomic_fetch_add_explicit(&g_vmodel_eg_pass_picked, 1,
+                                  memory_order_relaxed);
+      }
     }
   }
   if (best_move)
