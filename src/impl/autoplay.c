@@ -2110,6 +2110,16 @@ static _Atomic uint64_t g_vmodel_eg_pass_picked = 0;
 // pass is not in a decided position (0.02 < p < 0.98). A pass that wins by
 // 0.001 in a hopeless position is noise; one that wins by 0.1 while the mover
 // is ahead is the real thing.
+// Why the endgame picker declined, and how many individual moves it could not
+// score. "HastyBot fell back 0.03%" hides two different things: a position with
+// NO scoreable move (counted below), and a position that returned a move while
+// silently dropping most candidates. Over 100M games even 0.03% is ~150k plies,
+// so both need to be counted, not assumed.
+static _Atomic uint64_t g_vmodel_eg_null_nomodel  = 0;  // no model for this bag
+static _Atomic uint64_t g_vmodel_eg_null_nomoves  = 0;  // movegen produced none
+static _Atomic uint64_t g_vmodel_eg_null_unscored = 0;  // moves existed, none scoreable
+static _Atomic uint64_t g_vmodel_eg_mv_total      = 0;  // candidate moves seen
+static _Atomic uint64_t g_vmodel_eg_mv_unscored   = 0;  // of those, returned p<0
 static _Atomic uint64_t g_vmodel_eg_pass_big  = 0;  // margin >= 0.05
 static _Atomic uint64_t g_vmodel_eg_pass_live = 0;  // 0.02 < pass p < 0.98
 // MAGPIE_VMODEL_PLAYOUT_NO_PASS=1: the V-model playout policy never picks a pass
@@ -2271,6 +2281,17 @@ void vmodel_log_stats(void) {
               egp ? 100.0 * (double)egpb / (double)egp : 0.0,
               (unsigned long long)egpl,
               egp ? 100.0 * (double)egpl / (double)egp : 0.0);
+      fprintf(stderr, "vmodel:   HastyBot fell back: no-model %llu, no-moves "
+              "%llu, none-scoreable %llu | moves unscored %llu/%llu (%.3f%%)\n",
+              (unsigned long long)atomic_load_explicit(&g_vmodel_eg_null_nomodel, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&g_vmodel_eg_null_nomoves, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&g_vmodel_eg_null_unscored, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&g_vmodel_eg_mv_unscored, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&g_vmodel_eg_mv_total, memory_order_relaxed),
+              atomic_load_explicit(&g_vmodel_eg_mv_total, memory_order_relaxed)
+                ? 100.0 * (double)atomic_load_explicit(&g_vmodel_eg_mv_unscored, memory_order_relaxed)
+                        / (double)atomic_load_explicit(&g_vmodel_eg_mv_total, memory_order_relaxed)
+                : 0.0);
     }
   }
   // Always emit picks stats up-front — when picks cover every rack the
@@ -2670,7 +2691,10 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   const int bag_key = bag_get_letters(bag) + (RACK_SIZE);
   if (bag_key < 0 || bag_key >= VMODEL_MAX_BAG) return NULL;
   const VModel *model = vmodels_by_bag[bag_key];
-  if (!model) return NULL;
+  if (!model) {
+    atomic_fetch_add_explicit(&g_vmodel_eg_null_nomodel, 1, memory_order_relaxed);
+    return NULL;
+  }
   atomic_fetch_add_explicit(&g_vmodel_eg_called, 1, memory_order_relaxed);
 
   // Lazy one-time read of the play-only playout flag (benign race: every thread
@@ -2704,7 +2728,10 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   generate_moves(&gen_args);
   move_list_sort_moves(ml);
   const int n_moves = move_list_get_count(ml);
-  if (n_moves == 0) return NULL;
+  if (n_moves == 0) {
+    atomic_fetch_add_explicit(&g_vmodel_eg_null_nomoves, 1, memory_order_relaxed);
+    return NULL;
+  }
 
   uint8_t rack_idx[16];
   int rack_len = vmodel_extract_rack_indices(player_rack, rack_idx, 16);
@@ -2735,7 +2762,12 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     if (kind == 2) diff += equity_to_int(move_get_score(m));
     float p = vmodel_predict(model, rack_idx, rack_len, leave_idx, leave_len,
                              kind, diff, model->turn, unseen, sl);
-    if (p < 0.0f) continue;  // unscored (stratum/bucket missing)
+    atomic_fetch_add_explicit(&g_vmodel_eg_mv_total, 1, memory_order_relaxed);
+    if (p < 0.0f) {  // unscored (stratum/bucket missing)
+      atomic_fetch_add_explicit(&g_vmodel_eg_mv_unscored, 1,
+                                memory_order_relaxed);
+      continue;
+    }
     const float p_round = roundf(p * 10000.0f) / 10000.0f;
     if (p_round > best_win) {  // strict > keeps equity-sorted tie order
       best_win = p_round;
@@ -2803,6 +2835,9 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   }
   if (best_move)
     atomic_fetch_add_explicit(&g_vmodel_eg_picked, 1, memory_order_relaxed);
+  else
+    atomic_fetch_add_explicit(&g_vmodel_eg_null_unscored, 1,
+                              memory_order_relaxed);
   return best_move;  // NULL -> nothing scoreable -> caller keeps HastyBot
 }
 
