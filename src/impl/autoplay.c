@@ -2116,6 +2116,11 @@ static _Atomic uint64_t g_vmodel_eg_pass_picked = 0;
 // silently dropping most candidates. Over 100M games even 0.03% is ~150k plies,
 // so both need to be counted, not assumed.
 static _Atomic uint64_t g_vmodel_eg_null_nomodel  = 0;  // no model for this bag
+// Which bag_key the no-model calls land on. If they are bag_key<8 the bag has
+// emptied and the position belongs to the EXACT endgame solver, not to a model
+// lookup that misses and hands the move to HastyBot.
+#define VM_NOMODEL_HIST 24
+static _Atomic uint64_t g_vmodel_eg_nomodel_hist[VM_NOMODEL_HIST];
 static _Atomic uint64_t g_vmodel_eg_null_nomoves  = 0;  // movegen produced none
 static _Atomic uint64_t g_vmodel_eg_null_unscored = 0;  // moves existed, none scoreable
 static _Atomic uint64_t g_vmodel_eg_mv_total      = 0;  // candidate moves seen
@@ -2292,6 +2297,18 @@ void vmodel_log_stats(void) {
                 ? 100.0 * (double)atomic_load_explicit(&g_vmodel_eg_mv_unscored, memory_order_relaxed)
                         / (double)atomic_load_explicit(&g_vmodel_eg_mv_total, memory_order_relaxed)
                 : 0.0);
+      {
+        char hb[512]; int hn = 0;
+        hn += snprintf(hb + hn, sizeof(hb) - hn, "vmodel:   no-model by bag_key:");
+        for (int bk = 0; bk < VM_NOMODEL_HIST; bk++) {
+          const uint64_t c = atomic_load_explicit(&g_vmodel_eg_nomodel_hist[bk],
+                                                  memory_order_relaxed);
+          if (c && hn < (int)sizeof(hb) - 32)
+            hn += snprintf(hb + hn, sizeof(hb) - hn, " %d=%llu", bk,
+                           (unsigned long long)c);
+        }
+        fprintf(stderr, "%s\n", hb);
+      }
     }
   }
   // Always emit picks stats up-front — when picks cover every rack the
@@ -2693,6 +2710,9 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   const VModel *model = vmodels_by_bag[bag_key];
   if (!model) {
     atomic_fetch_add_explicit(&g_vmodel_eg_null_nomodel, 1, memory_order_relaxed);
+    if (bag_key < VM_NOMODEL_HIST)
+      atomic_fetch_add_explicit(&g_vmodel_eg_nomodel_hist[bag_key], 1,
+                                memory_order_relaxed);
     return NULL;
   }
   atomic_fetch_add_explicit(&g_vmodel_eg_called, 1, memory_order_relaxed);
