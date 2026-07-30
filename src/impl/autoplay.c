@@ -60,6 +60,7 @@
 #include "move_gen.h"
 #include "rack_list.h"
 #include "simmer.h"
+#include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -128,6 +129,36 @@ static _Atomic uint64_t g_eb_l3plus_outer_loop = 0;
 // Per-priority gate matched count at length>=3
 static _Atomic uint64_t g_eb_l3p_gate_match_by_prio[4] = {0};
 static _Atomic uint64_t g_eb_l3p_gate_iter_by_prio[4] = {0};
+// Benchmark instrumentation: accumulates total sim iterations across all
+// turns in all games. Read/reset via autoplay_get_total_sim_iterations().
+static _Atomic uint64_t autoplay_total_sim_iterations;
+
+uint64_t autoplay_get_total_sim_iterations(void) {
+  return atomic_load_explicit(&autoplay_total_sim_iterations,
+                              memory_order_relaxed);
+}
+
+void autoplay_reset_total_sim_iterations(void) {
+  atomic_store_explicit(&autoplay_total_sim_iterations, 0,
+                        memory_order_relaxed);
+}
+
+// Benchmark mode: when true, get_top_simming_move still runs the sim (so
+// iteration counts and per-turn timing are measured) but the turn's played
+// move is the top-equity move instead of the sim's chosen move. This makes
+// the game trajectory independent of sim throughput, so different RIT/BAI
+// variants run through the same sequence of positions.
+static _Atomic bool autoplay_bench_static_move_enabled;
+
+void autoplay_set_bench_static_move(bool enabled) {
+  atomic_store_explicit(&autoplay_bench_static_move_enabled, enabled,
+                        memory_order_relaxed);
+}
+
+bool autoplay_get_bench_static_move(void) {
+  return atomic_load_explicit(&autoplay_bench_static_move_enabled,
+                              memory_order_relaxed);
+}
 
 typedef struct LeavegenSharedData {
   int num_gens;
@@ -139,6 +170,10 @@ typedef struct LeavegenSharedData {
   const char *data_paths;
   KLV *klv;
   RackList *rack_list;
+  // Whether each generation should also dump rack_list's
+  // "<rack>,<count>,<mean>" data to a CSV (see rack_list_write_rack_equity_
+  // csv).
+  bool write_rack_equity_csv;
   Checkpoint *postgen_checkpoint;
   AutoplayResults *primary_autoplay_results;
   AutoplayResults **autoplay_results_list;
@@ -534,6 +569,22 @@ void postgen_prebroadcast_func(void *data) {
     log_fatal("leavegen failed to write result summary to file");
   }
 
+  // When -writerackequitycsv is set, also dump rack_list's
+  // "<rack>,<count>,<mean>" data for every observed rack, so a distributed
+  // caller doesn't have to parse the full per-generation KLV to get results.
+  if (lg_shared_data->write_rack_equity_csv) {
+    char *rack_equity_csv_name =
+        get_formatted_string("%s_rack_equity.csv", report_name_prefix);
+    rack_list_write_rack_equity_csv(lg_shared_data->rack_list,
+                                    lg_shared_data->ld, rack_equity_csv_name,
+                                    error_stack);
+    if (!error_stack_is_empty(error_stack)) {
+      error_stack_print_and_reset(error_stack);
+      log_fatal("leavegen failed to write rack equity results to file");
+    }
+    free(rack_equity_csv_name);
+  }
+
   string_builder_destroy(leave_gen_sb);
   error_stack_destroy(error_stack);
 
@@ -683,11 +734,16 @@ void autoplay_worker_destroy(AutoplayWorker *autoplay_worker) {
   free(autoplay_worker);
 }
 
+// forced_racks_filename is optional (NULL/empty for an unrestricted run) and
+// is passed straight through to rack_list_create; see its documentation for
+// what it does. Pushes to error_stack and returns NULL if that file can't be
+// read.
 LeavegenSharedData *leavegen_shared_data_create(
     AutoplayResults *primary_autoplay_results,
     AutoplayResults **autoplay_results_list, const LetterDistribution *ld,
     const char *data_paths, KLV *klv, int number_of_threads, int num_gens,
-    int *min_rack_targets) {
+    int *min_rack_targets, const char *forced_racks_filename,
+    bool write_rack_equity_csv, ErrorStack *error_stack) {
   LeavegenSharedData *shared_data = malloc_or_die(sizeof(LeavegenSharedData));
 
   shared_data->num_gens = num_gens;
@@ -701,19 +757,31 @@ LeavegenSharedData *leavegen_shared_data_create(
   shared_data->ld = ld;
   shared_data->data_paths = data_paths;
   shared_data->min_rack_targets = min_rack_targets;
-  shared_data->rack_list = rack_list_create(ld, min_rack_targets[0]);
+  shared_data->rack_list = rack_list_create(ld, min_rack_targets[0],
+                                            forced_racks_filename, error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    autoplay_results_destroy(shared_data->gen_autoplay_results);
+    free(shared_data);
+    return NULL;
+  }
+  shared_data->write_rack_equity_csv = write_rack_equity_csv;
   shared_data->postgen_checkpoint =
       checkpoint_create(number_of_threads, postgen_prebroadcast_func);
   return shared_data;
 }
 
-// Use NULL for the KLV when not running in leave gen mode.
+// Use NULL for the KLV when not running in leave gen mode. forced_racks_
+// filename and write_rack_equity_csv are only meaningful when klv is
+// non-NULL (see leavegen_shared_data_create); pushes to error_stack and
+// returns NULL on the same conditions that function does.
 AutoplaySharedData *
 autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
                             const uint64_t first_gen_num_games,
                             AutoplayResults *primary_autoplay_results,
                             AutoplayResults **autoplay_results_list, KLV *klv,
-                            int num_gens, int *min_rack_targets) {
+                            int num_gens, int *min_rack_targets,
+                            const char *forced_racks_filename,
+                            ErrorStack *error_stack) {
   AutoplaySharedData *shared_data = malloc_or_die(sizeof(AutoplaySharedData));
   shared_data->num_threads = num_autoplay_threads;
   shared_data->print_interval = args->print_interval;
@@ -730,8 +798,13 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   if (klv) {
     shared_data->leavegen_shared_data = leavegen_shared_data_create(
         primary_autoplay_results, autoplay_results_list, args->game_args->ld,
-        args->data_paths, klv, num_autoplay_threads, num_gens,
-        min_rack_targets);
+        args->data_paths, klv, num_autoplay_threads, num_gens, min_rack_targets,
+        forced_racks_filename, args->write_rack_equity_csv, error_stack);
+    if (!error_stack_is_empty(error_stack)) {
+      prng_destroy(shared_data->prng);
+      free(shared_data);
+      return NULL;
+    }
   }
   shared_data->force_table = NULL;
   shared_data->ld = args->game_args->ld;
@@ -1674,7 +1747,10 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
       force_table_is_exhausted(game_runner->shared_data->force_table);
   if (game_runner->shared_data->leavegen_shared_data &&
       // We only force draws if we've played enough games for this
-      // generation.
+      // generation. This also applies when leavegen's rack list is
+      // restricted to a forceracksfile (see rack_list_create): clients
+      // fulfilling requests can just pass 0 if they want forcing
+      // from the start.
       (iter_output->iter_count -
        game_runner->shared_data->leavegen_shared_data->gen_start_games) >=
           (uint64_t)autoplay_worker->args.games_before_force_draw_start) {
@@ -1758,9 +1834,21 @@ const Move *game_runner_get_top_simming_move(AutoplayWorker *autoplay_worker,
   }
 
   ErrorStack *error_stack = autoplay_worker->error_stack;
-  const Move *move = get_top_simming_move(
-      game, autoplay_worker->worker_index, move_list, sim_args,
-      &autoplay_worker->sim_ctx, autoplay_worker->sim_results, error_stack);
+  const Move *move =
+      get_top_simming_move(game, move_list, sim_args, &autoplay_worker->sim_ctx,
+                           autoplay_worker->sim_results, error_stack);
+  if (autoplay_worker->sim_results != NULL) {
+    atomic_fetch_add_explicit(
+        &autoplay_total_sim_iterations,
+        sim_results_get_iteration_count(autoplay_worker->sim_results),
+        memory_order_relaxed);
+  }
+  // In benchmark mode the sim still runs (above) but we play the top-equity
+  // static move to pin the game trajectory so different variants compare
+  // like-for-like positions.
+  if (autoplay_get_bench_static_move() && move_list_get_count(move_list) > 0) {
+    move = move_list_get_move(move_list, 0);
+  }
   if (!error_stack_is_empty(error_stack)) {
     error_stack_print_and_reset(error_stack);
     log_fatal("autoplay worker %d failed to get top simming move for player %d "
@@ -1828,7 +1916,6 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
         .move_record_type = MOVE_RECORD_BEST,
         .move_sort_type = MOVE_SORT_EQUITY,
         .override_kwg = NULL,
-        .thread_index = autoplay_worker->worker_index,
         .eq_margin_movegen = 0,
         .target_equity = EQUITY_MAX_VALUE,
         .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -1914,7 +2001,6 @@ static const Move *try_forced_move(AutoplayWorker *autoplay_worker,
       .move_record_type = MOVE_RECORD_ALL,
       .move_sort_type = MOVE_SORT_EQUITY,
       .override_kwg = NULL,
-      .thread_index = autoplay_worker->worker_index,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -2018,8 +2104,7 @@ const Move *game_runner_get_best_move(AutoplayWorker *autoplay_worker,
                                 : &autoplay_worker->args.p2_sim_args;
   if (sim_args->num_plies == 0) {
     return get_top_equity_move(
-        game_runner->game, autoplay_worker->worker_index,
-        autoplay_worker->move_lists[player_on_turn_index]);
+        game_runner->game, autoplay_worker->move_lists[player_on_turn_index]);
   }
   return game_runner_get_top_simming_move(autoplay_worker, game_runner);
 }
@@ -2482,7 +2567,6 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
       .move_record_type = MOVE_RECORD_ALL,
       .move_sort_type = MOVE_SORT_EQUITY,
       .override_kwg = NULL,
-      .thread_index = autoplay_worker->worker_index,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -2741,7 +2825,7 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   const MoveGenArgs gen_args = {
       .game = game, .move_list = ml, .move_record_type = MOVE_RECORD_ALL,
       .move_sort_type = MOVE_SORT_EQUITY, .override_kwg = NULL,
-      .thread_index = worker_index, .eq_margin_movegen = 0,
+      .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
       .tiles_played_bv = NULL, .initial_tiles_bv = 0};
@@ -3062,8 +3146,16 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
 
     const Move *forced_move =
         game_runner_get_best_move(autoplay_worker, game_runner);
-    rack_list_add_rack(lg_shared_data->rack_list, &rare_rack_or_move_leave,
-                       equity_to_double(move_get_equity(forced_move)));
+    // A forced rack is under no obligation to have a legal play, and a
+    // pass's equity is a sentinel value that can't be recorded, so passes
+    // are skipped entirely here. This is more likely than usual when
+    // lg_shared_data->rack_list is restricted to a forceracksfile (see
+    // rack_list_create), since those racks are picked externally rather
+    // than drawn from the actual remaining tile pool.
+    if (move_get_type(forced_move) != GAME_EVENT_PASS) {
+      rack_list_add_rack(lg_shared_data->rack_list, &rare_rack_or_move_leave,
+                         equity_to_double(move_get_equity(forced_move)));
+    }
 
     rack_copy(player_rack, &original_rack);
   }
@@ -3138,7 +3230,6 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
             .move_record_type = MOVE_RECORD_ALL,
             .move_sort_type = MOVE_SORT_EQUITY,
             .override_kwg = NULL,
-            .thread_index = autoplay_worker->worker_index,
             .eq_margin_movegen = 0,
             .target_equity = EQUITY_MAX_VALUE,
             .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -3274,7 +3365,8 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
     if (sim_args->num_plies > 0) {
       char *sim_str = sim_results_get_string(
           game, autoplay_worker->sim_results, sim_args->max_num_display_plays,
-          sim_args->max_num_display_plies, -1, -1, NULL, 0, false, false, NULL);
+          sim_args->max_num_display_plies, -1, -1, NULL, 0, false, false,
+          /*show_bu=*/false, NULL);
       string_builder_add_string(output, sim_str);
       free(sim_str);
       if (sim_args->use_inference && game_runner->turn_number > 0 &&
@@ -4287,7 +4379,6 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
       .move_record_type = MOVE_RECORD_ALL,
       .move_sort_type = MOVE_SORT_EQUITY,
       .override_kwg = NULL,
-      .thread_index = w->worker_index,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -5821,7 +5912,7 @@ static bool pp_credit_once(const ForceTable *ft, const ForceTarget *t,
 // if the game reached a committable end; sets *is_win/*is_tie (mover's view)
 // and *f0/*f1 (final scores, sign-correct so the recorder's per-row outcome
 // matches the label).
-static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
+static bool pp_playout_outcome(EndgameCtx **es, EndgameResults *er,
                                ThreadControl *tc, Game *dg, MoveList *post_ml,
                                int worker_index, int mover, bool endgame,
                                int eg_plies, const double *eg_caps,
@@ -5862,7 +5953,7 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
           if (vmodels_by_bag)
             pm = vmodel_endgame_pick_move(dg, vmodels_by_bag, vmodel_sl,
                                           worker_index, post_ml);
-          if (!pm) pm = get_top_equity_move(dg, worker_index, post_ml);
+          if (!pm) pm = get_top_equity_move(dg, post_ml);
           play_move(pm, dg, NULL);
         } else {
           Move *sp = move_list_get_spare_move(post_ml);
@@ -5906,7 +5997,7 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
         if (vmodels_by_bag)
           pm = vmodel_endgame_pick_move(dg, vmodels_by_bag, vmodel_sl,
                                         worker_index, post_ml);
-        if (!pm) pm = get_top_equity_move(dg, worker_index, post_ml);
+        if (!pm) pm = get_top_equity_move(dg, post_ml);
         const game_event_t opp_mt = move_get_type(pm);
         play_move(pm, dg, NULL);
         // The mover's pass commitment holds while tiles remain in the bag:
@@ -5950,11 +6041,21 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
             .tt_fraction_of_mem = eg_tt_frac,
             .initial_small_move_arena_size =
                 DEFAULT_INITIAL_SMALL_MOVE_ARENA_SIZE,
-            .num_threads = 1, .base_thread_index = worker_index,
+            // Movegen scratch is now per-pthread (get_movegen() picks the
+            // slot), so the old base_thread_index offset is obsolete —
+            // concurrent solves can no longer collide on slot 0.
+            .num_threads = 1,
             .num_top_moves = 1, .use_heuristics = true,
             .per_ply_callback = NULL, .per_ply_callback_data = NULL,
             .forced_pass_bypass = false, .soft_time_limit = cap,
-            .hard_time_limit = cap, .sign_stable_k = eg_signstable_k};
+            .hard_time_limit = cap,
+            // hard_time_limit alone is only consulted BETWEEN depths (via the
+            // EBF projection), so a single mispredicted depth could still tail
+            // the worker. Arm the absolute deadline too: workers check it
+            // in-search, which is what our own hard_deadline_ns used to do.
+            .external_deadline_ns =
+                ctimer_monotonic_ns() + (int64_t)(cap * 1e9),
+            .sign_stable_k = eg_signstable_k};
         ErrorStack *err = error_stack_create();
         Timer eg_timer;
         ctimer_start(&eg_timer);
@@ -6007,7 +6108,7 @@ static bool pp_playout_outcome(EndgameSolver *es, EndgameResults *er,
       pm = vmodel_endgame_pick_move(dg, vmodels_by_bag, vmodel_sl,
                                     worker_index, post_ml);
     }
-    if (!pm) pm = get_top_equity_move(dg, worker_index, post_ml);
+    if (!pm) pm = get_top_equity_move(dg, post_ml);
     play_move(pm, dg, NULL);
   }
   // Commit a natural terminus: a standard out OR the six-pass (CONSECUTIVE_
@@ -6045,7 +6146,6 @@ static bool pp_setup_opener(AutoplayWorker *worker, GameRunner *gr,
       .move_record_type = MOVE_RECORD_ALL,
       .move_sort_type = MOVE_SORT_EQUITY,
       .override_kwg = NULL,
-      .thread_index = worker->worker_index,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -6282,7 +6382,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             eg_caps[3], eg_caps[4], eg_caps[5], eg_caps[6], eg_caps[7],
             eg_pos_budget, eg_overflow_cap, eg_max_solves);
   }
-  EndgameSolver *es = endgame ? endgame_solver_create() : NULL;
+  EndgameCtx *es = endgame ? endgame_ctx_create() : NULL;
   EndgameResults *er = endgame ? endgame_results_create() : NULL;
   // Per-worker ThreadControl for the endgame solves: worker->args.thread_control
   // is SHARED across all autoplay workers, so concurrent endgame_solve on it
@@ -6520,7 +6620,6 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             .move_record_type = MOVE_RECORD_ALL,
             .move_sort_type = MOVE_SORT_EQUITY,
             .override_kwg = NULL,
-            .thread_index = worker->worker_index,
             .eq_margin_movegen = 0,
             .target_equity = EQUITY_MAX_VALUE,
             .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -6792,7 +6891,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
               int if0 = 0, if1 = 0;
               double ispent = 0.0;
               const bool ok = pp_playout_outcome(
-                  es, er, eg_tc, cg, post_ml, worker->worker_index, on_idx,
+                  &es, er, eg_tc, cg, post_ml, worker->worker_index, on_idx,
                   /*endgame=*/false, eg_plies, eg_caps, eg_signstable_k, eg_diffgate,
                   eg_tt_frac, &ispent, eg_pos_budget, eg_overflow_cap, &iwin, &itie,
                   &if0, &if1, NULL,
@@ -6847,7 +6946,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             Game *pg = game_duplicate(dg);
             bool pw = false, pt = false;
             int pf0 = 0, pf1 = 0;
-            pp_playout_outcome(es, er, eg_tc, pg, post_ml, worker->worker_index,
+            pp_playout_outcome(&es, er, eg_tc, pg, post_ml, worker->worker_index,
                                on_idx, false, eg_plies, eg_caps, eg_signstable_k,
                                eg_diffgate, eg_tt_frac, NULL, 0.0, 0.0, &pw, &pt,
                                &pf0, &pf1, NULL,
@@ -6878,7 +6977,8 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             eg_solve = (eff_diff >= eg_cut_lo[gate_bag][llen] &&
                         eff_diff <= eg_cut_hi[gate_bag][llen]);
           const bool committable = pp_playout_outcome(
-              es, er, eg_tc, dg, post_ml, worker->worker_index, on_idx, eg_solve,
+              &es, er, eg_tc, dg, post_ml, worker->worker_index, on_idx,
+              eg_solve,
               eg_plies, eg_caps, eg_signstable_k, eg_diffgate, eg_tt_frac,
               &eg_spent, eg_pos_budget, eg_overflow_cap, &win, &tie, &f0, &f1,
               &spread,
@@ -6949,14 +7049,14 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         // NOT game_runner_play_move, whose autoplay path (sim / EB role forcing)
         // misbehaves on a loaded mid-game board. Stage the row, then play it.
         const Move *target =
-            get_top_equity_move(gr->game, worker->worker_index, post_ml);
+            get_top_equity_move(gr->game, post_ml);
         eb_stage_trajectory_row(gr, gr->game, target, on_idx);
         play_move(target, gr->game, NULL);
         // POST: play out to game end (endgame solve at bag-empty if enabled).
         bool win = false, tie = false;
         int f0 = 0, f1 = 0;
         const bool committable = pp_playout_outcome(
-            es, er, eg_tc, gr->game, post_ml, worker->worker_index, on_idx,
+            &es, er, eg_tc, gr->game, post_ml, worker->worker_index, on_idx,
             endgame, eg_plies, eg_caps, eg_signstable_k, eg_diffgate, eg_tt_frac,
             NULL, 0.0, 0.0, &win, &tie, &f0, &f1, NULL,
             sd->vmodel_bags_any_loaded ? sd->vmodels_by_bag : NULL,
@@ -6974,7 +7074,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
       if (pos_capped) break;
     }
   }
-  if (es) endgame_solver_destroy(es);
+  if (es) endgame_ctx_destroy(es);
   if (er) endgame_results_destroy(er);
   if (eg_tc) thread_control_destroy(eg_tc);
   if (spread_fp) fclose(spread_fp);
@@ -7087,6 +7187,11 @@ void valid_autoplay_results_options(const AutoplayResults *autoplay_results,
 
 void autoplay(const AutoplayArgs *args, AutoplayResults *autoplay_results,
               ErrorStack *error_stack) {
+  valid_autoplay_results_options(autoplay_results, args, error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    return;
+  }
+
   const bool is_leavegen_mode = args->type == AUTOPLAY_TYPE_LEAVE_GEN;
   int num_gens = 1;
   int *min_rack_targets = NULL;
@@ -7120,11 +7225,6 @@ void autoplay(const AutoplayArgs *args, AutoplayResults *autoplay_results,
     }
   }
 
-  valid_autoplay_results_options(autoplay_results, args, error_stack);
-  if (!error_stack_is_empty(error_stack)) {
-    return;
-  }
-
   ThreadControl *thread_control = args->thread_control;
 
   autoplay_results_reset(autoplay_results);
@@ -7145,7 +7245,13 @@ void autoplay(const AutoplayArgs *args, AutoplayResults *autoplay_results,
 
   AutoplaySharedData *shared_data = autoplay_shared_data_create(
       args, autoplay_num_threads, first_gen_num_games, autoplay_results,
-      autoplay_results_list, klv, num_gens, min_rack_targets);
+      autoplay_results_list, klv, num_gens, min_rack_targets,
+      args->force_racks_filename, error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    free(autoplay_results_list);
+    free(min_rack_targets);
+    return;
+  }
 
   AutoplayWorker **autoplay_workers =
       malloc_or_die((sizeof(AutoplayWorker *)) * (autoplay_num_threads));

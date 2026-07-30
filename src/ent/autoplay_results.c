@@ -1112,8 +1112,10 @@ void leaves_data_consolidate(Recorder **recorder_list, int list_size,
                      ld_get_size(primary_recorder->recorder_context->ld));
   if (access(leaves_count_filename, F_OK) == 0) {
     FILE *leaves_file = fopen_or_die(leaves_count_filename, "r");
-    char line[256];
-    while (fgets(line, sizeof(line), leaves_file)) {
+    char *line = NULL;
+    size_t line_capacity = 0;
+    while (getline_ignore_carriage_return(&line, &line_capacity, leaves_file) !=
+           -1) {
       char *leave_str = strtok(line, ",");
       const char *count_str = strtok(NULL, "\n");
       if (!leave_str || !count_str) {
@@ -1141,6 +1143,7 @@ void leaves_data_consolidate(Recorder **recorder_list, int list_size,
       }
       primary_leaves_data->leave_counts[leave_index] = count;
     }
+    free(line);
     fclose_or_die(leaves_file);
   }
 

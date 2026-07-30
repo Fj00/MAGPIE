@@ -235,6 +235,85 @@ void test_autoplay_leaves_record(void) {
   config_destroy(csw_config);
 }
 
+void test_autoplay_leavegen_force_racks(void) {
+  Config *ab_config =
+      config_create_or_die("set -lex CSW21_ab -ld english_ab -wmp false -s1 "
+                           "equity -s2 equity -r1 best -r2 "
+                           "best -numplays 1 -threads 1");
+
+  const char *force_racks_filename = "test_leavegen_force_racks.txt";
+  ErrorStack *write_error_stack = error_stack_create();
+  // Racks must be full RACK_SIZE racks: the file restricts which racks
+  // leavegen's RackList treats as eligible to be forced (see
+  // rack_list_create). CSW21_ab/english_ab only has 8 possible full racks
+  // (see test_rack_list in rack_list_test.c), so restricting to 2 of them
+  // makes the generation converge almost immediately.
+  write_string_to_file(force_racks_filename, "w", "AAAAAAB\nABBBBBB\n",
+                       write_error_stack);
+  assert(error_stack_is_empty(write_error_stack));
+  error_stack_destroy(write_error_stack);
+
+  char *leavegen_cmd =
+      get_formatted_string("leavegen 1 0 %s -seed 3", force_racks_filename);
+  // The minimum leave count should be achieved quickly, so if this takes too
+  // long, we know it failed.
+  load_and_exec_config_or_die_timed(ab_config, leavegen_cmd, 60);
+  free(leavegen_cmd);
+
+  // Missing force racks file.
+  assert_config_exec_status(
+      ab_config, "leavegen 1 0 does_not_exist_force_racks.txt -seed 3",
+      ERROR_STATUS_RW_FAILED_TO_OPEN_STREAM);
+
+  // Malformed rack line (wrong size for RACK_SIZE-tile racks).
+  const char *bad_force_racks_filename = "test_leavegen_bad_force_racks.txt";
+  ErrorStack *bad_write_error_stack = error_stack_create();
+  write_string_to_file(bad_force_racks_filename, "w", "AAAAAAB\nAB\n",
+                       bad_write_error_stack);
+  assert(error_stack_is_empty(bad_write_error_stack));
+  error_stack_destroy(bad_write_error_stack);
+  char *bad_racks_cmd =
+      get_formatted_string("leavegen 1 0 %s -seed 3", bad_force_racks_filename);
+  assert_config_exec_status(ab_config, bad_racks_cmd,
+                            ERROR_STATUS_AUTOPLAY_FORCE_RACKS_MALFORMED_RACK);
+  free(bad_racks_cmd);
+  (void)remove(bad_force_racks_filename);
+
+  // Duplicate rack.
+  const char *duplicate_force_racks_filename =
+      "test_leavegen_duplicate_force_racks.txt";
+  ErrorStack *duplicate_write_error_stack = error_stack_create();
+  write_string_to_file(duplicate_force_racks_filename, "w",
+                       "AAAAAAB\nABBBBBB\nAAAAAAB\n",
+                       duplicate_write_error_stack);
+  assert(error_stack_is_empty(duplicate_write_error_stack));
+  error_stack_destroy(duplicate_write_error_stack);
+  char *duplicate_racks_cmd = get_formatted_string(
+      "leavegen 1 0 %s -seed 3", duplicate_force_racks_filename);
+  assert_config_exec_status(ab_config, duplicate_racks_cmd,
+                            ERROR_STATUS_AUTOPLAY_FORCE_RACKS_DUPLICATE_RACK);
+  free(duplicate_racks_cmd);
+  (void)remove(duplicate_force_racks_filename);
+
+  // File with no parseable racks.
+  const char *empty_force_racks_filename =
+      "test_leavegen_empty_force_racks.txt";
+  ErrorStack *empty_write_error_stack = error_stack_create();
+  write_string_to_file(empty_force_racks_filename, "w", "\n\n   \n",
+                       empty_write_error_stack);
+  assert(error_stack_is_empty(empty_write_error_stack));
+  error_stack_destroy(empty_write_error_stack);
+  char *empty_racks_cmd = get_formatted_string("leavegen 1 0 %s -seed 3",
+                                               empty_force_racks_filename);
+  assert_config_exec_status(ab_config, empty_racks_cmd,
+                            ERROR_STATUS_AUTOPLAY_FORCE_RACKS_FILE_EMPTY);
+  free(empty_racks_cmd);
+  (void)remove(empty_force_racks_filename);
+
+  (void)remove(force_racks_filename);
+  config_destroy(ab_config);
+}
+
 // Check wmp movegen correctness by comparing results in gamepair autoplay to
 // the legacy recursive_gen algorithm. Auto-discovers .wmp lexica under the
 // configured data paths so the test stays in sync with available data.
@@ -324,6 +403,48 @@ void test_autoplay_wmp_correctness(void) {
   error_stack_destroy(error_stack);
 }
 
+void test_autoplay_rit_correctness(void) {
+  // Build a RIT for TWL98 using the release binary (fast), then run
+  // game pairs under ASAN where player 1 uses RIT and player 2 does not.
+  // Any divergence means the RIT changed move selection.
+  const char *lex = "TWL98";
+  const int num_pairs = 5000;
+
+  // The RIT must be pre-built before running this test. On CI, the
+  // release binary builds it. Locally: run
+  //   echo "convert klvwmp2rit TWL98" | ./bin/magpie "set -lex TWL98 -wmp true
+  //   -rit false"
+  printf("Running %d game pairs with RIT correctness check for %s...\n",
+         num_pairs, lex);
+  (void)fflush(stdout);
+
+  // Run game pairs: player 1 uses RIT, player 2 does not.
+  Config *c = config_create_or_die(
+      "set -lex TWL98 -s1 equity -s2 equity -r1 all -r2 all "
+      "-numplays 1 -gp true -w1 true -w2 true "
+      "-rit1 true -rit2 false -threads 4");
+  load_and_exec_config_or_die(c, "autoplay games 5000 -seed 42 -gp true");
+
+  char *res =
+      autoplay_results_to_string(config_get_autoplay_results(c), false, true);
+  const char *expected_zero = "autoplay games 0";
+  if (!has_substring(res, expected_zero)) {
+    (void)fprintf(stderr, "RIT autoplay divergence detected for %s:\n%s\n", lex,
+                  res ? res : "(no output)");
+    assert(false);
+  }
+  free(res);
+  config_destroy(c);
+
+  // Clean up the RIT file.
+  char *rit_path =
+      get_formatted_string("%s/lexica/%s.rit", DEFAULT_TEST_DATA_PATH, lex);
+  (void)remove(rit_path);
+  free(rit_path);
+
+  printf("RIT correctness: PASSED (%d game pairs, 0 divergent)\n", num_pairs);
+}
+
 void test_autoplay_sim(void) {
   Config *config = config_create_or_die(
       "set -lex CSW21 -s1 equity -s2 equity -r1 all -r2 all "
@@ -340,13 +461,18 @@ void test_autoplay_sim(void) {
   config_destroy(config);
 }
 
-void test_autoplay(void) {
+void test_autoplay_remaining(void) {
   test_odds_that_player_is_better();
-  test_autoplay_default();
   test_autoplay_leavegen();
   test_autoplay_divergent_games();
-  test_autoplay_wmp_correctness();
   test_autoplay_win_pct_record();
   test_autoplay_leaves_record();
+  test_autoplay_leavegen_force_racks();
   test_autoplay_sim();
+}
+
+void test_autoplay(void) {
+  test_autoplay_remaining();
+  test_autoplay_default();
+  test_autoplay_wmp_correctness();
 }

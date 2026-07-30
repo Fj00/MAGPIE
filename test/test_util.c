@@ -181,7 +181,8 @@ Config *config_create_default_test(void) {
   error_stack_destroy(error_stack);
   load_and_exec_config_or_die(
       config, "set -threads 1 -savesettings false -hr "
-              "false -numplays 15 -ima 0 -minp 100 -autosave false");
+              "false -numplays 15 -ima 0 -minp 100 -autosave false "
+              "-fgrequired false");
   return config;
 }
 
@@ -372,7 +373,6 @@ void play_top_n_equity_move(Game *game, int n) {
       .move_record_type = MOVE_RECORD_ALL,
       .move_sort_type = MOVE_SORT_EQUITY,
       .override_kwg = NULL,
-      .thread_index = 0,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -726,7 +726,6 @@ void assert_validated_and_generated_moves(Game *game, const char *rack_string,
   const MoveGenArgs move_gen_args = {
       .game = game,
       .move_list = move_list,
-      .thread_index = 0,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -802,7 +801,8 @@ error_code_t config_simulate_and_return_status(Config *config, SimCtx **sim_ctx,
   ErrorStack *error_stack = error_stack_create();
   thread_control_set_status(config_get_thread_control(config),
                             THREAD_CONTROL_STATUS_STARTED);
-  config_simulate(config, sim_ctx, known_opp_rack, sim_results, error_stack);
+  config_simulate(config, sim_ctx, known_opp_rack, sim_results, NULL, 0,
+                  error_stack);
   error_code_t status = error_stack_top(error_stack);
   if (status != ERROR_STATUS_SUCCESS) {
     printf("config simulate finished with error: %d\n", status);
@@ -1011,14 +1011,13 @@ void generate_anchors_for_test(Game *game) {
   // We don't care about them, but exchanges will be recorded while
   // looking up leave values and it is not adding a parameter to prevent this.
   MoveList *move_list = move_list_create(1000);
-  MoveGen *gen = get_movegen(/*thread_index=*/0);
+  MoveGen *gen = get_movegen();
   const MoveGenArgs args = {
       .game = game,
       .move_list = move_list,
       .move_record_type = player_get_move_record_type(player_on_turn),
       .move_sort_type = player_get_move_sort_type(player_on_turn),
       .override_kwg = NULL,
-      .thread_index = 0,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
@@ -1028,15 +1027,17 @@ void generate_anchors_for_test(Game *game) {
   if (wmp_move_gen_is_active(&gen->wmp_move_gen)) {
     const bool check_leaves = (gen->number_of_tiles_in_bag > 0) &&
                               (gen->move_sort_type != MOVE_SORT_SCORE);
-    wmp_move_gen_check_nonplaythrough_existence(&gen->wmp_move_gen,
-                                                check_leaves, &gen->leave_map);
+    wmp_move_gen_check_nonplaythrough_existence(
+        &gen->wmp_move_gen, check_leaves, &gen->leave_map,
+        /*subracks_precomputed=*/false,
+        /*wmp_entries_precomputed=*/false);
   }
   gen_shadow(gen);
   move_list_destroy(move_list);
 }
 
 void extract_sorted_anchors_for_test(AnchorHeap *sorted_anchors) {
-  MoveGen *gen = get_movegen(/*thread_index=*/0);
+  MoveGen *gen = get_movegen();
   anchor_heap_reset(sorted_anchors);
   while (gen->anchor_heap.count > 0) {
     sorted_anchors->anchors[sorted_anchors->count++] =
@@ -1135,6 +1136,7 @@ void assert_config_exec_status(Config *config, const char *cmd,
              "%d\n>%s<\n",
              expected_error_code, load_status, cmd);
       error_stack_print_and_reset(error_stack);
+      (void)fflush(stdout);
       abort();
     }
     error_stack_destroy(error_stack);
@@ -1148,6 +1150,7 @@ void assert_config_exec_status(Config *config, const char *cmd,
            "%d\n>%s<\n",
            expected_error_code, actual_error_code, cmd);
     error_stack_print_and_reset(error_stack);
+    (void)fflush(stdout);
     abort();
   }
   error_stack_destroy(error_stack);

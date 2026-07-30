@@ -118,6 +118,7 @@ void simulate(SimArgs *sim_args, SimCtx **sim_ctx, SimResults *sim_results,
   sim_results_set_rack(sim_results, move_list_get_rack(sim_args->move_list));
   sim_results_set_known_opp_rack(sim_results, sim_args->known_opp_rack);
   sim_results_set_cutoff(sim_results, sim_args->bai_options.cutoff);
+  sim_results_set_utility_w_spread(sim_results, sim_args->utility_w_spread);
   sim_results_set_num_infer_leaves(sim_results, num_infer_leaves);
 
   bai(&sim_args->bai_options, (*sim_ctx)->rvs, (*sim_ctx)->rng,
@@ -141,9 +142,9 @@ void simulate_without_ctx(SimArgs *sim_args, SimResults *sim_results,
 // but they are passed in separately because this function needs to generate
 // moves on a nonconst MoveList pointer but the SimArgs MoveList pointer is
 // const.
-const Move *get_top_simming_move(Game *game, int movegen_index,
-                                 MoveList *move_list, SimArgs *sim_args,
-                                 SimCtx **sim_ctx, SimResults *sim_results,
+const Move *get_top_simming_move(Game *game, MoveList *move_list,
+                                 SimArgs *sim_args, SimCtx **sim_ctx,
+                                 SimResults *sim_results,
                                  ErrorStack *error_stack) {
   const MoveGenArgs gen_args = {
       .game = game,
@@ -151,7 +152,6 @@ const Move *get_top_simming_move(Game *game, int movegen_index,
       .move_record_type = MOVE_RECORD_ALL,
       .move_sort_type = MOVE_SORT_EQUITY,
       .override_kwg = NULL,
-      .thread_index = movegen_index,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,

@@ -3,6 +3,7 @@
 #include "io_util.h"
 #include <assert.h>
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -863,6 +864,43 @@ double string_to_double(const char *str, ErrorStack *error_stack) {
   return result;
 }
 
+int string_to_int_prefix(const char *str, const char **end,
+                         ErrorStack *error_stack) {
+  const char *str_copy = str;
+  str = str + strspn(str, STRING_CONV_ACCEPT_CHARS);
+  errno = 0;
+  char *endptr;
+  long result = strtol(str, &endptr, 10);
+  if (endptr == str || errno == ERANGE) {
+    error_stack_push(error_stack, ERROR_STATUS_STRING_TO_INT_CONVERSION_FAILED,
+                     get_formatted_string(
+                         "string to int conversion failed for '%s'", str_copy));
+    result = 0;
+    endptr = (char *)str;
+  }
+  *end = endptr;
+  return (int)result;
+}
+
+double string_to_double_prefix(const char *str, const char **end,
+                               ErrorStack *error_stack) {
+  const char *str_copy = str;
+  const char *trimmed_str = str + strspn(str, STRING_CONV_ACCEPT_CHARS);
+  errno = 0;
+  char *endptr;
+  double result = strtod(trimmed_str, &endptr);
+  if (endptr == trimmed_str || errno == ERANGE) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_STRING_TO_DOUBLE_CONVERSION_FAILED,
+        get_formatted_string("string to decimal conversion failed for '%s'",
+                             str_copy));
+    result = 0;
+    endptr = (char *)trimmed_str;
+  }
+  *end = endptr;
+  return result;
+}
+
 char *json_unescape_string(const char *json_string) {
   size_t input_len = string_length(json_string);
   char *unescaped = malloc_or_die(input_len + 1);
@@ -949,6 +987,7 @@ struct StringGrid {
   int cols;
   int col_padding;
   int *max_col_widths;
+  bool *col_right_align; // per column; false (left-aligned) by default
   char **cells;
 };
 
@@ -958,6 +997,7 @@ StringGrid *string_grid_create(int rows, int cols, int col_padding) {
   string_grid->cols = cols;
   string_grid->col_padding = col_padding;
   string_grid->max_col_widths = calloc_or_die(cols, sizeof(int));
+  string_grid->col_right_align = calloc_or_die(cols, sizeof(bool));
   string_grid->cells =
       calloc_or_die((size_t)rows * (size_t)cols, sizeof(char *));
   return string_grid;
@@ -971,8 +1011,17 @@ void string_grid_destroy(StringGrid *string_grid) {
     free(string_grid->cells[i]);
   }
   free(string_grid->max_col_widths);
+  free(string_grid->col_right_align);
   free(string_grid->cells);
   free(string_grid);
+}
+
+void string_grid_set_col_right_align(StringGrid *string_grid, int col,
+                                     bool right_align) {
+  if (col < 0 || col >= string_grid->cols) {
+    log_fatal("string grid column out of range: %d", col);
+  }
+  string_grid->col_right_align[col] = right_align;
 }
 
 int string_grid_get_cell_index(const StringGrid *string_grid, int row,
@@ -1041,8 +1090,21 @@ void string_builder_add_string_grid(StringBuilder *sb, const StringGrid *sg,
         cell_value = "";
       }
 
-      string_builder_add_formatted_string(sb, "%-*s", sg->max_col_widths[c],
-                                          cell_value);
+      // Align the cell within its content width, then emit the column padding
+      // as a trailing separator. This keeps padding between columns regardless
+      // of alignment (so right-aligned columns still get a gap to the next
+      // one), and is byte-identical to the old "%-*s" over the padded width for
+      // the default left-aligned case.
+      int content_width = sg->max_col_widths[c] - sg->col_padding;
+      if (content_width < 0) {
+        content_width = 0;
+      }
+      string_builder_add_formatted_string(
+          sb, sg->col_right_align[c] ? "%*s" : "%-*s", content_width,
+          cell_value);
+      for (int pad = 0; pad < sg->col_padding; pad++) {
+        string_builder_add_char(sb, ' ');
+      }
 
       if (add_border) {
         string_builder_add_string(sb, "|");
@@ -1055,6 +1117,10 @@ void string_builder_add_string_grid(StringBuilder *sb, const StringGrid *sg,
       string_builder_draw_horizontal_border(sb, sg);
     }
   }
+}
+
+int compare_string_ptrs(const void *a, const void *b) {
+  return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
 size_t visual_string_length(const char *str) {

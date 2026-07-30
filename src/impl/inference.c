@@ -62,7 +62,6 @@ typedef struct Inference {
   uint64_t current_rack_index;
   int num_threads;
   int print_interval;
-  int movegen_index;
   uint64_t *shared_rack_index;
   cpthread_mutex_t *shared_rack_index_lock;
   cpthread_t cpthread_id;
@@ -168,7 +167,7 @@ void evaluate_possible_leave(Inference *inference) {
 
   // For tile placements, margin is already in target_equity_cutoff, so pass 0
   const Move *top_move = get_top_equity_move_for_inferences(
-      inference->game, inference->movegen_index, inference->move_list,
+      inference->game, inference->move_list,
       inference->use_infer_cutoff_optimization ? target_equity_cutoff
                                                : EQUITY_MAX_VALUE,
       target_leave_size, eq_margin_movegen);
@@ -325,8 +324,7 @@ void complete_inference_setup(Inference *inference, const InferenceArgs *args) {
   }
 }
 
-Inference *inference_create(const Game *game, int thread_index,
-                            const InferenceArgs *args,
+Inference *inference_create(const Game *game, const InferenceArgs *args,
                             const InferenceResults *results) {
   Inference *inference = malloc_or_die(sizeof(Inference));
   inference->game = game_duplicate(game);
@@ -365,14 +363,6 @@ Inference *inference_create(const Game *game, int thread_index,
   inference->num_threads = args->num_threads;
   inference->print_interval = args->print_interval;
   inference->thread_control = args->thread_control;
-  if (args->parent_worker_thread_index > 0 && thread_index > 0) {
-    log_fatal("Both parent worker thread index (%d) and inference thread "
-              "index (%d) are greater than 0.",
-              args->parent_worker_thread_index, thread_index);
-  }
-
-  inference->movegen_index = args->parent_worker_thread_index + thread_index;
-
   complete_inference_setup(inference, args);
 
   return inference;
@@ -688,8 +678,20 @@ void populate_inference_args_with_game_history(InferenceArgs *args,
     args->target_num_exch = move_get_tiles_played(move);
     rack_reset(args->target_played_tiles);
   }
-  rack_copy(args->nontarget_known_rack,
-            player_get_rack(game_get_player(game_dup, 1 - args->target_index)));
+  // Only overwrite nontarget_known_rack from the replayed game state if the
+  // caller has not already provided one. Callers such as analyze pre-set this
+  // to the current player's actual GCG rack so that inference only considers
+  // leaves whose tiles are genuinely available in the simulation bag. If we
+  // always overwrote it here, we would copy the nontarget player's rack from
+  // the replayed game_dup, which is empty (their tiles are in the bag at the
+  // replayed state), allowing inference to enumerate racks that include tiles
+  // already held by the current player — causing fatal draw failures when
+  // simulation later tries to draw those tiles from the bag.
+  if (rack_is_empty(args->nontarget_known_rack)) {
+    rack_copy(
+        args->nontarget_known_rack,
+        player_get_rack(game_get_player(game_dup, 1 - args->target_index)));
+  }
   if (rack_is_empty(args->target_known_rack)) {
     for (int i = most_recent_move_event_index - 1; i >= 0; i--) {
       GameEvent *event = game_history_get_event(game_history, i);
@@ -742,7 +744,7 @@ void inference_ctx_set_inferences(InferenceCtx *ctx, const InferenceArgs *args,
   } else {
     cpthread_mutex_init(&ctx->shared_rack_index_lock);
     for (int i = 0; i < ctx->num_workers; i++) {
-      ctx->worker_inferences[i] = inference_create(ctx->game, i, args, results);
+      ctx->worker_inferences[i] = inference_create(ctx->game, args, results);
       set_shared_variables_for_inference(ctx->worker_inferences[i],
                                          &ctx->shared_rack_index,
                                          &ctx->shared_rack_index_lock);

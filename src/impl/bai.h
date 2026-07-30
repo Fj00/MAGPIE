@@ -55,6 +55,12 @@ typedef struct BAISyncData {
   cpthread_mutex_t mutex;
   ThreadControl *thread_control;
   BAIResult *bai_result;
+  // Non-owning pointer into bai_options->arm_avoid_prune.
+  // bai() modifies this array in-place (swap-and-shrink); guarded by mutex.
+  int *avoid_prune_arms;
+  int avoid_prune_count;    // remaining arms still needing top-up
+  int avoid_prune_next_idx; // round-robin cursor
+  int avoid_prune_best_arm_idx;
 } BAISyncData;
 
 static inline BAISyncData *bai_sync_data_create(BAIResult *bai_result,
@@ -68,6 +74,7 @@ static inline BAISyncData *bai_sync_data_create(BAIResult *bai_result,
   bai_sync_data->num_total_samples_requested = 0;
   bai_sync_data->astar_index = -1;
   bai_sync_data->challenger_index = -1;
+  bai_sync_data->avoid_prune_best_arm_idx = -1;
   bai_sync_data->initial_phase = true;
   bai_sync_data->arm_data =
       calloc_or_die(num_initial_arms, sizeof(BAIArmDatum));
@@ -79,6 +86,9 @@ static inline BAISyncData *bai_sync_data_create(BAIResult *bai_result,
   cpthread_mutex_init(&bai_sync_data->mutex);
   bai_sync_data->thread_control = thread_control;
   bai_sync_data->bai_result = bai_result;
+  bai_sync_data->avoid_prune_arms = NULL;
+  bai_sync_data->avoid_prune_count = 0;
+  bai_sync_data->avoid_prune_next_idx = 0;
   return bai_sync_data;
 }
 
@@ -99,6 +109,16 @@ typedef struct BAISampleArgs {
   bai_sampling_rule_t sampling_rule;
   bai_threshold_t threshold;
   double cutoff;
+  // Per-thread batch state for the initial phase. When batch_remaining == 0
+  // the worker atomically reserves num_arms consecutive sample indices from
+  // the global counter, forming a batch of (iter N, arms 0..num_arms-1)
+  // processed contiguously on this thread. Each arm in iter N draws its
+  // pre-candidate opp rack from the same iter-local PRNG state, so racks
+  // repeat across arms within a batch and the RIT cache hits. This matters
+  // in the all-initial-phase regime (short MCTS-style sims with no BAI
+  // pruning); it's neutral in normal BAI-phase-dominated sims.
+  uint64_t initial_batch_next_total_index;
+  int initial_batch_remaining;
 } BAISampleArgs;
 
 static inline double bai_alt_lambda(const double mu1, const double sigma21,
@@ -191,12 +211,24 @@ bai_sync_data_get_next_bai_sample_index_while_locked(BAISampleArgs *args) {
 
 static inline int
 bai_sync_data_get_next_initial_sample_index_while_locked(BAISampleArgs *args) {
-  if (args->bai_sync_data->num_total_samples_requested >=
-      args->bai_sync_data->num_arms * args->sample_minimum) {
+  const int num_arms = args->bai_sync_data->num_arms;
+  const uint64_t initial_limit = (uint64_t)num_arms * args->sample_minimum;
+  if (args->initial_batch_remaining == 0) {
+    if (args->bai_sync_data->num_total_samples_requested >= initial_limit) {
+      return -1;
+    }
+    args->initial_batch_next_total_index =
+        args->bai_sync_data->num_total_samples_requested;
+    args->bai_sync_data->num_total_samples_requested += (uint64_t)num_arms;
+    args->initial_batch_remaining = num_arms;
+  }
+  const uint64_t total_index = args->initial_batch_next_total_index++;
+  args->initial_batch_remaining--;
+  if (total_index >= initial_limit) {
+    args->initial_batch_remaining = 0;
     return -1;
   }
-  return args->bai_sync_data->num_total_samples_requested++ /
-         args->sample_minimum;
+  return (int)(total_index % (uint64_t)num_arms);
 }
 
 static inline int
@@ -349,6 +381,7 @@ typedef struct BAIWorkerArgs {
   const BAIOptions *bai_options;
   BAILogger *bai_logger;
   Checkpoint *checkpoint;
+  Checkpoint *avoid_prune_checkpoint;
   int thread_index;
 } BAIWorkerArgs;
 
@@ -358,6 +391,13 @@ static inline bool bai_should_stop(BAIResult *bai_result,
              bai_result, thread_control_get_status(thread_control) ==
                              THREAD_CONTROL_STATUS_USER_INTERRUPT) !=
          BAI_RESULT_STATUS_NONE;
+}
+
+static inline void bai_avoid_prune_prebroadcast(void *data) {
+  BAIWorkerArgs *bai_worker_args = (BAIWorkerArgs *)data;
+  BAISyncData *sync_data = bai_worker_args->sync_data;
+  sync_data->avoid_prune_best_arm_idx =
+      rvs_get_best_arm_index(bai_worker_args->rvs);
 }
 
 static inline void bai_finish_initial_phase(void *uncasted_bai_worker_args) {
@@ -389,6 +429,52 @@ static inline void bai_finish_initial_phase(void *uncasted_bai_worker_args) {
       bai_worker_args->bai_options->delta, bai_sync_data->astar_index, true);
 }
 
+// Selects the next arm to sample from the avoid-prune list. Modifies the
+// BAIArmDatum for the selected arm by incrementing its num_samples field,
+// which tracks the number of samples requested for that arm.
+static inline int get_avoid_prune_next_idx(BAISyncData *sync_data,
+                                           const uint64_t winner_count) {
+  cpthread_mutex_lock(&sync_data->mutex);
+  int result = -1;
+  while (sync_data->avoid_prune_count > 0) {
+    const int idx =
+        sync_data->avoid_prune_next_idx % sync_data->avoid_prune_count;
+    const int arm_index = sync_data->avoid_prune_arms[idx];
+    if (sync_data->arm_data[arm_index].num_samples >= winner_count) {
+      // Arm is done: swap with last and shrink
+      sync_data->avoid_prune_arms[idx] =
+          sync_data->avoid_prune_arms[sync_data->avoid_prune_count - 1];
+      sync_data->avoid_prune_count--;
+      // Do not advance next_idx; re-examine the swapped-in arm
+    } else {
+      sync_data->avoid_prune_next_idx++;
+      result = arm_index;
+      sync_data->arm_data[arm_index].num_samples++;
+      break;
+    }
+  }
+  cpthread_mutex_unlock(&sync_data->mutex);
+  return result;
+}
+
+static inline void sim_unpruned_to_winner(BAIWorkerArgs *bai_worker_args) {
+  BAISyncData *sync_data = bai_worker_args->sync_data;
+  const BAIOptions *bai_options = bai_worker_args->bai_options;
+  RandomVariables *rvs = bai_worker_args->rvs;
+  const int rvs_thread_index =
+      bai_options->parent_worker_thread_index + bai_worker_args->thread_index;
+  const uint64_t winner_count =
+      sync_data->arm_data[sync_data->avoid_prune_best_arm_idx].num_samples;
+  while (thread_control_get_status(sync_data->thread_control) !=
+         THREAD_CONTROL_STATUS_USER_INTERRUPT) {
+    const int arm_index = get_avoid_prune_next_idx(sync_data, winner_count);
+    if (arm_index < 0) {
+      break;
+    }
+    rvs_sample(rvs, (uint64_t)arm_index, rvs_thread_index, NULL);
+  }
+}
+
 static inline void bai_worker_sample_loop(BAIWorkerArgs *bai_worker_args) {
   BAISyncData *sync_data = bai_worker_args->sync_data;
   ThreadControl *thread_control = bai_worker_args->sync_data->thread_control;
@@ -417,6 +503,8 @@ static inline void bai_worker_sample_loop(BAIWorkerArgs *bai_worker_args) {
       .sampling_rule = bai_options->sampling_rule,
       .threshold = bai_options->threshold,
       .cutoff = bai_options->cutoff,
+      .initial_batch_next_total_index = 0,
+      .initial_batch_remaining = 0,
   };
 
   while (!bai_should_stop(sync_data->bai_result, thread_control)) {
@@ -434,6 +522,10 @@ static inline void *bai_worker(void *args) {
   bai_worker_sample_loop(bai_worker_args);
   checkpoint_wait(bai_worker_args->checkpoint, bai_worker_args);
   bai_worker_sample_loop(bai_worker_args);
+  if (bai_worker_args->sync_data->avoid_prune_arms) {
+    checkpoint_wait(bai_worker_args->avoid_prune_checkpoint, bai_worker_args);
+    sim_unpruned_to_winner(bai_worker_args);
+  }
   return NULL;
 }
 
@@ -450,12 +542,22 @@ static inline void bai(const BAIOptions *bai_options, RandomVariables *rvs,
   BAISyncData *sync_data = bai_sync_data_create(bai_result, thread_control,
                                                 (int)rvs_get_num_rvs(rvs), rng);
 
+  if (bai_options->arm_avoid_prune && bai_options->num_arm_avoid_prune > 0) {
+    sync_data->avoid_prune_arms = bai_options->arm_avoid_prune;
+    sync_data->avoid_prune_count = bai_options->num_arm_avoid_prune;
+    sync_data->avoid_prune_next_idx = 0;
+  }
+
+  Checkpoint *avoid_prune_checkpoint =
+      checkpoint_create(bai_options->num_threads, bai_avoid_prune_prebroadcast);
+
   BAIWorkerArgs bai_worker_args = {
       .sync_data = sync_data,
       .rvs = rvs,
       .bai_options = bai_options,
       .bai_logger = bai_logger,
       .checkpoint = checkpoint,
+      .avoid_prune_checkpoint = avoid_prune_checkpoint,
   };
 
   cpthread_t *worker_ids =
@@ -478,6 +580,7 @@ static inline void bai(const BAIOptions *bai_options, RandomVariables *rvs,
   free(bai_worker_args_array);
   free(worker_ids);
   bai_sync_data_destroy(sync_data);
+  checkpoint_destroy(avoid_prune_checkpoint);
   checkpoint_destroy(checkpoint);
 }
 

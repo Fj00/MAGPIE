@@ -8,9 +8,27 @@ endif
 SRC_DIR := src
 TEST_DIR := test
 CMD_DIR := cmd
-OBJ_DIR := obj
 BIN_DIR := bin
 COV_DIR := cov
+
+# Build knobs that change the compiled objects. Defined up here (before OBJ_DIR)
+# so object files can be keyed by them.
+#dev is default, for another flavor : make BUILD=release
+BUILD ?= dev
+ifndef BOARD_DIM
+BOARD_DIM = 15
+endif
+ifndef RACK_SIZE
+RACK_SIZE = 7
+endif
+
+# Key every object (and its .d fragment) by the flags that change its contents:
+# build flavor, board dim, rack size. Switching any of them selects a different
+# obj subtree instead of relinking objects compiled with mismatched flags -- so
+# no `make clean` is needed between flavors, and switching back reuses the cached
+# objects. `clean` wipes the whole OBJ_ROOT.
+OBJ_ROOT := obj
+OBJ_DIR := $(OBJ_ROOT)/$(BUILD)-b$(BOARD_DIM)-r$(RACK_SIZE)
 
 SRC  := $(wildcard $(SRC_DIR)/**/*.c)
 TEST := $(wildcard $(TEST_DIR)/*.c)
@@ -24,9 +42,6 @@ SRC_OBJ_SUBDIRS := $(patsubst $(SRC_DIR)/%,$(OBJ_DIR)/$(SRC_DIR)/%,$(SRC_SUBDIRS
 
 TEST_SUBDIRS := $(shell find $(TEST_DIR) -type d)
 TEST_OBJ_SUBDIRS := $(patsubst $(TEST_DIR)/%,$(OBJ_DIR)/$(TEST_DIR)/%,$(TEST_SUBDIRS))
-
-#dev is default, for another flavor : make BUILD=release
-BUILD ?= dev
 
 ifeq ($(BUILD),thread)
     FSAN_ARG := -fsanitize=thread
@@ -46,9 +61,6 @@ cflags.release := -O3 -flto -march=native -DNDEBUG -Wall -Wno-trigraphs
 # Test-specific flags: like release but without DNDEBUG (asserts always enabled in tests)
 cflags.test_release := -O3 -flto -march=native -Wall -Wno-trigraphs
 cflags.profile := -O3 -g -march=native -DNDEBUG -Wall -Wno-trigraphs -fno-omit-frame-pointer -mllvm -inline-threshold=0
-cflags.dll_dev = -g -O0 -fpic -Wall
-cflags.dll_release = -O3 -fpic -flto -march=native -Wall -Wno-trigraphs
-
 lflags.cov := --coverage
 
 ldflags.dev := -pthread $(FSAN_ARG)
@@ -57,20 +69,17 @@ ldflags.vlg := -pthread
 ldflags.release := -pthread
 ldflags.profile := -pthread
 ldflags.cov := -pthread
-ldflags.dll_dev := -pthread
-ldflags.dll_release := -pthread
 
 CFLAGS := ${cflags.${BUILD}}
 
-ifndef BOARD_DIM
-BOARD_DIM = 15
-endif
-
-ifndef RACK_SIZE
-RACK_SIZE = 7
-endif
+# Emit a .d makefile fragment next to each .o listing the headers it includes
+# (-MMD) plus phony targets for those headers (-MP, so deleting a header does
+# not break the build). These fragments are -included at the bottom, so editing
+# a header recompiles exactly the .c files that include it -- no `make clean`.
+DEPFLAGS := -MMD -MP
 
 CFLAGS += -DBOARD_DIM=$(BOARD_DIM) -DRACK_SIZE=$(RACK_SIZE)
+
 
 LFLAGS := ${lflags.${BUILD}}
 LDFLAGS  := ${ldflags.${BUILD}}
@@ -80,8 +89,8 @@ LDLIBS   := -lm
 
 all: magpie magpie_test
 
-magpie_so: $(OBJ_SRC)
-	$(CC) -shared $(LDFLAGS) $(LFLAGS) $^ $(LDLIBS) -o libmagpie.so
+libmagpie_core.a: $(OBJ_SRC)
+	ar rcs $@ $^
 
 magpie: $(OBJ_SRC) $(OBJ_CMD) | $(BIN_DIR)
 	$(CC) $(LDFLAGS) $(LFLAGS) $^ $(LDLIBS) -o $(BIN_DIR)/$@
@@ -90,20 +99,20 @@ magpie_test: $(OBJ_SRC) $(OBJ_TEST) | $(BIN_DIR)
 	$(CC) $(LDFLAGS) $(LFLAGS) $^ $(LDLIBS) -o $(BIN_DIR)/$@
 
 $(OBJ_DIR)/$(SRC_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR) $(OBJ_DIR)/$(SRC_DIR) $(SRC_OBJ_SUBDIRS)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OBJ_DIR)/$(CMD_DIR)/%.o: $(CMD_DIR)/%.c | $(OBJ_DIR) $(OBJ_DIR)/$(CMD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Test files: use test_release flags if BUILD=release, otherwise use dev flags
 $(OBJ_DIR)/$(TEST_DIR)/%.o: $(TEST_DIR)/%.c | $(OBJ_DIR) $(OBJ_DIR)/$(TEST_DIR) $(TEST_OBJ_SUBDIRS)
-	$(CC) $(if $(filter release,$(BUILD)),${cflags.test_release},$(CFLAGS)) -DBOARD_DIM=$(BOARD_DIM) -DRACK_SIZE=$(RACK_SIZE) -c $< -o $@
+	$(CC) $(if $(filter release,$(BUILD)),${cflags.test_release},$(CFLAGS)) $(DEPFLAGS) -DBOARD_DIM=$(BOARD_DIM) -DRACK_SIZE=$(RACK_SIZE) -c $< -o $@
 
 $(BIN_DIR) $(OBJ_DIR) $(OBJ_DIR)/$(SRC_DIR) $(OBJ_DIR)/$(CMD_DIR) $(OBJ_DIR)/$(TEST_DIR) $(SRC_OBJ_SUBDIRS) $(TEST_OBJ_SUBDIRS):
 	mkdir -p $@
 
 clean:
-	@$(RM) -rv $(BIN_DIR) $(OBJ_DIR)
+	@$(RM) -rv $(BIN_DIR) $(OBJ_ROOT) libmagpie_core.a
 
 -include $(OBJ_SRC:.o=.d)
 -include $(OBJ_CMD:.o=.d)

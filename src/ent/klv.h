@@ -5,6 +5,7 @@
 #include "../def/klv_defs.h"
 #include "../ent/kwg.h"
 #include "../util/fileproxy.h"
+#include "../util/fnv.h"
 #include "../util/io_util.h"
 #include "../util/string_util.h"
 #include "data_filepaths.h"
@@ -25,9 +26,31 @@ typedef struct KLV {
   char *name;
   uint32_t *word_counts;
   Equity *leave_values;
+  // Bumped on every mutation of leave_values. MoveGen caches that store
+  // leave-derived data (subrack cache, anchor cache upper bounds, etc.)
+  // compare this counter to the value captured at the last gen_load_position
+  // and invalidate when it has changed, even when the KLV pointer itself
+  // hasn't moved. Only test code currently mutates leave_values in-place;
+  // production KLVs are loaded once and treated as immutable.
+  uint64_t mutation_counter;
 } KLV;
 
 static inline const char *klv_get_name(const KLV *klv) { return klv->name; }
+
+// A value unique to this loaded KLV instance: a hash of the base addresses and
+// size of its freshly-allocated leave_values/word_counts arrays. Two different
+// loads (even of the same lexicon) produce different fingerprints, so MoveGen
+// caches that hold leave-derived data can detect that the backing KLV has been
+// replaced even when a new KLV is allocated at a freed one's address (ABA),
+// which the pointer comparison cannot see.
+static inline uint64_t klv_get_instance_fingerprint(const KLV *klv) {
+  uint64_t hash = FNV_64_OFFSET_BASIS;
+  hash = fnv64a_step(hash, (uintptr_t)klv->leave_values);
+  hash = fnv64a_step(hash, (uintptr_t)klv->word_counts);
+  hash = fnv64a_step(hash, (uintptr_t)klv->kwg);
+  hash = fnv64a_step(hash, (uint64_t)klv->number_of_leaves);
+  return hash;
+}
 
 static inline const KWG *klv_get_kwg(const KLV *klv) { return klv->kwg; }
 
@@ -38,6 +61,11 @@ static inline uint32_t klv_get_number_of_leaves(const KLV *klv) {
 static inline void klv_set_all_leave_values_to_zero(KLV *klv) {
   memset(klv->leave_values, int_to_equity(0),
          klv->number_of_leaves * sizeof(Equity));
+  klv->mutation_counter++;
+}
+
+static inline uint64_t klv_get_mutation_counter(const KLV *klv) {
+  return klv->mutation_counter;
 }
 
 static inline Equity klv_get_indexed_leave_value(const KLV *klv,
@@ -51,6 +79,10 @@ static inline Equity klv_get_indexed_leave_value(const KLV *klv,
 // Assumes the index is valid
 static inline Equity klv_set_indexed_leave_value(const KLV *klv, uint32_t index,
                                                  Equity value) {
+  // Bumping the mutation counter requires a non-const KLV, but the public
+  // API historically accepts const to avoid churn at call sites that treat
+  // the KLV as mostly-immutable. Cast away const for the counter bump only.
+  ((KLV *)klv)->mutation_counter++;
   return klv->leave_values[index] = value;
 }
 

@@ -26,10 +26,16 @@ typedef struct BAIOptions {
   double delta;
   uint64_t sample_limit;
   uint64_t sample_minimum;
-  uint64_t time_limit_seconds;
+  double time_limit_seconds;
   int num_threads;
   int parent_worker_thread_index;
   double cutoff;
+  // Array of arm indices to avoid pruning. NULL if none.
+  // NOTE: bai() mutates this array in-place via swap-and-shrink during
+  // sim_unpruned_to_winner. The caller must not rely on its contents
+  // being preserved after bai() returns.
+  int *arm_avoid_prune;
+  int num_arm_avoid_prune;
 } BAIOptions;
 
 #endif

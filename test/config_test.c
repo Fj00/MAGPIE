@@ -1,8 +1,10 @@
 #include "config_test.h"
 
 #include "../src/def/game_defs.h"
+#include "../src/def/letter_distribution_defs.h"
 #include "../src/def/move_defs.h"
 #include "../src/def/players_data_defs.h"
+#include "../src/def/rack_defs.h"
 #include "../src/ent/bag.h"
 #include "../src/ent/equity.h"
 #include "../src/ent/game.h"
@@ -11,8 +13,10 @@
 #include "../src/ent/move.h"
 #include "../src/ent/player.h"
 #include "../src/ent/players_data.h"
+#include "../src/ent/rack.h"
 #include "../src/ent/sim_results.h"
 #include "../src/ent/trie.h"
+#include "../src/ent/validated_move.h"
 #include "../src/ent/wmp.h"
 #include "../src/impl/config.h"
 #include "../src/str/move_string.h"
@@ -1721,6 +1725,13 @@ void test_config_anno(void) {
                             ERROR_STATUS_NO_INFERENCE_TO_SHOW);
   assert_config_exec_status(config, "shendgame",
                             ERROR_STATUS_NO_ENDGAME_TO_SHOW);
+  assert_config_exec_status(config, "shpeg", ERROR_STATUS_NO_PEG_TO_SHOW);
+  // The -pegoutcomes boolean setting (drives the peg/shpeg outcomes column)
+  // parses and loads in both states.
+  assert_config_exec_status(config, "set -pegoutcomes true",
+                            ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "set -pegoutcomes false",
+                            ERROR_STATUS_SUCCESS);
   // Passing a rack to the top commit should commit the best static move
   assert_config_exec_status(config, "t BARCHAN", ERROR_STATUS_SUCCESS);
   assert(player_get_score(game_get_player(game, 0)) == int_to_equity(86));
@@ -2279,11 +2290,26 @@ static void assert_note_with_move_ref(Config *config, int move_idx) {
 }
 
 void test_config_note_move_interpolation(void) {
-  // No moves: game has events but no moves have been generated.
+  // Adding a note after navigating back to the start should not crash.
   Config *config = config_create_or_die("set -lex CSW21");
+  assert_config_exec_status(config, "newgame", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "r RETINAS", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com h8 RETINAS", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "goto start", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "note test",
+                            ERROR_STATUS_NOTE_NO_GAME_EVENTS);
+  config_destroy(config);
+
+  // No moves: game has events but no moves have been generated.
+  config = config_create_or_die("set -lex CSW21");
   assert_config_exec_status(config, "load testdata/gcgs/success.gcg",
                             ERROR_STATUS_SUCCESS);
-  assert_config_exec_status(config, "note $1", ERROR_STATUS_NOTE_NO_MOVES);
+  assert_config_exec_status(config, "note $1",
+                            ERROR_STATUS_NOTE_NO_GAME_EVENTS);
+  assert_config_exec_status(config, "goto start", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "n", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "note $1",
+                            ERROR_STATUS_NOTE_NO_MOVES_TO_INTERPOLATE);
   config_destroy(config);
 
   // Set up a game with generated moves for the remaining tests.
@@ -2336,6 +2362,203 @@ void test_config_note_move_interpolation(void) {
   config_destroy(config);
 }
 
+void test_config_fg_required(void) {
+  Config *config = config_create_default_test();
+  assert_config_exec_status(config, "set -lex CSW21", ERROR_STATUS_SUCCESS);
+
+  // fgrequired defaults to false in test config, so newgame without a
+  // filename should succeed.
+  assert_config_exec_status(config, "newgame", ERROR_STATUS_SUCCESS);
+
+  // Enable fgrequired; newgame without a filename should now fail.
+  assert_config_exec_status(config, "set -fgrequired true",
+                            ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "newgame",
+                            ERROR_STATUS_CONFIG_LOAD_MISSING_ARG);
+  config_destroy(config);
+}
+
+void test_config_exchange_blank(void) {
+  Config *config = config_create_default_test();
+  assert_config_exec_status(config, "set -lex CSW21", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "newgame", ERROR_STATUS_SUCCESS);
+
+  // "com ex ?" when the rack has no blank should return a validation
+  // error rather than crashing. BLANK_MACHINE_LETTER == PLAYED_THROUGH_MARKER
+  // == 0, so the blank was previously skipped when building tiles_played_rack,
+  // causing the rack-subtract check to pass silently and later triggering an
+  // assert in rack_take_letter.
+  assert_config_exec_status(config, "rack RETINAS", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(
+      config, "com ex ?",
+      ERROR_STATUS_MOVE_VALIDATION_TILES_PLAYED_NOT_IN_RACK);
+
+  // "com ex u" (lowercase) should unblank to uppercase U and exchange the U
+  // tile rather than storing a blanked machine letter in the move and causing
+  // an out-of-bounds rack access. Only '?' may denote the blank in an exchange.
+  assert_config_exec_status(config, "rack QUIOEU?", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com ex u", ERROR_STATUS_SUCCESS);
+
+  // Exchange both blanks from a rack with 5 non-blank tiles and 2 blanks.
+  // impl_set_rack_internal returns the off-turn player's tiles to the bag
+  // before drawing, so after "rack ABCDE??" the bag holds 93 tiles with
+  // 0 blanks. execute_exchange_move draws new tiles before returning the
+  // exchanged tiles to the bag, so both drawn tiles are guaranteed non-blank.
+  assert_config_exec_status(config, "newgame", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "rack ABCDE??", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com ex ??", ERROR_STATUS_SUCCESS);
+  const Game *game = config_get_game(config);
+
+  // After game_play_n_events replays the history, the live player rack is
+  // empty: set_after_game_event_racks has no future events from which to
+  // infer the post-exchange rack for the last event. Verify the exchange
+  // is recorded correctly through the game history event instead. The
+  // pre-exchange rack stored in the event must have the 5 non-blank tiles
+  // plus the 2 blanks that were exchanged, and the validated move must
+  // store exactly 2 blank machine letters as the exchanged tiles.
+  const GameHistory *game_history = config_get_game_history(config);
+  const GameEvent *last_event = game_history_get_event(
+      game_history, game_history_get_num_played_events(game_history) - 1);
+  const Rack *rack = game_event_get_const_rack(last_event);
+  const LetterDistribution *ld = game_get_ld(game);
+  assert(rack_get_total_letters(rack) == RACK_SIZE);
+  assert(rack_get_letter(rack, BLANK_MACHINE_LETTER) == 2);
+  assert(rack_get_letter(rack, ld_hl_to_ml(ld, "A")) == 1);
+  assert(rack_get_letter(rack, ld_hl_to_ml(ld, "B")) == 1);
+  assert(rack_get_letter(rack, ld_hl_to_ml(ld, "C")) == 1);
+  assert(rack_get_letter(rack, ld_hl_to_ml(ld, "D")) == 1);
+  assert(rack_get_letter(rack, ld_hl_to_ml(ld, "E")) == 1);
+  const Move *exchange_move =
+      validated_moves_get_move(game_event_get_vms(last_event), 0);
+  assert(exchange_move->tiles_played == 2);
+  assert(exchange_move->tiles[0] == BLANK_MACHINE_LETTER);
+  assert(exchange_move->tiles[1] == BLANK_MACHINE_LETTER);
+
+  // Same test but with 1 blank
+  assert_config_exec_status(config, "newgame", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "rack ABCDE??", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com ex ?", ERROR_STATUS_SUCCESS);
+  game = config_get_game(config);
+
+  game_history = config_get_game_history(config);
+  last_event = game_history_get_event(
+      game_history, game_history_get_num_played_events(game_history) - 1);
+  rack = game_event_get_const_rack(last_event);
+  ld = game_get_ld(game);
+  assert(rack_get_total_letters(rack) == RACK_SIZE);
+  assert(rack_get_letter(rack, BLANK_MACHINE_LETTER) == 2);
+  assert(rack_get_letter(rack, ld_hl_to_ml(ld, "A")) == 1);
+  assert(rack_get_letter(rack, ld_hl_to_ml(ld, "B")) == 1);
+  assert(rack_get_letter(rack, ld_hl_to_ml(ld, "C")) == 1);
+  assert(rack_get_letter(rack, ld_hl_to_ml(ld, "D")) == 1);
+  assert(rack_get_letter(rack, ld_hl_to_ml(ld, "E")) == 1);
+  exchange_move = validated_moves_get_move(game_event_get_vms(last_event), 0);
+  assert(exchange_move->tiles_played == 1);
+  assert(exchange_move->tiles[0] == BLANK_MACHINE_LETTER);
+
+  config_destroy(config);
+}
+
+void test_config_utility_blend(void) {
+  ErrorStack *error_stack = error_stack_create();
+
+  // Defaults: (1.0, 0.5, 100.0), fanned out identically to both players.
+  {
+    Config *config = config_create_default_test();
+    assert(within_epsilon(config_get_utility_w_winpct(config), 1.0));
+    assert(within_epsilon(config_get_utility_w_spread(config), 0.5));
+    assert(within_epsilon(config_get_utility_spread_scale(config), 100.0));
+    assert(within_epsilon(config_get_p1_utility_w_winpct(config), 1.0));
+    assert(within_epsilon(config_get_p1_utility_w_spread(config), 0.5));
+    assert(within_epsilon(config_get_p1_utility_spread_scale(config), 100.0));
+    assert(within_epsilon(config_get_p2_utility_w_winpct(config), 1.0));
+    assert(within_epsilon(config_get_p2_utility_w_spread(config), 0.5));
+    assert(within_epsilon(config_get_p2_utility_spread_scale(config), 100.0));
+    config_destroy(config);
+  }
+
+  // Global -uwin / -uspread / -uspreadscale fans out to both players.
+  {
+    Config *config = config_create_default_test();
+    load_and_exec_config_or_die(config,
+                                "set -uwin 0.7 -uspread 0.3 -uspreadscale 80");
+    assert(within_epsilon(config_get_utility_w_winpct(config), 0.7));
+    assert(within_epsilon(config_get_utility_w_spread(config), 0.3));
+    assert(within_epsilon(config_get_utility_spread_scale(config), 80.0));
+    assert(within_epsilon(config_get_p1_utility_w_winpct(config), 0.7));
+    assert(within_epsilon(config_get_p1_utility_w_spread(config), 0.3));
+    assert(within_epsilon(config_get_p1_utility_spread_scale(config), 80.0));
+    assert(within_epsilon(config_get_p2_utility_w_winpct(config), 0.7));
+    assert(within_epsilon(config_get_p2_utility_w_spread(config), 0.3));
+    assert(within_epsilon(config_get_p2_utility_spread_scale(config), 80.0));
+    config_destroy(config);
+  }
+
+  // Per-player flags override the global on the matching player only.
+  {
+    Config *config = config_create_default_test();
+    load_and_exec_config_or_die(config,
+                                "set -uwin 0.5 -uspread 0.5 -uspreadscale 100 "
+                                "-uwin1 1 -uspread1 2 -uspreadscale1 50 "
+                                "-uwin2 1 -uspread2 0");
+    // Global retains what was set.
+    assert(within_epsilon(config_get_utility_w_winpct(config), 0.5));
+    assert(within_epsilon(config_get_utility_w_spread(config), 0.5));
+    assert(within_epsilon(config_get_utility_spread_scale(config), 100.0));
+    // P1 overridden on all three.
+    assert(within_epsilon(config_get_p1_utility_w_winpct(config), 1.0));
+    assert(within_epsilon(config_get_p1_utility_w_spread(config), 2.0));
+    assert(within_epsilon(config_get_p1_utility_spread_scale(config), 50.0));
+    // P2 overridden on w_winpct/w_spread, scale inherited from global.
+    assert(within_epsilon(config_get_p2_utility_w_winpct(config), 1.0));
+    assert(within_epsilon(config_get_p2_utility_w_spread(config), 0.0));
+    assert(within_epsilon(config_get_p2_utility_spread_scale(config), 100.0));
+    config_destroy(config);
+  }
+
+  // Per-player flags alone (no global) override only the matching player;
+  // the other player keeps the defaults.
+  {
+    Config *config = config_create_default_test();
+    load_and_exec_config_or_die(config, "set -uwin1 0.4 -uspread1 0.6");
+    assert(within_epsilon(config_get_utility_w_winpct(config), 1.0));
+    assert(within_epsilon(config_get_utility_w_spread(config), 0.5));
+    assert(within_epsilon(config_get_p1_utility_w_winpct(config), 0.4));
+    assert(within_epsilon(config_get_p1_utility_w_spread(config), 0.6));
+    assert(within_epsilon(config_get_p2_utility_w_winpct(config), 1.0));
+    assert(within_epsilon(config_get_p2_utility_w_spread(config), 0.5));
+    config_destroy(config);
+  }
+
+  // Validation cases: reuse one config across all (test_config_load_error
+  // calls error_stack_reset, so subsequent calls aren't affected).
+  Config *err_config = config_create_default_test();
+
+  // Both global weights zero is rejected.
+  test_config_load_error(err_config, "set -uwin 0 -uspread 0",
+                         ERROR_STATUS_CONFIG_LOAD_MALFORMED_DOUBLE_ARG,
+                         error_stack);
+
+  // P1 weights summing to zero (via per-player overrides) is rejected
+  // even when the global is positive.
+  test_config_load_error(err_config, "set -uwin1 0 -uspread1 0",
+                         ERROR_STATUS_CONFIG_LOAD_MALFORMED_DOUBLE_ARG,
+                         error_stack);
+
+  // P2 weights summing to zero is rejected.
+  test_config_load_error(err_config, "set -uwin2 0 -uspread2 0",
+                         ERROR_STATUS_CONFIG_LOAD_MALFORMED_DOUBLE_ARG,
+                         error_stack);
+
+  // Non-numeric value is rejected.
+  test_config_load_error(err_config, "set -uwin abc",
+                         ERROR_STATUS_CONFIG_LOAD_MALFORMED_DOUBLE_ARG,
+                         error_stack);
+
+  config_destroy(err_config);
+  error_stack_destroy(error_stack);
+}
+
 void test_config(void) {
   test_game_display();
   test_trie();
@@ -2351,4 +2574,7 @@ void test_config(void) {
   test_config_lexical_data();
   test_config_wmp();
   test_config_note_move_interpolation();
+  test_config_fg_required();
+  test_config_exchange_blank();
+  test_config_utility_blend();
 }

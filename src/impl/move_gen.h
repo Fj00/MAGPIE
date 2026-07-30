@@ -15,9 +15,58 @@
 #include "../ent/letter_distribution.h"
 #include "../ent/move.h"
 #include "../ent/rack.h"
+#include "../ent/rack_info_table.h"
 #include "wmp_move_gen.h"
 #include <stdbool.h>
 #include <stdint.h>
+
+#define MOVEGEN_RIT_CACHE_SIZE 64
+
+// Per-thread cache of KLV walk results (leave_values[128] and
+// best_leaves[8]) keyed by player_bit_rack. This is the "mini-RIT":
+// the same data a loaded RackInfoTable would have supplied, computed
+// on demand on cache miss and reused on recurring racks in the sim
+// rollouts. Lets WMP-enabled runs without a .rit file still skip the
+// per-rack KLV/KWG descent once the rack has been seen. Direct-mapped.
+#ifndef MOVEGEN_KLV_LEAVES_CACHE_SIZE
+#define MOVEGEN_KLV_LEAVES_CACHE_SIZE 256
+#endif
+
+typedef struct KlvLeavesCacheEntry {
+  BitRack key;
+  bool valid;
+  // Per-subset (128-slot) leave_values, same layout as leave_map.leave_values.
+  Equity leave_values[1 << RACK_SIZE];
+  // Per-leave-size max leave across canonical subsets, same as
+  // RackInfoTableEntry.best_leaves.
+  Equity best_leaves[RACK_SIZE + 1];
+} KlvLeavesCacheEntry;
+
+// Size of the per-thread cache of
+// wmp_move_gen_enumerate_nonplaythrough_subracks results. Keyed by
+// player_bit_rack. The enumeration output is a function of the rack alone, so
+// caching it saves 5-20% of sim time when the same rack recurs across rollouts
+// (typical in MCTS-style sims). Direct-mapped.
+#ifndef MOVEGEN_SUBRACK_CACHE_SIZE
+#define MOVEGEN_SUBRACK_CACHE_SIZE 64
+#endif
+
+// Number of subrack slots stored per rack. Matches (1 << RACK_SIZE) which
+// is the total number of multi-subset combinations of a RACK_SIZE-tile rack.
+#define MOVEGEN_SUBRACK_CACHE_ENTRIES (1 << RACK_SIZE)
+
+typedef struct SubrackEnumCacheEntry {
+  BitRack key;
+  bool valid;
+  // Flat array indexed by subracks_get_combination_offset(size) + idx_for_size.
+  BitRack subracks[MOVEGEN_SUBRACK_CACHE_ENTRIES];
+  Equity leave_values[MOVEGEN_SUBRACK_CACHE_ENTRIES];
+  // wmp_entry pointers per subrack, also rack-determined. Storing them
+  // lets us skip the per-subrack wmp_get_word_entry hash lookups on
+  // cache hit. Invalidated when the WMP pointer changes.
+  const WMPEntry *wmp_entries[MOVEGEN_SUBRACK_CACHE_ENTRIES];
+  uint8_t count_by_size[RACK_SIZE + 1];
+} SubrackEnumCacheEntry;
 
 typedef struct UnrestrictedMultiplier {
   uint8_t multiplier;
@@ -54,7 +103,9 @@ typedef struct MoveGen {
   Rack bingo_alpha_rack_shadow_right_copy;
   Rack opponent_rack;
   Rack leave;
-  Square lanes_cache[BOARD_DIM * BOARD_DIM * 2];
+  // Read-only view into the board's lanes for the current cross index;
+  // refreshed by gen_load_position each call.
+  const Square *lanes_cache;
   Square row_cache[BOARD_DIM];
   uint8_t row_number_of_anchors_cache[(BOARD_DIM) * 2];
   Equity opening_move_penalties[(BOARD_DIM) * 2];
@@ -130,8 +181,52 @@ typedef struct MoveGen {
   int number_of_letters_on_rack;
   const KWG *kwg;
   const KLV *klv;
+  // Snapshot of klv->mutation_counter captured at the last gen_load_position
+  // call. If the KLV's leave_values have been mutated in place since then
+  // (test-only set_klv_leave_value path), leave-derived caches (the subrack
+  // cache) must be invalidated even though the KLV pointer is unchanged.
+  uint64_t klv_mutation_counter_at_load;
+  // Instance fingerprints of the KLV and WMP captured at the last
+  // gen_load_position call. The MoveGen cache is pooled per thread and
+  // outlives the Configs the engine creates and destroys; when a Config is
+  // freed and another loaded, the allocator can hand the new KLV/WMP the freed
+  // one's struct address (ABA) -- even for the same lexicon -- while its
+  // internal arrays are reallocated elsewhere. A KLV/WMP pointer (or lexicon
+  // name) comparison reads "unchanged" and keeps stale leave_values / dangling
+  // wmp_entry pointers cached. The fingerprint hashes the internal array
+  // addresses, so it changes whenever the backing data is reloaded.
+  uint64_t klv_instance_fp_at_load;
+  uint64_t wmp_instance_fp_at_load;
+  const RackInfoTable *rack_info_table;
+  // RIT entry for the current player_rack, looked up once in
+  // gen_look_up_leaves_and_record_exchanges and cached here for the duration
+  // of this move generation. NULL if rack_info_table is NULL, the rack isn't
+  // a full RACK_SIZE rack, or the rack wasn't found in the table.
+  const RackInfoTableEntry *rit_entry;
+  // Small per-thread RIT lookup cache. In sim rollouts, the same racks
+  // recur across iterations within a turn (limited bag composition).
+  // Direct-mapped by low bits of BitRack hash.
+  BitRack rit_cache_keys[MOVEGEN_RIT_CACHE_SIZE];
+  const RackInfoTableEntry *rit_cache_entries[MOVEGEN_RIT_CACHE_SIZE];
+  bool rit_cache_valid[MOVEGEN_RIT_CACHE_SIZE];
+  // Cache of wmp_move_gen_enumerate_nonplaythrough_subracks output
+  // (purely rack-determined). Hit rate tracks rack-repeat rate in sims.
+  SubrackEnumCacheEntry subrack_cache[MOVEGEN_SUBRACK_CACHE_SIZE];
+  // Per-thread mini-RIT: cached leave_values and best_leaves per full rack.
+  // Populated from the KLV walk (generate_exchange_moves) on first touch
+  // for each rack; reused on subsequent movegen calls when the same rack
+  // recurs. Lets WMP-enabled runs without a loaded RackInfoTable still
+  // amortize the KLV descent cost across the rollout. Invalidated when
+  // the KLV pointer or its mutation_counter changes.
+  KlvLeavesCacheEntry klv_leaves_cache[MOVEGEN_KLV_LEAVES_CACHE_SIZE];
   const Board *board;
   LetterDistribution ld;
+  // Whether ld fits a BitRack: <= BIT_RACK_MAX_ALPHABET_SIZE machine letters
+  // (4-bit letter index) and <= 15 of any one letter, blanks included (4-bit
+  // per-letter count) -- see bit_rack_is_compatible_with_ld. The RIT cache,
+  // KLV-leaves cache, and WMP all key on a BitRack, so all three are disabled
+  // when this is false. Set in gen_load_position.
+  bool bit_rack_compatible;
   MoveList *move_list;
   AnchorHeap anchor_heap;
   Equity tile_scores[MACHINE_LETTER_MAX_VALUE];
@@ -168,7 +263,6 @@ typedef struct MoveGenArgs {
   // from move generation based on alternate exchange sizes. Value is
   // UNSET_LEAVE_SIZE for non-exchange scenarios.
   int target_leave_size_for_exchange_cutoff;
-  int thread_index;
   MoveList *move_list;
   // Output: bitvector of machine letters that appear in any valid move.
   // Only used with MOVE_RECORD_TILES_PLAYED. Caller provides pointer; callee
@@ -187,7 +281,7 @@ void gen_destroy_cache(void);
 // solving.
 void generate_moves(const MoveGenArgs *args);
 
-MoveGen *get_movegen(int thread_index);
+MoveGen *get_movegen(void);
 
 void gen_load_position(MoveGen *gen, const MoveGenArgs *args);
 

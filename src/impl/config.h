@@ -20,6 +20,7 @@
 #include "../ent/win_pct.h"
 #include "../impl/simmer.h"
 #include "../util/io_util.h"
+#include "peg.h"
 #include <stdbool.h>
 
 typedef struct Config Config;
@@ -53,6 +54,7 @@ int config_get_num_plays(const Config *config);
 int config_get_num_small_plays(const Config *config);
 int config_get_plies(const Config *config);
 int config_get_shplies(const Config *config);
+bool config_get_show_bu(const Config *config);
 int config_get_endgame_plies(const Config *config);
 uint64_t config_get_max_iterations(const Config *config);
 uint64_t config_get_seed(const Config *config);
@@ -62,9 +64,19 @@ bool config_get_use_small_plays(const Config *config);
 bool config_get_human_readable(const Config *config);
 bool config_get_show_prompt(const Config *config);
 bool config_get_save_settings(const Config *config);
+bool config_get_fg_required(const Config *config);
 bool config_get_loaded_settings(const Config *config);
 void config_set_loaded_settings(Config *config, const bool value);
 double config_get_tt_fraction_of_mem(const Config *config);
+double config_get_utility_w_winpct(const Config *config);
+double config_get_utility_w_spread(const Config *config);
+double config_get_utility_spread_scale(const Config *config);
+double config_get_p1_utility_w_winpct(const Config *config);
+double config_get_p1_utility_w_spread(const Config *config);
+double config_get_p1_utility_spread_scale(const Config *config);
+double config_get_p2_utility_w_winpct(const Config *config);
+double config_get_p2_utility_w_spread(const Config *config);
+double config_get_p2_utility_spread_scale(const Config *config);
 PlayersData *config_get_players_data(const Config *config);
 LetterDistribution *config_get_ld(const Config *config);
 ThreadControl *config_get_thread_control(const Config *config);
@@ -74,6 +86,7 @@ GameHistory *config_get_game_history(const Config *config);
 MoveList *config_get_move_list(const Config *config);
 SimResults *config_get_sim_results(const Config *config);
 EndgameResults *config_get_endgame_results(const Config *config);
+const PegResult *config_get_peg_result(const Config *config);
 AutoplayResults *config_get_autoplay_results(const Config *config);
 const char *config_get_settings_filename(const Config *config);
 const char *config_get_current_exec_name(const Config *config);
@@ -99,9 +112,10 @@ void config_autoplay(const Config *config, AutoplayResults *autoplay_results,
                      autoplay_t autoplay_type,
                      const char *num_games_or_min_rack_targets,
                      int games_before_force_draw_start,
-                     ErrorStack *error_stack);
+                     const char *force_racks_filename, ErrorStack *error_stack);
 void config_simulate(Config *config, SimCtx **sim_ctx, Rack *known_opp_rack,
-                     SimResults *sim_results, ErrorStack *error_stack);
+                     SimResults *sim_results, int *arm_avoid_prune,
+                     int num_arm_avoid_prune, ErrorStack *error_stack);
 void config_convert(const Config *config, ConversionResults *results,
                     ErrorStack *error_stack);
 void config_parse_gcg(Config *config, const char *gcg_filename,

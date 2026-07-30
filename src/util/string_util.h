@@ -96,6 +96,14 @@ int string_to_int(const char *str, ErrorStack *error_stack);
 uint64_t string_to_uint64(const char *str, ErrorStack *error_stack);
 double string_to_double(const char *str, ErrorStack *error_stack);
 
+// Parse a leading int/double prefix of str, without requiring the rest of
+// the string to be consumed. On success, *end points just past the parsed
+// number so the caller can keep parsing the remainder of str.
+int string_to_int_prefix(const char *str, const char **end,
+                         ErrorStack *error_stack);
+double string_to_double_prefix(const char *str, const char **end,
+                               ErrorStack *error_stack);
+
 // JSON utilities
 char *json_unescape_string(const char *json_string);
 char *get_process_output(const char *cmd);
@@ -109,8 +117,15 @@ void string_grid_destroy(StringGrid *string_grid);
 int string_grid_get_cell_index(const StringGrid *string_grid, int row, int col);
 void string_grid_set_cell(StringGrid *string_grid, int row, int col,
                           char *value);
+// Right-align a column's cells (default is left-aligned). Use for columns of
+// numbers so their digits line up on the right.
+void string_grid_set_col_right_align(StringGrid *string_grid, int col,
+                                     bool right_align);
 void string_builder_add_string_grid(StringBuilder *sb, const StringGrid *sg,
                                     bool add_border);
+
+// Compares two string pointers for use with qsort.
+int compare_string_ptrs(const void *a, const void *b);
 
 // Returns the number of terminal columns a string occupies, correctly handling
 // ANSI escape sequences (0 columns) and Unicode wide characters (2 columns).

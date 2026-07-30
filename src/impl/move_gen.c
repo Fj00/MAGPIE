@@ -2,6 +2,7 @@
 
 #include "../compat/cpthread.h"
 #include "../def/board_defs.h"
+#include "../def/cpthread_defs.h"
 #include "../def/cross_set_defs.h"
 #include "../def/equity_defs.h"
 #include "../def/game_defs.h"
@@ -28,7 +29,9 @@
 #include "../ent/move.h"
 #include "../ent/player.h"
 #include "../ent/rack.h"
+#include "../ent/rack_info_table.h"
 #include "../ent/static_eval.h"
+#include "../ent/wmp.h"
 #include "../util/io_util.h"
 #include "wmp_move_gen.h"
 #include <assert.h>
@@ -46,7 +49,12 @@
 // be expensive. The infer and sim functions
 // don't have this problem since they are
 // only called once per command.
+// Pool of reusable MoveGens. cached_gens[slot] is allocated lazily and kept
+// for the whole process (freed only at shutdown) so the expensive MoveGen
+// allocation is amortized across solves; slot_in_use[slot] marks whether a
+// live thread currently owns that slot. See get_movegen below.
 static MoveGen *cached_gens[MAX_THREADS];
+static bool slot_in_use[MAX_THREADS];
 static cpthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER; // NOLINT
 
 void generator_destroy(MoveGen *gen) {
@@ -56,20 +64,96 @@ void generator_destroy(MoveGen *gen) {
   free(gen);
 }
 
-MoveGen *get_movegen(int thread_index) {
-  if (!cached_gens[thread_index]) {
-    cached_gens[thread_index] = malloc_or_die(sizeof(MoveGen));
+// MoveGen pool keyed by a per-thread slot. Each live pthread acquires a
+// distinct free slot on its first generate_moves and holds it for the thread's
+// lifetime, so two threads can never share a MoveGen and corrupt each other's
+// state.
+//
+// A slot's MoveGen is allocated lazily and reused for the whole process, so the
+// expensive allocation is amortized across solves. The pthread key's destructor
+// only *releases the slot* on thread exit (it does not free the gen), so a
+// future thread reuses
+// both the slot and its already-allocated gen — bounded memory, no per-thread
+// reallocation, and no leak. Gens are freed when gen_destroy_cache runs
+// (typically at shutdown or after CLI commands complete).
+//
+// A reused gen carries stale per-call scratch, which is fine: generate_moves
+// resets the state it reads each call — the same reuse the old cross-solve
+// slot sharing relied on.
+static cpthread_key_t gen_key;
+static cpthread_once_t gen_key_once = CPTHREAD_ONCE_INIT;
+
+// Thread-exit destructor: return this thread's slot to the pool (keep the gen).
+static void gen_release_slot(void *ptr) {
+  if (ptr == NULL) {
+    return;
   }
-  return cached_gens[thread_index];
+  cpthread_mutex_lock(&cache_mutex);
+  for (int i = 0; i < MAX_THREADS; i++) {
+    if (cached_gens[i] == ptr) {
+      slot_in_use[i] = false;
+      break;
+    }
+  }
+  cpthread_mutex_unlock(&cache_mutex);
+}
+
+static void gen_key_init(void) {
+  cpthread_key_create(&gen_key, gen_release_slot);
+}
+
+MoveGen *get_movegen(void) {
+  cpthread_once(&gen_key_once, gen_key_init);
+  MoveGen *gen = cpthread_getspecific(gen_key);
+  if (gen != NULL) {
+    return gen;
+  }
+  // First touch on this thread: acquire a free slot, reusing its gen if one was
+  // allocated by an earlier thread that has since released the slot.
+  cpthread_mutex_lock(&cache_mutex);
+  int slot = -1;
+  for (int i = 0; i < MAX_THREADS; i++) {
+    if (!slot_in_use[i]) {
+      slot = i;
+      slot_in_use[i] = true;
+      break;
+    }
+  }
+  if (slot < 0) {
+    cpthread_mutex_unlock(&cache_mutex);
+    log_fatal("movegen pool exhausted: more than %d concurrent threads",
+              MAX_THREADS);
+  }
+  // cppcheck-suppress negativeIndex ; slot >= 0 here (log_fatal above is
+  // noreturn)
+  gen = cached_gens[slot];
+  if (gen == NULL) {
+    gen = calloc_or_die(1, sizeof(MoveGen));
+    cached_gens[slot] = gen;
+  }
+  cpthread_mutex_unlock(&cache_mutex);
+  cpthread_setspecific(gen_key, gen);
+  return gen;
 }
 
 void gen_destroy_cache(void) {
+  // May run mid-process, not only at shutdown: caches_destroy() calls this
+  // after a CLI command completes (and again at exit). It runs on a single
+  // thread after every worker has been joined, so no slot-release destructor
+  // can race it.
   cpthread_mutex_lock(&cache_mutex);
   for (int i = 0; i < (MAX_THREADS); i++) {
     generator_destroy(cached_gens[i]);
     cached_gens[i] = NULL;
+    slot_in_use[i] = false;
   }
   cpthread_mutex_unlock(&cache_mutex);
+  // The calling thread's key still points at the gen we just freed (key
+  // destructors don't fire for a thread that keeps running), so clear it.
+  // Otherwise the next get_movegen on this thread takes the fast path and
+  // returns that dangling pointer instead of acquiring a fresh slot/gen.
+  cpthread_once(&gen_key_once, gen_key_init);
+  cpthread_setspecific(gen_key, NULL);
 }
 
 // Cache getter functions
@@ -422,6 +506,37 @@ static inline void record_exchange(MoveGen *gen) {
       BOARD_HORIZONTAL_DIRECTION, gen->exchange_strip);
 }
 
+// Record the single best exchange from the precomputed RIT strip.
+// Sets up leave_map so gen_get_static_equity reads the correct leave value.
+static void record_best_exchange_from_table(MoveGen *gen) {
+  int tiles_exchanged = 0;
+  const MachineLetter *strip = rack_info_table_entry_get_best_exchange_strip(
+      gen->rit_entry, &tiles_exchanged);
+  if (tiles_exchanged == 0) {
+    return;
+  }
+  const int leave_size = RACK_SIZE - tiles_exchanged;
+  const Equity leave_value = gen->best_leaves[leave_size];
+  if (better_play_has_been_found(gen, leave_value)) {
+    return;
+  }
+  // Temporarily set leave_map so gen_get_static_equity reads the correct
+  // leave value. Save and restore index 0's value.
+  const int saved_index = leave_map_get_current_index(&gen->leave_map);
+  const Equity saved_value = gen->leave_map.leave_values[0];
+  leave_map_set_current_index(&gen->leave_map, 0);
+  gen->leave_map.leave_values[0] = leave_value;
+
+  memcpy(gen->exchange_strip, strip, tiles_exchanged * sizeof(MachineLetter));
+  update_best_move_or_insert_into_movelist(
+      gen, 0, tiles_exchanged, GAME_EVENT_EXCHANGE, 0, 0, 0, tiles_exchanged,
+      BOARD_HORIZONTAL_DIRECTION, gen->exchange_strip);
+
+  // Restore leave_map state.
+  gen->leave_map.leave_values[0] = saved_value;
+  leave_map_set_current_index(&gen->leave_map, saved_index);
+}
+
 // Look up leave values for all subsets of the player's rack and if add_exchange
 // is true, record exchange moves for them. KLV indices are retained to speed up
 // lookup of leaves with common lexicographical "prefixes".
@@ -468,6 +583,49 @@ void generate_exchange_moves(MoveGen *gen, Rack *leave, uint32_t node_index,
                               add_exchange);
     }
 
+    rack_take_letters(leave, ml, num_this);
+    for (int i = 0; i < num_this; i++) {
+      leave_map_add_letter_and_update_complement_index(&gen->leave_map,
+                                                       &gen->player_rack, ml);
+    }
+  }
+}
+
+// Variant of generate_exchange_moves used when gen->rack_info_table is
+// populated. Enumerates the same canonical subsets as generate_exchange_moves
+// (so leave_map.current_index moves through the same sequence of values and
+// best_leaves is updated in the same way), but skips the KLV/KWG traversal
+// entirely: leave values have already been memcpy'd into
+// leave_map.leave_values from the RIT, so leave_map_get_current_value
+// returns the right value at each leaf.
+static void generate_exchange_moves_from_table(MoveGen *gen, Rack *leave,
+                                               MachineLetter ml,
+                                               bool add_exchange) {
+  const int ld_size = ld_get_size(&gen->ld);
+  while (ml < ld_size && rack_get_letter(&gen->player_rack, ml) == 0) {
+    ml++;
+  }
+  if (ml == ld_size) {
+    const int number_of_letters_on_rack =
+        rack_get_total_letters(&gen->player_rack);
+    if (number_of_letters_on_rack > 0) {
+      const Equity value = leave_map_get_current_value(&gen->leave_map);
+      if (value > gen->best_leaves[rack_get_total_letters(leave)]) {
+        gen->best_leaves[rack_get_total_letters(leave)] = value;
+      }
+      if (add_exchange) {
+        record_exchange(gen);
+      }
+    }
+  } else {
+    generate_exchange_moves_from_table(gen, leave, ml + 1, add_exchange);
+    const uint16_t num_this = rack_get_letter(&gen->player_rack, ml);
+    for (uint16_t i = 0; i < num_this; i++) {
+      rack_add_letter(leave, ml);
+      leave_map_take_letter_and_update_complement_index(&gen->leave_map,
+                                                        &gen->player_rack, ml);
+      generate_exchange_moves_from_table(gen, leave, ml + 1, add_exchange);
+    }
     rack_take_letters(leave, ml, num_this);
     for (int i = 0; i < num_this; i++) {
       leave_map_add_letter_and_update_complement_index(&gen->leave_map,
@@ -723,6 +881,40 @@ void wordmap_gen(MoveGen *gen, const Anchor *anchor) {
   gen->max_tiles_to_play = anchor->tiles_to_play;
   assert(anchor->tiles_to_play <= rack_get_total_letters(&gen->player_rack));
   WMPMoveGen *wgen = &gen->wmp_move_gen;
+
+  // Inline bingo fast path: for nonplaythrough full-rack plays with
+  // precomputed bingo words, skip subrack enumeration and WMP lookup.
+  // Uses record_wmp_plays_for_word with subrack_idx=0 (the only subrack
+  // for a full-rack play) so blank assignment is handled correctly.
+  if (gen->rit_entry != NULL && anchor->tiles_to_play == RACK_SIZE &&
+      anchor->playthrough_blocks == 0) {
+    const int num_bingos = gen->rit_entry->num_bingo_words;
+    if (num_bingos > 0) {
+      wgen->word_length = RACK_SIZE;
+      wgen->tiles_to_play = RACK_SIZE;
+      // Leave value is 0 for bingo (all tiles played), leave is empty.
+      wgen->leave_value = 0;
+      if (gen->number_of_tiles_in_bag == 0) {
+        rack_reset(&gen->leave);
+      }
+      for (int bingo_idx = 0; bingo_idx < num_bingos; bingo_idx++) {
+        // Point the word list at the RIT's inline word (no copy).
+        wgen->words = gen->rit_entry->bingo_words[bingo_idx];
+        wgen->num_words = 1;
+        for (int start_col = anchor->leftmost_start_col;
+             start_col <= anchor->rightmost_start_col; start_col++) {
+          if (wordmap_gen_check_playthrough_and_crosses(gen, 0, start_col)) {
+            record_wmp_plays_for_word(gen, 0, start_col, 0, 0);
+            if (gen->threshold_exceeded) {
+              return;
+            }
+          }
+        }
+      }
+      return;
+    }
+  }
+
   wmp_move_gen_set_playthrough_bit_rack(wgen, anchor, gen->row_cache);
   wmp_move_gen_playthrough_subracks_init(wgen, anchor);
 
@@ -987,16 +1179,13 @@ static inline void recursive_gen_small(MoveGen *gen, int col,
                                        int rightstrip, bool unique_play,
                                        int main_word_score, int word_multiplier,
                                        Equity cross_score) {
-  const MachineLetter current_letter = gen_cache_get_letter(gen, col);
-  uint64_t possible_letters_here = gen_cache_get_cross_set(gen, col) &
-                                   gen_cache_get_left_extension_set(gen, col);
-  if ((gen->tiles_played == 0) && (col == gen->current_anchor_col + 1)) {
-    possible_letters_here &= gen->anchor_right_extension_set;
-  }
-  if (possible_letters_here == 1) {
-    possible_letters_here = 0;
-  }
+  // Load the row_cache Square once; every field read below goes through it,
+  // giving the compiler a single base for the col*sizeof(Square) arithmetic.
+  const Square *sq = &gen->row_cache[col];
+  const MachineLetter current_letter = square_get_letter(sq);
   if (current_letter != ALPHABET_EMPTY_SQUARE_MARKER) {
+    // Play-through square: possible_letters_here is dead on this branch (it
+    // reads only raw / next_node_index / accepts), so it is not computed here.
     const MachineLetter raw = get_unblanked_machine_letter(current_letter);
     uint32_t next_node_index = 0;
     bool accepts = false;
@@ -1014,15 +1203,30 @@ static inline void recursive_gen_small(MoveGen *gen, int col,
     go_on_small(gen, col, current_letter, next_node_index, accepts, leftstrip,
                 rightstrip, unique_play, main_word_score, word_multiplier,
                 cross_score);
-  } else if (!rack_is_empty(&gen->player_rack) &&
-             ((possible_letters_here & gen->rack_cross_set) != 0)) {
+  } else if (!rack_is_empty(&gen->player_rack)) {
+    // Empty square: compute the placeable-letter set only now -- it is unused
+    // on the play-through branch and when the mover's rack is empty.
+    uint64_t possible_letters_here =
+        square_get_cross_set(sq) & square_get_left_extension_set(sq);
+    if ((gen->tiles_played == 0) && (col == gen->current_anchor_col + 1)) {
+      possible_letters_here &= gen->anchor_right_extension_set;
+    }
+    if (possible_letters_here == 1) {
+      possible_letters_here = 0;
+    }
+    if ((possible_letters_here & gen->rack_cross_set) == 0) {
+      return;
+    }
+    // The rack's blank count is invariant across the sibling loop: each
+    // iteration's take/add of a blank (or a non-blank ml) is balanced and the
+    // go_on_small recursion fully restores player_rack, so hoist it.
+    const uint16_t num_blanks =
+        rack_get_letter(&gen->player_rack, BLANK_MACHINE_LETTER);
     for (uint32_t i = node_index;; i++) {
       const uint32_t node = kwg_node(gen->kwg, i);
       const MachineLetter ml = kwg_node_tile(node);
       const uint16_t number_of_ml = rack_get_letter(&gen->player_rack, ml);
-      if (ml != 0 &&
-          (number_of_ml != 0 ||
-           rack_get_letter(&gen->player_rack, BLANK_MACHINE_LETTER) != 0) &&
+      if (ml != 0 && (number_of_ml != 0 || num_blanks != 0) &&
           board_is_letter_allowed_in_cross_set(possible_letters_here, ml)) {
         const uint32_t next_node_index =
             kwg_node_arc_index_prefetch(node, gen->kwg);
@@ -1037,7 +1241,7 @@ static inline void recursive_gen_small(MoveGen *gen, int col,
           rack_add_letter(&gen->player_rack, ml);
         }
         // check blank
-        if (rack_get_letter(&gen->player_rack, BLANK_MACHINE_LETTER) > 0) {
+        if (num_blanks > 0) {
           rack_take_letter(&gen->player_rack, BLANK_MACHINE_LETTER);
           gen->tiles_played++;
           go_on_small(gen, col, get_blanked_machine_letter(ml), next_node_index,
@@ -1304,11 +1508,93 @@ void go_on_alpha(MoveGen *gen, int current_col, MachineLetter L, int leftstrip,
 static inline void shadow_record(MoveGen *gen) {
   const Equity *best_leaves = gen->best_leaves;
   if (wmp_move_gen_is_active(&gen->wmp_move_gen)) {
-    if (wmp_move_gen_has_playthrough(&gen->wmp_move_gen) &&
-        (gen->tiles_played == gen->number_of_letters_on_rack)) {
-      if (!wmp_move_gen_check_playthrough_full_rack_existence(
-              &gen->wmp_move_gen)) {
-        return;
+    if (wmp_move_gen_has_playthrough(&gen->wmp_move_gen)) {
+      // RIT fast path for single-playthrough anchors: the RIT's
+      // playthrough_union[leave_size] holds a uint32 bitmask of letters L
+      // such that at least one canonical (tiles_played)-tile subrack of
+      // the current full rack forms a valid (tiles_played + 1)-letter
+      // word with L. Works for any tiles_played value (1..RACK_SIZE) as
+      // long as the built RIT has coverage for that played size. Replaces
+      // the KWG/WMP hash walk with one array load and one bit test.
+      //
+      // Preconditions:
+      //   - gen->rit_entry is set (implies number_of_letters_on_rack ==
+      //     RACK_SIZE, since gen_look_up_leaves_and_record_exchanges only
+      //     populates rit_entry for full racks)
+      //   - exactly one playthrough tile (the RIT's unions are built for
+      //     single-blank-equivalent queries, not multi-blank)
+      //   - played_size falls in the RIT's coverage interval
+      const bool rit_fast_path =
+          gen->rit_entry != NULL &&
+          gen->wmp_move_gen.num_tiles_played_through == 1 &&
+          rack_info_table_has_playthrough_coverage(gen->rack_info_table,
+                                                   gen->tiles_played);
+      if (rit_fast_path) {
+        const int leave_size = RACK_SIZE - gen->tiles_played;
+        const uint32_t union_bitmask =
+            rack_info_table_entry_get_playthrough_union(gen->rit_entry,
+                                                        leave_size);
+        const MachineLetter playthrough_ml =
+            wmp_move_gen_single_playthrough_letter(&gen->wmp_move_gen);
+        if (((union_bitmask >> playthrough_ml) & 1U) == 0) {
+          return;
+        }
+      } else if (gen->tiles_played == gen->number_of_letters_on_rack) {
+        // Fall back to the existing WMP check for full-rack cases not
+        // handled by the RIT fast path: full rack + multi-playthrough,
+        // or full rack + single-playthrough when the RIT is unavailable
+        // or doesn't cover full-rack play.        // Multi-pt tp=7 bitvec
+        // pre-filter ahead of the exact wmp walk. The RIT stores per word
+        // length a uint32 with bit L set iff some 7-tile subrack of this rack +
+        // {L} + (other letters) makes a word of that length. Tests each
+        // playthrough letter against that single load. Only applies to 7-tile
+        // bingo plays (tiles_played == RACK_SIZE) with >=2 playthrough tiles on
+        // blankless racks.
+        if (gen->rit_entry != NULL && gen->tiles_played == RACK_SIZE &&
+            gen->wmp_move_gen.num_tiles_played_through >= 2 &&
+            bit_rack_get_letter(&gen->wmp_move_gen.player_bit_rack,
+                                BLANK_MACHINE_LETTER) == 0) {
+          const int word_length =
+              gen->tiles_played + gen->wmp_move_gen.num_tiles_played_through;
+          uint32_t length_bitvec = 0;
+          if (wmp_move_gen_get_multi_pt_bitvec_for_tiles_played(
+                  gen->rit_entry, gen->tiles_played, word_length,
+                  &length_bitvec) &&
+              wmp_move_gen_multi_pt_bitvec_says_prune(&gen->wmp_move_gen,
+                                                      length_bitvec)) {
+            return;
+          }
+        }
+        if (!wmp_move_gen_check_playthrough_full_rack_existence(
+                &gen->wmp_move_gen)) {
+          return;
+        }
+        // Exact WMP lookup confirmed word exists.
+      } else {
+        // Partial rack + multi-playthrough. Previously had no shadow-
+        // time word-existence check at all. The tp=6 bitvec populated
+        // by the maker fills that gap for the tiles_played == RACK_SIZE
+        // - 1 case: load the per-length uint32 and AND across the
+        // actual playthrough letters as a necessary condition. tp=5
+        // was measured and dropped (4.7% prune rate didn't cover the
+        // file-size cost); other tiles_played values still fall through
+        // with no check.
+        if (gen->rit_entry != NULL &&
+            gen->wmp_move_gen.num_tiles_played_through >= 2 &&
+            bit_rack_get_letter(&gen->wmp_move_gen.player_bit_rack,
+                                BLANK_MACHINE_LETTER) == 0 &&
+            gen->tiles_played == RACK_SIZE - 1) {
+          const int word_length =
+              gen->tiles_played + gen->wmp_move_gen.num_tiles_played_through;
+          uint32_t length_bitvec = 0;
+          if (wmp_move_gen_get_multi_pt_bitvec_for_tiles_played(
+                  gen->rit_entry, gen->tiles_played, word_length,
+                  &length_bitvec) &&
+              wmp_move_gen_multi_pt_bitvec_says_prune(&gen->wmp_move_gen,
+                                                      length_bitvec)) {
+            return;
+          }
+        }
       }
     }
     if (!wmp_move_gen_has_playthrough(&gen->wmp_move_gen) &&
@@ -1521,15 +1807,13 @@ static inline void remove_score_from_descending_tile_scores(MoveGen *gen,
   }
 }
 
-// Returns false if the tile can not be restricted.
-// Otherwise it removes the tile from the rack and adds the score.
-static inline bool try_restrict_tile_and_accumulate_score(
-    MoveGen *gen, uint64_t possible_letters_here, int letter_multiplier,
-    int this_word_multiplier, int col) {
-  const bool restricted = is_single_bit_set(possible_letters_here);
-  if (!restricted) {
-    return false;
-  }
+// Removes the (single) tile in possible_letters_here from the rack and adds
+// the score. Callers must have already established that possible_letters_here
+// has exactly one bit set.
+static inline void
+restrict_tile_and_accumulate_score(MoveGen *gen, uint64_t possible_letters_here,
+                                   int letter_multiplier,
+                                   int this_word_multiplier, int col) {
   const MachineLetter ml = get_single_bit_index(possible_letters_here);
   rack_take_letter(&gen->player_rack, ml);
   if (rack_get_letter(&gen->player_rack, ml) == 0) {
@@ -1549,7 +1833,18 @@ static inline bool try_restrict_tile_and_accumulate_score(
   // But verified with godbolt that this compiles to faster code.
   gen->shadow_perpendicular_additional_score +=
       (lsm * this_word_multiplier) & (-(int)is_cross_word);
+}
 
+// Returns false if the tile can not be restricted.
+// Otherwise it removes the tile from the rack and adds the score.
+static inline bool try_restrict_tile_and_accumulate_score(
+    MoveGen *gen, uint64_t possible_letters_here, int letter_multiplier,
+    int this_word_multiplier, int col) {
+  if (!is_single_bit_set(possible_letters_here)) {
+    return false;
+  }
+  restrict_tile_and_accumulate_score(
+      gen, possible_letters_here, letter_multiplier, this_word_multiplier, col);
   return true;
 }
 
@@ -1560,28 +1855,25 @@ static inline void shadow_play_right(MoveGen *gen, bool is_unique) {
   const Equity orig_perp_score = gen->shadow_perpendicular_additional_score;
   const int orig_wordmul = gen->shadow_word_multiplier;
 
-  // Save the rack with the tiles available before beginning shadow right. Any
-  // tiles restricted by unique hooks will be returned to the rack after
-  // exhausting rightward shadow.
-  rack_copy(&gen->player_rack_shadow_right_copy, &gen->player_rack);
-  rack_copy(&gen->bingo_alpha_rack_shadow_right_copy, &gen->bingo_alpha_rack);
+  // The rack with the tiles available before beginning shadow right is
+  // saved lazily: any tiles restricted by unique hooks modify the rack, so
+  // the rack (and the descending tile scores) are copied just before the
+  // first restriction and restored after exhausting rightward shadow.
   const uint64_t orig_rack_cross_set = gen->rack_cross_set;
-  memcpy(gen->descending_tile_scores_copy, gen->descending_tile_scores,
-         sizeof(gen->descending_tile_scores));
   // Only recopy the originals if a restriction modified the arrays above.
   bool restricted_any_tiles = false;
 
-  // Save the state of the unrestricted multiplier arrays so they can be
-  // restored after exhausting the rightward shadow plays. Shadowing right
-  // changes the values of multipliers found while shadowing left. We need to
-  // restore them to how they were before looking further left.
+  if (gen->is_wordsmog) {
+    rack_copy(&gen->bingo_alpha_rack_shadow_right_copy, &gen->bingo_alpha_rack);
+  }
+
+  // The state of the unrestricted multiplier arrays is saved lazily (just
+  // before the first modification) so they can be restored after exhausting
+  // the rightward shadow plays. Shadowing right changes the values of
+  // multipliers found while shadowing left. We need to restore them to how
+  // they were before looking further left.
   const int orig_num_unrestricted_multipliers =
       gen->num_unrestricted_multipliers;
-  memcpy(gen->desc_xw_muls_copy, gen->descending_cross_word_multipliers,
-         sizeof(gen->descending_cross_word_multipliers));
-  memcpy(gen->desc_eff_letter_muls_copy,
-         gen->descending_effective_letter_multipliers,
-         sizeof(gen->descending_effective_letter_multipliers));
   bool changed_any_restricted_multipliers = false;
 
   const int original_current_right_col = gen->current_right_col;
@@ -1633,13 +1925,30 @@ static inline void shadow_play_right(MoveGen *gen, bool is_unique) {
         cross_score * this_word_multiplier;
     gen->shadow_word_multiplier *= this_word_multiplier;
 
-    if (try_restrict_tile_and_accumulate_score(
-            gen, possible_letters_here, letter_multiplier, this_word_multiplier,
-            gen->current_right_col)) {
-      restricted_any_tiles = true;
+    if (is_single_bit_set(possible_letters_here)) {
+      if (!restricted_any_tiles) {
+        // First restriction in this rightward shadow: save the rack and
+        // descending tile scores so they can be restored on exit.
+        rack_copy(&gen->player_rack_shadow_right_copy, &gen->player_rack);
+        memcpy(gen->descending_tile_scores_copy, gen->descending_tile_scores,
+               sizeof(gen->descending_tile_scores));
+        restricted_any_tiles = true;
+      }
+      restrict_tile_and_accumulate_score(
+          gen, possible_letters_here, letter_multiplier, this_word_multiplier,
+          gen->current_right_col);
     } else {
+      if (!changed_any_restricted_multipliers) {
+        // First multiplier-array modification: save the arrays so they can
+        // be restored on exit.
+        memcpy(gen->desc_xw_muls_copy, gen->descending_cross_word_multipliers,
+               sizeof(gen->descending_cross_word_multipliers));
+        memcpy(gen->desc_eff_letter_muls_copy,
+               gen->descending_effective_letter_multipliers,
+               sizeof(gen->descending_effective_letter_multipliers));
+        changed_any_restricted_multipliers = true;
+      }
       insert_unrestricted_multipliers(gen, gen->current_right_col);
-      changed_any_restricted_multipliers = true;
     }
     if (cross_set == TRIVIAL_CROSS_SET) {
       is_unique = true;
@@ -1654,7 +1963,11 @@ static inline void shadow_play_right(MoveGen *gen, bool is_unique) {
       found_playthrough_tile = true;
       const MachineLetter unblanked_playthrough_ml =
           get_unblanked_machine_letter(next_letter);
-      rack_add_letter(&gen->bingo_alpha_rack, unblanked_playthrough_ml);
+      if (gen->is_wordsmog) {
+        // bingo_alpha_rack is only read by the wordsmog alphagram check in
+        // shadow_record, so skip maintaining it otherwise.
+        rack_add_letter(&gen->bingo_alpha_rack, unblanked_playthrough_ml);
+      }
       // Adding a letter here would be unsafe if the LetterDistribution's
       // alphabet size exceeded BIT_RACK_MAX_ALPHABET_SIZE.
       if (wmp_move_gen_is_active(&gen->wmp_move_gen)) {
@@ -1704,7 +2017,9 @@ static inline void shadow_play_right(MoveGen *gen, bool is_unique) {
   // Restore state to undo other shadow progress
   gen->current_right_col = original_current_right_col;
   gen->tiles_played = original_tiles_played;
-  rack_copy(&gen->bingo_alpha_rack, &gen->bingo_alpha_rack_shadow_right_copy);
+  if (gen->is_wordsmog) {
+    rack_copy(&gen->bingo_alpha_rack, &gen->bingo_alpha_rack_shadow_right_copy);
+  }
   wmp_move_gen_restore_playthrough_state(&gen->wmp_move_gen);
 
   // The change of shadow_word_multiplier necessitates recalculating effective
@@ -1720,19 +2035,16 @@ static inline void shadow_play_right_small(MoveGen *gen, bool is_unique) {
   const Equity orig_perp_score = gen->shadow_perpendicular_additional_score;
   const int orig_wordmul = gen->shadow_word_multiplier;
 
-  rack_copy(&gen->player_rack_shadow_right_copy, &gen->player_rack);
+  // The rack/tile-score and multiplier-array snapshots are saved LAZILY on the
+  // first restriction / first unrestricted insertion in the loop below,
+  // mirroring the non-small shadow_play_right. Most rightward shadows over the
+  // short racks of an endgame restrict nothing, so these ~132 bytes of wide
+  // copies are usually never paid. orig_rack_cross_set and
+  // orig_num_unrestricted_multipliers are cheap scalars, kept eager.
   const uint64_t orig_rack_cross_set = gen->rack_cross_set;
-  memcpy(gen->descending_tile_scores_copy, gen->descending_tile_scores,
-         sizeof(gen->descending_tile_scores));
   bool restricted_any_tiles = false;
-
   const int orig_num_unrestricted_multipliers =
       gen->num_unrestricted_multipliers;
-  memcpy(gen->desc_xw_muls_copy, gen->descending_cross_word_multipliers,
-         sizeof(gen->descending_cross_word_multipliers));
-  memcpy(gen->desc_eff_letter_muls_copy,
-         gen->descending_effective_letter_multipliers,
-         sizeof(gen->descending_effective_letter_multipliers));
   bool changed_any_restricted_multipliers = false;
 
   const int original_current_right_col = gen->current_right_col;
@@ -1777,13 +2089,30 @@ static inline void shadow_play_right_small(MoveGen *gen, bool is_unique) {
         cross_score * this_word_multiplier;
     gen->shadow_word_multiplier *= this_word_multiplier;
 
-    if (try_restrict_tile_and_accumulate_score(
-            gen, possible_letters_here, letter_multiplier, this_word_multiplier,
-            gen->current_right_col)) {
-      restricted_any_tiles = true;
+    if (is_single_bit_set(possible_letters_here)) {
+      if (!restricted_any_tiles) {
+        // First restriction in this rightward shadow: snapshot the rack and
+        // descending tile scores that restrict_tile_and_accumulate_score is
+        // about to mutate. Must save BEFORE the mutating call.
+        rack_copy(&gen->player_rack_shadow_right_copy, &gen->player_rack);
+        memcpy(gen->descending_tile_scores_copy, gen->descending_tile_scores,
+               sizeof(gen->descending_tile_scores));
+        restricted_any_tiles = true;
+      }
+      restrict_tile_and_accumulate_score(
+          gen, possible_letters_here, letter_multiplier, this_word_multiplier,
+          gen->current_right_col);
     } else {
+      if (!changed_any_restricted_multipliers) {
+        // First unrestricted insertion: snapshot the multiplier arrays.
+        memcpy(gen->desc_xw_muls_copy, gen->descending_cross_word_multipliers,
+               sizeof(gen->descending_cross_word_multipliers));
+        memcpy(gen->desc_eff_letter_muls_copy,
+               gen->descending_effective_letter_multipliers,
+               sizeof(gen->descending_effective_letter_multipliers));
+        changed_any_restricted_multipliers = true;
+      }
       insert_unrestricted_multipliers(gen, gen->current_right_col);
-      changed_any_restricted_multipliers = true;
     }
     if (cross_set == TRIVIAL_CROSS_SET) {
       is_unique = true;
@@ -2131,7 +2460,11 @@ static inline void shadow_start_playthrough(MoveGen *gen,
   for (;;) {
     const MachineLetter unblanked_playthrough_ml =
         get_unblanked_machine_letter(current_letter);
-    rack_add_letter(&gen->bingo_alpha_rack, unblanked_playthrough_ml);
+    if (gen->is_wordsmog) {
+      // bingo_alpha_rack is only read by the wordsmog alphagram check in
+      // shadow_record, so skip maintaining it otherwise.
+      rack_add_letter(&gen->bingo_alpha_rack, unblanked_playthrough_ml);
+    }
     if (wmp_move_gen_is_active(&gen->wmp_move_gen)) {
       wmp_move_gen_add_playthrough_letter(&gen->wmp_move_gen,
                                           unblanked_playthrough_ml);
@@ -2183,7 +2516,9 @@ static inline void shadow_start(MoveGen *gen) {
 
   const uint64_t original_rack_cross_set = gen->rack_cross_set;
   rack_copy(&gen->full_player_rack, &gen->player_rack);
-  rack_copy(&gen->bingo_alpha_rack, &gen->player_rack);
+  if (gen->is_wordsmog) {
+    rack_copy(&gen->bingo_alpha_rack, &gen->player_rack);
+  }
 
   const MachineLetter current_letter =
       gen_cache_get_letter(gen, gen->current_left_col);
@@ -2411,26 +2746,101 @@ void gen_load_position(MoveGen *gen, const MoveGenArgs *args) {
   const Player *player = game_get_player(game, gen->player_index);
   const Player *opponent = game_get_player(game, 1 - gen->player_index);
 
-  memcpy(&gen->ld, game_get_ld(game), sizeof(LetterDistribution));
-  gen->kwg = player_get_kwg(player);
+  // gen->ld is a by-value copy and the per-thread MoveGen is reused across
+  // every node of a solve with a stable game->ld, so skip the ~3.4 KB memcpy
+  // (and the bit_rack compat scan) when the source distribution is unchanged --
+  // pure per-node-setup work removed on the movegen-dominated endgame profile.
+  // The guard is the ld's content fingerprint, NOT its address: the MoveGen
+  // cache outlives the Config that owns an ld, so a freed ld (and its name
+  // string) can be reused by a different distribution at the same address
+  // (ABA), which a pointer comparison misses but the content hash catches. The
+  // cached copy's fingerprint is 0 until the first load (calloc), and a real
+  // fingerprint is never 0, so the first node always loads.
+  const LetterDistribution *ld_src = game_get_ld(game);
+  if (ld_get_content_fingerprint(ld_src) != gen->ld.content_fingerprint) {
+    memcpy(&gen->ld, ld_src, sizeof(LetterDistribution));
+    gen->bit_rack_compatible = bit_rack_is_compatible_with_ld(&gen->ld);
+  }
   gen->kwg = (override_kwg == NULL) ? player_get_kwg(player) : override_kwg;
-  gen->klv = player_get_klv(player);
+  const KLV *new_klv = player_get_klv(player);
+  const uint64_t new_klv_mutation_counter =
+      (new_klv != NULL) ? klv_get_mutation_counter(new_klv) : 0;
+  const uint64_t new_klv_instance_fp =
+      (new_klv != NULL) ? klv_get_instance_fingerprint(new_klv) : 0;
+  // Invalidate when the KLV pointer changes (player swap, lexicon change), the
+  // KLV instance fingerprint changes (catches a reloaded KLV the allocator
+  // placed at the freed KLV's address -- ABA -- which the pointer comparison
+  // misses because the move_gen cache outlives the Config that owned the old
+  // KLV), OR the same KLV's leave_values have been mutated in place. The
+  // mutation-counter path catches test-only set_klv_leave_value calls between
+  // generate_moves invocations, which would otherwise leave stale leave_values
+  // cached in the subrack cache and anchor-cache upper-bound entries.
+  const bool klv_changed =
+      (new_klv != gen->klv) ||
+      (new_klv_instance_fp != gen->klv_instance_fp_at_load) ||
+      (new_klv_mutation_counter != gen->klv_mutation_counter_at_load);
+  if (klv_changed) {
+    for (int i = 0; i < MOVEGEN_SUBRACK_CACHE_SIZE; i++) {
+      gen->subrack_cache[i].valid = false;
+    }
+    for (int i = 0; i < MOVEGEN_KLV_LEAVES_CACHE_SIZE; i++) {
+      gen->klv_leaves_cache[i].valid = false;
+    }
+  }
+  gen->klv = new_klv;
+  gen->klv_mutation_counter_at_load = new_klv_mutation_counter;
+  gen->klv_instance_fp_at_load = new_klv_instance_fp;
+  // The RIT keys on a BitRack, so it is unusable for a BitRack-incompatible
+  // alphabet; treat it as absent (the WMP is gated the same way below).
+  const RackInfoTable *new_rit =
+      gen->bit_rack_compatible ? player_get_rack_info_table(player) : NULL;
+  if (new_rit != gen->rack_info_table) {
+    memset(gen->rit_cache_valid, 0, sizeof(gen->rit_cache_valid));
+    // Leave values are stored in the subrack cache; they depend on the
+    // RIT (via the leave_map), so invalidate when the RIT changes.
+    for (int i = 0; i < MOVEGEN_SUBRACK_CACHE_SIZE; i++) {
+      gen->subrack_cache[i].valid = false;
+    }
+  }
+  gen->rack_info_table = new_rit;
   gen->board_number_of_tiles_played = board_get_tiles_played(gen->board);
   rack_copy(&gen->opponent_rack, player_get_rack(opponent));
   rack_copy(&gen->player_rack, player_get_rack(player));
   move_list_set_rack(move_list, &gen->player_rack);
   rack_set_dist_size(&gen->leave, ld_get_size(&gen->ld));
+  const WMP *previous_wmp = gen->wmp_move_gen.wmp;
+  // Decide up front whether WMP will be active. It is disabled for
+  // ALL_SMALL/TILES_PLAYED (unsupported), when override_kwg is set (WMP data
+  // corresponds to the original KWG, not the override), and on a
+  // BitRack-incompatible alphabet (the WMP keys on a BitRack). Passing NULL
+  // when disabled lets wmp_move_gen_init early-return instead of building a
+  // BitRack, clearing the length table, and seeding all anchor slots -- wasted
+  // work on every endgame node, which always passes override_kwg. The seeded
+  // fields are only read while WMP is active, so skipping them when it is NULL
+  // is safe.
+  const bool wmp_disabled = gen->move_record_type == MOVE_RECORD_ALL_SMALL ||
+                            gen->move_record_type == MOVE_RECORD_TILES_PLAYED ||
+                            override_kwg != NULL || !gen->bit_rack_compatible;
   wmp_move_gen_init(&gen->wmp_move_gen, &gen->ld, &gen->player_rack,
-                    player_get_wmp(player));
-
-  if (gen->move_record_type == MOVE_RECORD_ALL_SMALL ||
-      gen->move_record_type == MOVE_RECORD_TILES_PLAYED ||
-      override_kwg != NULL) {
-    // Disable WMP when using ALL_SMALL/TILES_PLAYED (unsupported) or when
-    // override_kwg is set (WMP data corresponds to the original KWG, not
-    // the override).
-    gen->wmp_move_gen.wmp = NULL;
+                    wmp_disabled ? NULL : player_get_wmp(player));
+  // The subrack cache holds wmp_entry pointers derived from the WMP; a WMP
+  // swap (different lexicon) makes those stale -- and "stale" means dangling,
+  // since the old WMP's Config may have been freed. Invalidate on a WMP
+  // pointer change OR an instance-fingerprint change. The fingerprint catches
+  // a reloaded WMP (even of the same lexicon) that the allocator placed at the
+  // freed WMP's struct address (ABA) but whose internal maps are at new
+  // addresses -- a pointer comparison alone would miss it because the move_gen
+  // cache outlives the Config that owned the old WMP.
+  const WMP *new_wmp = gen->wmp_move_gen.wmp;
+  const uint64_t new_wmp_instance_fp =
+      (new_wmp != NULL) ? wmp_get_instance_fingerprint(new_wmp) : 0;
+  if (new_wmp != previous_wmp ||
+      new_wmp_instance_fp != gen->wmp_instance_fp_at_load) {
+    for (int i = 0; i < MOVEGEN_SUBRACK_CACHE_SIZE; i++) {
+      gen->subrack_cache[i].valid = false;
+    }
   }
+  gen->wmp_instance_fp_at_load = new_wmp_instance_fp;
 
   gen->bingo_bonus = game_get_bingo_bonus(game);
   gen->number_of_tiles_in_bag = bag_get_letters(game_get_bag(game));
@@ -2474,9 +2884,16 @@ void gen_load_position(MoveGen *gen, const MoveGenArgs *args) {
 
   board_load_number_of_row_anchors_cache(gen->board,
                                          gen->row_number_of_anchors_cache);
-  board_load_lanes_cache(gen->board, gen->cross_index, gen->lanes_cache);
+  gen->lanes_cache = board_get_readonly_lanes(gen->board, gen->cross_index);
 
-  board_copy_opening_penalties(gen->board, gen->opening_move_penalties);
+  // opening_move_penalties is read only by gen_get_static_equity (the
+  // equity-recording paths). The endgame's small-record movegen types never
+  // read it, so skip the per-node 120-byte copy for them.
+  if (gen->move_record_type != MOVE_RECORD_ALL_SMALL &&
+      gen->move_record_type != MOVE_RECORD_TILES_PLAYED &&
+      gen->move_record_type != MOVE_RECORD_BEST_SMALL) {
+    board_copy_opening_penalties(gen->board, gen->opening_move_penalties);
+  }
 
   gen->is_wordsmog = game_get_variant(game) == GAME_VARIANT_WORDSMOG;
   gen->threshold_exceeded = false;
@@ -2492,34 +2909,124 @@ void gen_look_up_leaves_and_record_exchanges(MoveGen *gen) {
     leave_map_set_current_value(&gen->leave_map, EQUITY_INITIAL_VALUE);
   }
 
-  for (int i = 0; i < (RACK_SIZE + 1); i++) {
-    gen->best_leaves[i] = EQUITY_INITIAL_VALUE;
+  for (int leave_size_idx = 0; leave_size_idx < (RACK_SIZE + 1);
+       leave_size_idx++) {
+    gen->best_leaves[leave_size_idx] = EQUITY_INITIAL_VALUE;
   }
 
   const bool check_leaves = (gen->number_of_tiles_in_bag > 0) &&
                             (gen->move_sort_type != MOVE_SORT_SCORE);
-  // TODO(olaugh): This is looking up leaves even when the sort is by score.
-  // We should pass check_leaves to generate_exchange_moves because if we sort
-  // by score we should still generate all exchanges. However this is an actual
-  // waste performance-wise for endgame, unless we want to somehow incorporate
-  // something like heuristic "endgame leaves" to use in estimates for negamax.
-  //
-  // Set the best leaves and maybe add exchanges.
-  // gen->leave_map.current_index moves differently when filling
-  // leave_values than when reading from it to generate plays. Start at 0,
-  // which represents using (exchanging) gen->player_rack->number_of_letters
-  // tiles and keeping 0 tiles.
-  leave_map_set_current_index(&gen->leave_map, 0);
-  uint32_t node_index = kwg_get_dawg_root_node_index(gen->klv->kwg);
-  rack_reset(&gen->leave);
+
   // Assumes the player has drawn a full rack but not the opponent.
-  bool add_exchange = gen->number_of_tiles_in_bag +
-                          rack_get_total_letters(&gen->opponent_rack) >=
-                      (RACK_SIZE * 2);
-  generate_exchange_moves(gen, &gen->leave, node_index, 0, 0, add_exchange);
+  const bool add_exchange = gen->number_of_tiles_in_bag +
+                                rack_get_total_letters(&gen->opponent_rack) >=
+                            (RACK_SIZE * 2);
+
+  // Try to use the pre-computed rack info table for full racks.
+  const bool has_full_rack =
+      rack_get_total_letters(&gen->player_rack) == RACK_SIZE;
+  const RackInfoTable *rit = gen->rack_info_table;
+  gen->rit_entry = NULL;
+
+  // rit is NULL for BitRack-incompatible alphabets (gated in
+  // gen_load_position), so this RIT-cache path is already skipped for them.
+  if (has_full_rack && rit != NULL) {
+    const BitRack player_bit_rack =
+        bit_rack_create_from_rack(&gen->ld, &gen->player_rack);
+    // Check per-thread direct-mapped cache before the full hash lookup.
+    const uint32_t cache_idx =
+        bit_rack_get_bucket_index(&player_bit_rack, MOVEGEN_RIT_CACHE_SIZE);
+    if (gen->rit_cache_valid[cache_idx] &&
+        bit_rack_equals(&player_bit_rack, &gen->rit_cache_keys[cache_idx])) {
+      gen->rit_entry = gen->rit_cache_entries[cache_idx];
+    } else {
+      const RackInfoTableEntry *entry =
+          rack_info_table_lookup(rit, &player_bit_rack);
+      gen->rit_cache_keys[cache_idx] = player_bit_rack;
+      gen->rit_cache_entries[cache_idx] = entry;
+      gen->rit_cache_valid[cache_idx] = true;
+      if (entry != NULL) {
+        gen->rit_entry = entry;
+      }
+    }
+  }
+
+  // gen->leave_map.current_index moves differently when filling leave_values
+  // than when reading from it to generate plays. Start at 0, which represents
+  // using (exchanging) gen->player_rack->number_of_letters tiles and keeping
+  // 0 tiles.
+  leave_map_set_current_index(&gen->leave_map, 0);
+  rack_reset(&gen->leave);
+
+  if (gen->rit_entry != NULL) {
+    // Fast path: unpack the RIT's 24-bit packed leave values to 32-bit
+    // in the leave map so play-time leave_map_get_current_value calls
+    // and wmp_move_gen's subrack reads return the right value.
+    rack_info_table_entry_unpack_leaves(gen->rit_entry,
+                                        gen->leave_map.leave_values);
+    // Load best_leaves directly from the RIT entry, avoiding the
+    // 2^RACK_SIZE canonical subset walk. Only fall back to the walk
+    // when we actually need to record exchange moves.
+    const Equity *rit_best_leaves =
+        rack_info_table_entry_get_best_leaves(gen->rit_entry);
+    memcpy(gen->best_leaves, rit_best_leaves,
+           RACK_INFO_TABLE_BEST_LEAVES_PER_ENTRY * sizeof(Equity));
+    if (add_exchange) {
+      if (gen->move_record_type == MOVE_RECORD_BEST) {
+        // For MOVE_RECORD_BEST, record the single precomputed best
+        // exchange from the RIT — O(1) instead of 2^RACK_SIZE walk.
+        record_best_exchange_from_table(gen);
+      } else {
+        generate_exchange_moves_from_table(gen, &gen->leave, 0, true);
+      }
+    }
+  } else if (check_leaves || add_exchange) {
+    // Mini-RIT fast path: when the leave_values and best_leaves for this
+    // rack have been computed by a previous KLV walk on this thread,
+    // memcpy them in and only walk the KLV tree again when add_exchange
+    // requires recording the actual exchange moves (which goes through
+    // the RIT-alike generate_exchange_moves_from_table, skipping the
+    // KLV descent either way).
+    // Unlike the RIT/WMP caches (gated by being NULL), this KLV-leaves cache is
+    // always available, so it must consult bit_rack_compatible directly: its
+    // key is a BitRack, unrepresentable for a too-large alphabet.
+    const bool kle_eligible = has_full_rack && gen->bit_rack_compatible;
+    const BitRack kle_bit_rack =
+        kle_eligible ? bit_rack_create_from_rack(&gen->ld, &gen->player_rack)
+                     : bit_rack_create_empty();
+    const uint32_t kle_slot =
+        kle_eligible ? bit_rack_get_bucket_index(&kle_bit_rack,
+                                                 MOVEGEN_KLV_LEAVES_CACHE_SIZE)
+                     : 0;
+    KlvLeavesCacheEntry *kle =
+        kle_eligible ? &gen->klv_leaves_cache[kle_slot] : NULL;
+    if (kle_eligible && kle->valid &&
+        bit_rack_equals(&kle_bit_rack, &kle->key)) {
+      memcpy(gen->leave_map.leave_values, kle->leave_values,
+             sizeof(kle->leave_values));
+      memcpy(gen->best_leaves, kle->best_leaves, sizeof(kle->best_leaves));
+      if (add_exchange) {
+        // Leaves are already in the leave map, so the RIT-style variant
+        // (no KLV descent) can record exchanges straight from memory.
+        generate_exchange_moves_from_table(gen, &gen->leave, 0, true);
+      }
+    } else {
+      const uint32_t node_index = kwg_get_dawg_root_node_index(gen->klv->kwg);
+      generate_exchange_moves(gen, &gen->leave, node_index, 0, 0, add_exchange);
+      if (kle_eligible) {
+        kle->key = kle_bit_rack;
+        memcpy(kle->leave_values, gen->leave_map.leave_values,
+               sizeof(kle->leave_values));
+        memcpy(kle->best_leaves, gen->best_leaves, sizeof(kle->best_leaves));
+        kle->valid = true;
+      }
+    }
+  }
+
   if (!check_leaves) {
-    for (int i = 0; i < RACK_SIZE + 1; i++) {
-      gen->best_leaves[i] = 0;
+    for (int leave_size_idx = 0; leave_size_idx < RACK_SIZE + 1;
+         leave_size_idx++) {
+      gen->best_leaves[leave_size_idx] = 0;
     }
   }
 
@@ -2703,7 +3210,7 @@ void gen_record_pass(MoveGen *gen) {
 }
 
 void generate_moves(const MoveGenArgs *args) {
-  MoveGen *gen = get_movegen(args->thread_index);
+  MoveGen *gen = get_movegen();
   gen_load_position(gen, args);
   if (gen->move_record_type == MOVE_RECORD_ALL_SMALL ||
       gen->move_record_type == MOVE_RECORD_TILES_PLAYED) {
@@ -2742,8 +3249,81 @@ void generate_moves(const MoveGenArgs *args) {
     if (wmp_move_gen_is_active(&gen->wmp_move_gen)) {
       const bool check_leaves = (gen->number_of_tiles_in_bag > 0) &&
                                 (gen->move_sort_type != MOVE_SORT_SCORE);
-      wmp_move_gen_check_nonplaythrough_existence(
-          &gen->wmp_move_gen, check_leaves, &gen->leave_map);
+      // Per-thread subrack enumeration cache. The enumeration output is
+      // rack-determined, so we hit on repeat racks (common in sims).
+      // IMPORTANT: leave_values written by the enumeration read from
+      // leave_map.leave_values, which is only populated when
+      // gen_look_up_leaves_and_record_exchanges actually walked the leave
+      // space -- i.e. when rit_entry != NULL (RIT unpacked leaves) or when
+      // (check_leaves || add_exchange) (KLV walk ran generate_exchange_moves).
+      // Otherwise leave_map.leave_values retains stale values from a prior
+      // rack and enumerating reads garbage. We only use the cache when
+      // those values are known-fresh, on both write and read.
+      WMPMoveGen *wgen = &gen->wmp_move_gen;
+      // Mirror the condition in gen_look_up_leaves_and_record_exchanges:
+      // add_exchange=true iff there are enough unseen tiles for the
+      // exchange walk to make sense.
+      const bool add_exchange =
+          gen->number_of_tiles_in_bag +
+              rack_get_total_letters(&gen->opponent_rack) >=
+          (RACK_SIZE * 2);
+      const bool leaves_are_populated =
+          (gen->rit_entry != NULL) || check_leaves || add_exchange;
+      const uint32_t subrack_slot = bit_rack_get_bucket_index(
+          &wgen->player_bit_rack, MOVEGEN_SUBRACK_CACHE_SIZE);
+      SubrackEnumCacheEntry *subrack_entry = &gen->subrack_cache[subrack_slot];
+      const bool subrack_cache_hit =
+          leaves_are_populated && subrack_entry->valid &&
+          bit_rack_equals(&subrack_entry->key, &wgen->player_bit_rack);
+      if (subrack_cache_hit) {
+        // Restore enumerate_nonplaythrough_subracks output AND the
+        // per-subrack wmp_entry pointers from cache. Both pieces are
+        // rack-determined (subracks via combinatoric walk, wmp_entries
+        // via WMP hash), so on hit we skip both the enumeration and the
+        // per-subrack wmp_get_word_entry calls that the size walk would
+        // otherwise run.
+        memcpy(wgen->count_by_size, subrack_entry->count_by_size,
+               sizeof(wgen->count_by_size));
+        for (int i = 0; i < MOVEGEN_SUBRACK_CACHE_ENTRIES; i++) {
+          wgen->nonplaythrough_infos[i].subrack = subrack_entry->subracks[i];
+          wgen->nonplaythrough_infos[i].leave_value =
+              subrack_entry->leave_values[i];
+          wgen->nonplaythrough_infos[i].wmp_entry =
+              subrack_entry->wmp_entries[i];
+        }
+      }
+      if (gen->rit_entry != NULL) {
+        // RIT-backed fast path: skip the per-size wmp_get_word_entry loop
+        // for any played size where the RIT entry says no canonical
+        // k-subrack of this rack forms a k-letter word on its own. Seeds
+        // nonplaythrough_best_leave_values directly from the cached max
+        // the RIT already computed at build time.
+        wmp_move_gen_check_nonplaythrough_existence_with_rit(
+            wgen, check_leaves, &gen->leave_map, gen->rit_entry,
+            /*subracks_precomputed=*/subrack_cache_hit,
+            /*wmp_entries_precomputed=*/subrack_cache_hit);
+      } else {
+        wmp_move_gen_check_nonplaythrough_existence(
+            wgen, check_leaves, &gen->leave_map,
+            /*subracks_precomputed=*/subrack_cache_hit,
+            /*wmp_entries_precomputed=*/subrack_cache_hit);
+      }
+      if (!subrack_cache_hit && leaves_are_populated) {
+        // Store the newly-computed enumeration and wmp_entry pointers
+        // into the cache. Only cache when leaves_are_populated so we
+        // don't stash garbage leave_values from an uninitialized leave_map.
+        subrack_entry->key = wgen->player_bit_rack;
+        subrack_entry->valid = true;
+        memcpy(subrack_entry->count_by_size, wgen->count_by_size,
+               sizeof(wgen->count_by_size));
+        for (int i = 0; i < MOVEGEN_SUBRACK_CACHE_ENTRIES; i++) {
+          subrack_entry->subracks[i] = wgen->nonplaythrough_infos[i].subrack;
+          subrack_entry->leave_values[i] =
+              wgen->nonplaythrough_infos[i].leave_value;
+          subrack_entry->wmp_entries[i] =
+              wgen->nonplaythrough_infos[i].wmp_entry;
+        }
+      }
     }
 
     if (gen->stop_on_threshold && gen->threshold_exceeded) {

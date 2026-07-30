@@ -3,10 +3,13 @@
 #include "../src/util/io_util.h"
 #include "alias_method_test.h"
 #include "alphabet_test.h"
+#include "analyze_test.h"
 #include "autoplay_test.h"
 #include "bag_test.h"
 #include "bai_test.h"
+#include "bai_utility_test.h"
 #include "benchmark_endgame_test.h"
+#include "benchmark_peg_test.h"
 #include "bit_rack_test.h"
 #include "board_layout_default_test.h"
 #include "board_layout_super_test.h"
@@ -18,6 +21,7 @@
 #include "convert_test.h"
 #include "create_data_test.h"
 #include "cross_set_test.h"
+#include "dawg_packed_test.h"
 #include "endgame_test.h"
 #include "equity_adjustment_test.h"
 #include "equity_test.h"
@@ -37,11 +41,19 @@
 #include "math_util_test.h"
 #include "move_gen_test.h"
 #include "move_test.h"
+#include "peg_oracle_test.h"
+#include "peg_pess_test.h"
+#include "peg_poll_test.h"
+#include "peg_pool_test.h"
+#include "peg_test.h"
+#include "play_chooser_test.h"
 #include "players_data_test.h"
+#include "rack_info_table_test.h"
 #include "rack_list_test.h"
 #include "rack_test.h"
 #include "random_variable_test.h"
 #include "shadow_test.h"
+#include "sim_benchmark_test.h"
 #include "sim_test.h"
 #include "stats_test.h"
 #include "string_util_test.h"
@@ -75,6 +87,7 @@ static TestEntry test_table[] = {
     {"ld", test_ld},
     {"l", test_leaves},
     {"leavemap", test_leave_map},
+    {"rit", test_rack_info_table},
     {"kwg", test_kwg_alpha},
     {"bag", test_bag},
     {"rack", test_rack},
@@ -98,14 +111,17 @@ static TestEntry test_table[] = {
     {"sim", test_sim},
     {"math", test_math_util},
     {"bai", test_bai},
+    {"baiutil", test_bai_utility},
     {"command", test_command},
     {"gcg", test_gcg},
+    {"analyze", test_analyze},
     {"autoplay", test_autoplay},
     {"words", test_words},
     {"wordprune", test_word_prune},
     {"kwgmaker", test_kwg_maker},
     {"cgp", test_cgp},
     {"rl", test_rack_list},
+    {"rlfr", test_rack_list_forced_racks},
     {"ch", test_checkpoint},
     {"klv", test_klv},
     {"cv", test_convert},
@@ -118,27 +134,75 @@ static TestEntry test_table[] = {
     {"vmodel_verify", test_vmodel_verify},
     {"vmodel_picks", test_vmodel_picks},
     {"endgame", test_endgame},
+    {"endgameoutplay", test_endgame_outplay_zobrist_overflow},
+    {"endgamefirstwin", test_endgame_first_win_sign},
     {"eldar_v", test_eldar_v_stick},
     {"zobrist", test_zobrist},
     {"tt", test_transposition_table},
     {"load", test_load_gcg},
+    {"pegpool", test_peg_pool},
+    {"peg", test_peg},
+    {"pegpessdraw", test_peg_pessfull_draw_regression},
+    {"pegtopkall", test_peg_pegtopk_all},
+    {"playchooser", test_play_chooser},
     {NULL, NULL} // Sentinel value to mark end of array
 };
 
 // Tests that only run when explicitly requested (not included in run_all)
 static TestEntry on_demand_test_table[] = {
+    {"analyze_sim", test_analyze_sim},
+    {"ap_default", test_autoplay_default},
+    {"ap_wmp", test_autoplay_wmp_correctness},
+    {"ap_rest", test_autoplay_remaining},
     {"endgame_wasm", test_endgame_wasm},
+    {"endgameinject", test_endgame_dynamic_worker_injection},
+    {"viamover", test_via_mover_must_bingo_every_depth},
+    {"viaopp", test_via_opp_must_block_every_depth},
+    {"viastress", test_via_interrupted_reasonable_under_time_pressure},
     {"infercmp", test_infer_cmp},
     {"genstuck", test_generate_stuck_cgps},
     {"gennonstuck", test_generate_nonstuck_cgps},
     {"gennonstuck2", test_generate_nonstuck_cgps2},
+    {"genpegcgps", test_generate_peg_cgps},
+    {"pegstage", test_peg_stage_stability},
+    {"pegab", test_peg_strength_ab},
+    {"genpegfresh", test_gen_peg_fresh},
+    {"pegcurve", test_peg_strength_curve},
     {"benchfp", test_benchmark_forced_pass},
     {"benchns", test_benchmark_nonstuck},
     {"benchns3v3", test_benchmark_nonstuck_3v3},
     {"egcompare", test_endgame_compare},
+    {"egspeedbench", test_endgame_speed_bench},
+    {"egplayout", test_endgame_playout_bench},
+    {"egmove1", test_endgame_move1},
     {"multipv", test_multi_pv},
+    {"kwgtailmerge", test_kwg_tail_merge},
+    {"kwgtailreorder", test_kwg_tail_reorder},
+    {"dawgpacked", test_dawg_packed},
+    {"kwgmergebench", test_kwg_merge_build_bench},
+    {"endgame_stream", test_endgame_progress_stream},
     {"kue", test_kue},
     {"monsterq", test_monster_q},
+    {"simbench", test_sim_benchmark},
+    {"ap_rit", test_autoplay_rit_correctness},
+    // Pre-endgame (PEG) solver
+    {"peg1pb", test_peg_1bag_pass_best},
+    {"peg1onyx", test_peg_1bag_onyx},
+    {"peg2axe", test_peg_2bag_axe},
+    {"peg2acid", test_peg_2bag_acidotic},
+    {"peg3pah", test_peg_3bag_pah},
+    {"peg4pond", test_peg_4bag_pond},
+    {"peg3pahpess", test_peg_3bag_pah_pessimistic},
+    {"peg4pondpess", test_peg_4bag_pond_pessimistic},
+    {"pegbench1", test_benchmark_peg_1},
+    {"pegbench2", test_benchmark_peg_2},
+    {"pegbench3", test_benchmark_peg_3},
+    {"pegbench4", test_benchmark_peg_4},
+    {"pegbfix", test_peg_bench_fixture},
+    {"pegngap", test_peg_nested_gap},
+    {"genpegmore", test_gen_peg_more},
+    {"pegpoll", test_peg_poll},
+    {"passpegoracle", test_pass_peg_oracle_eval_move},
     {NULL, NULL} // Sentinel value to mark end of array
 };
 

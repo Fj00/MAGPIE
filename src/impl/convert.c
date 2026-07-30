@@ -6,17 +6,21 @@
 #include "../def/letter_distribution_defs.h"
 #include "../ent/conversion_results.h"
 #include "../ent/data_filepaths.h"
+#include "../ent/dawg_packed.h"
 #include "../ent/dictionary_word.h"
 #include "../ent/klv.h"
 #include "../ent/klv_csv.h"
 #include "../ent/kwg.h"
 #include "../ent/letter_distribution.h"
+#include "../ent/rack_info_table.h"
 #include "../ent/wmp.h"
 #include "../util/fileproxy.h"
 #include "../util/io_util.h"
 #include "../util/string_util.h"
 #include "kwg_maker.h"
+#include "rack_info_table_maker.h"
 #include "wmp_maker.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -115,6 +119,31 @@ void convert_from_text_with_dwl(const LetterDistribution *ld,
     }
     wmp_destroy(wmp);
     free(wmp_output_filename);
+  } else if (conversion_type == CONVERT_TEXT2DAWG_PACKED) {
+    char *packed_output_filename = data_filepaths_get_writable_filename(
+        data_paths, output_name, DATA_FILEPATH_TYPE_DAWG_PACKED, error_stack);
+    if (!error_stack_is_empty(error_stack)) {
+      return;
+    }
+    // Build the reorder DAWG, then re-encode it into minimal-width nodes. The
+    // CLI default is bit-packed (smallest); the byte-aligned strategy is for
+    // callers who decode on hardware that pays for cross-byte shifts.
+    KWG *kwg = make_kwg_from_words(strings, KWG_MAKER_OUTPUT_DAWG,
+                                   KWG_MAKER_MERGE_TAIL_REORDER);
+    DawgPacked *dp = dawg_packed_create_from_kwg(kwg, false);
+    dawg_packed_write_to_file(dp, packed_output_filename, error_stack);
+    if (!error_stack_is_empty(error_stack)) {
+      error_stack_push(
+          error_stack, ERROR_STATUS_CONVERT_OUTPUT_FILE_NOT_WRITABLE,
+          get_formatted_string("could not write packed dawg to output file: %s",
+                               packed_output_filename));
+    } else {
+      conversion_results_set_number_of_strings(
+          conversion_results, dictionary_word_list_get_count(strings));
+    }
+    dawg_packed_destroy(dp);
+    kwg_destroy(kwg);
+    free(packed_output_filename);
   } else {
     char *kwg_output_filename = data_filepaths_get_writable_filename(
         data_paths, output_name, DATA_FILEPATH_TYPE_KWG, error_stack);
@@ -122,12 +151,19 @@ void convert_from_text_with_dwl(const LetterDistribution *ld,
       return;
     }
     kwg_maker_output_t output_type = KWG_MAKER_OUTPUT_DAWG_AND_GADDAG;
-    if (conversion_type == CONVERT_TEXT2DAWG) {
+    if (conversion_type == CONVERT_TEXT2DAWG ||
+        conversion_type == CONVERT_TEXT2DAWG_TAIL_REORDER) {
       output_type = KWG_MAKER_OUTPUT_DAWG;
     } else if (conversion_type == CONVERT_TEXT2GADDAG) {
       output_type = KWG_MAKER_OUTPUT_GADDAG;
     }
-    KWG *kwg = make_kwg_from_words(strings, output_type, KWG_MAKER_MERGE_EXACT);
+    kwg_maker_merge_t merge_type = KWG_MAKER_MERGE_EXACT;
+    if (conversion_type == CONVERT_TEXT2KWG_TAIL_MERGE) {
+      merge_type = KWG_MAKER_MERGE_TAIL;
+    } else if (conversion_type == CONVERT_TEXT2DAWG_TAIL_REORDER) {
+      merge_type = KWG_MAKER_MERGE_TAIL_REORDER;
+    }
+    KWG *kwg = make_kwg_from_words(strings, output_type, merge_type);
     kwg_write_to_file(kwg, kwg_output_filename, error_stack);
     if (!error_stack_is_empty(error_stack)) {
       error_stack_push(
@@ -152,6 +188,9 @@ void convert_with_names(const LetterDistribution *ld,
   if ((conversion_type == CONVERT_TEXT2DAWG) ||
       (conversion_type == CONVERT_TEXT2GADDAG) ||
       (conversion_type == CONVERT_TEXT2KWG) ||
+      (conversion_type == CONVERT_TEXT2KWG_TAIL_MERGE) ||
+      (conversion_type == CONVERT_TEXT2DAWG_TAIL_REORDER) ||
+      (conversion_type == CONVERT_TEXT2DAWG_PACKED) ||
       (conversion_type == CONVERT_TEXT2WORDMAP)) {
     DictionaryWordList *strings = dictionary_word_list_create();
     convert_from_text_with_dwl(ld, conversion_type, data_paths, input_name,
@@ -199,6 +238,44 @@ void convert_with_names(const LetterDistribution *ld,
       klv_write_to_csv(klv, ld, data_paths, output_name, NULL, error_stack);
     }
     klv_destroy(klv);
+  } else if (conversion_type == CONVERT_KLVWMP2RIT) {
+    KLV *klv = klv_create(data_paths, input_name, error_stack);
+    if (!error_stack_is_empty(error_stack)) {
+      return;
+    }
+    WMP *wmp = wmp_create(data_paths, input_name, error_stack);
+    if (!error_stack_is_empty(error_stack)) {
+      klv_destroy(klv);
+      return;
+    }
+    char *rit_output_filename = data_filepaths_get_writable_filename(
+        data_paths, output_name, DATA_FILEPATH_TYPE_RACK_INFO_TABLE,
+        error_stack);
+    if (error_stack_is_empty(error_stack)) {
+      // Default coverage is the full interval [1, RACK_SIZE]. The rit_sweep
+      // on-demand test (test/rack_info_table_test.c) showed that widening
+      // coverage from played_size == RACK_SIZE down to played_size == 1
+      // monotonically improves CSW24 movegen user time by ~3% while the
+      // on-disk file stays flat at ~1.69 GB (entry size is fixed at 560 B
+      // regardless of min because playthrough_union is a fixed-size
+      // leave_size-indexed array, not variable-length per-slot storage).
+      // So there's no lighter variant worth shipping.
+      const uint8_t playthrough_min_played_size = 1;
+      RackInfoTable *rit = make_rack_info_table(klv, wmp, ld, num_threads,
+                                                playthrough_min_played_size);
+      rack_info_table_write_to_file(rit, rit_output_filename, error_stack);
+      if (!error_stack_is_empty(error_stack)) {
+        error_stack_push(
+            error_stack, ERROR_STATUS_CONVERT_OUTPUT_FILE_NOT_WRITABLE,
+            get_formatted_string(
+                "could not write rack info table to output file: %s",
+                rit_output_filename));
+      }
+      rack_info_table_destroy(rit);
+    }
+    free(rit_output_filename);
+    wmp_destroy(wmp);
+    klv_destroy(klv);
   } else {
     error_stack_push(error_stack,
                      ERROR_STATUS_CONVERT_UNIMPLEMENTED_CONVERSION_TYPE,
@@ -215,6 +292,12 @@ get_conversion_type_from_string(const char *conversion_type_string) {
     conversion_type = CONVERT_TEXT2GADDAG;
   } else if (strings_equal(conversion_type_string, "text2kwg")) {
     conversion_type = CONVERT_TEXT2KWG;
+  } else if (strings_equal(conversion_type_string, "text2kwgtailmerge")) {
+    conversion_type = CONVERT_TEXT2KWG_TAIL_MERGE;
+  } else if (strings_equal(conversion_type_string, "text2dawgtailreorder")) {
+    conversion_type = CONVERT_TEXT2DAWG_TAIL_REORDER;
+  } else if (strings_equal(conversion_type_string, "text2dawgpacked")) {
+    conversion_type = CONVERT_TEXT2DAWG_PACKED;
   } else if (strings_equal(conversion_type_string, "dawg2text")) {
     conversion_type = CONVERT_DAWG2TEXT;
   } else if (strings_equal(conversion_type_string, "gaddag2text")) {
@@ -227,6 +310,8 @@ get_conversion_type_from_string(const char *conversion_type_string) {
     conversion_type = CONVERT_TEXT2WORDMAP;
   } else if (strings_equal(conversion_type_string, "dawg2wordmap")) {
     conversion_type = CONVERT_DAWG2WORDMAP;
+  } else if (strings_equal(conversion_type_string, "klvwmp2rit")) {
+    conversion_type = CONVERT_KLVWMP2RIT;
   }
   return conversion_type;
 }

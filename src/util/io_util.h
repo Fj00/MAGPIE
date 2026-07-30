@@ -1,6 +1,7 @@
 #ifndef IO_UTIL_H
 #define IO_UTIL_H
 
+#include <dirent.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -76,6 +77,9 @@ typedef enum {
   ERROR_STATUS_AUTOPLAY_INVALID_OPTIONS,
   ERROR_STATUS_AUTOPLAY_MALFORMED_MINIMUM_LEAVE_TARGETS,
   ERROR_STATUS_AUTOPLAY_MALFORMED_NUM_GAMES,
+  ERROR_STATUS_AUTOPLAY_FORCE_RACKS_MALFORMED_RACK,
+  ERROR_STATUS_AUTOPLAY_FORCE_RACKS_DUPLICATE_RACK,
+  ERROR_STATUS_AUTOPLAY_FORCE_RACKS_FILE_EMPTY,
   // Board layout errors
   ERROR_STATUS_BOARD_LAYOUT_MALFORMED_START_COORDS,
   ERROR_STATUS_BOARD_LAYOUT_OUT_OF_BOUNDS_START_COORDS,
@@ -139,6 +143,7 @@ typedef enum {
   // Simmer errors
   ERROR_STATUS_SIM_NO_MOVES,
   ERROR_STATUS_SIM_GAME_OVER,
+  ERROR_STATUS_SIM_AVOID_PRUNE_MOVE_NOT_FOUND,
   // Move validation errors
   ERROR_STATUS_MOVE_VALIDATION_GAME_NOT_LOADED,
   ERROR_STATUS_MOVE_VALIDATION_EMPTY_MOVE,
@@ -210,6 +215,11 @@ typedef enum {
   ERROR_STATUS_INVALID_GCG_SOURCE,
   // Endgame errors
   ERROR_STATUS_ENDGAME_BAG_NOT_EMPTY,
+  ERROR_STATUS_ENDGAME_PV_INDEX_OUT_OF_RANGE,
+  // Pre-endgame (PEG) errors
+  ERROR_STATUS_PEG_BAG_OUT_OF_RANGE,
+  ERROR_STATUS_PEG_INVALID_STAGE_COUNTS,
+  ERROR_STATUS_PEG_INVALID_BAG_ORDER,
   // Commit errors
   ERROR_STATUS_COMMIT_MOVE_INDEX_OUT_OF_RANGE,
   ERROR_STATUS_COMMIT_WAITING_FOR_PASS_OR_CHALLENGE_BONUS,
@@ -234,12 +244,13 @@ typedef enum {
   ERROR_STATUS_EXPORT_NO_GAME_EVENTS,
   // Note errors
   ERROR_STATUS_NOTE_NO_GAME_EVENTS,
-  ERROR_STATUS_NOTE_NO_MOVES,
+  ERROR_STATUS_NOTE_NO_MOVES_TO_INTERPOLATE,
   ERROR_STATUS_NOTE_MOVE_INDEX_OUT_OF_RANGE,
   // Show errors
   ERROR_STATUS_NO_MOVES_TO_SHOW,
   ERROR_STATUS_NO_INFERENCE_TO_SHOW,
   ERROR_STATUS_NO_ENDGAME_TO_SHOW,
+  ERROR_STATUS_NO_PEG_TO_SHOW,
   // Heat map errors
   ERROR_STATUS_NO_HEAT_MAP_TO_SHOW,
   ERROR_STATUS_HEAT_MAP_MOVE_INDEX_OUT_OF_RANGE,
@@ -297,6 +308,7 @@ void io_reset_stream_in(void);
 char *format_string_with_va_list(const char *format, va_list *args);
 char *get_formatted_string(const char *format, ...);
 void fflush_or_die(FILE *stream);
+void snprintf_or_die(char *buf, size_t buf_size, const char *format, ...);
 void *malloc_or_die(size_t size);
 void *calloc_or_die(size_t num, size_t size);
 void *realloc_or_die(void *realloc_target, size_t size);
@@ -312,8 +324,6 @@ char *error_stack_get_string_and_reset(ErrorStack *error_stack);
 void error_stack_print_and_reset(ErrorStack *error_stack);
 bool error_stack_is_empty(const ErrorStack *error_stack);
 
-// WARNING: for testing only, production code should only reset the stack after
-// printing or retrieving the error string
 void error_stack_reset(ErrorStack *error_stack);
 
 void fseek_or_die(FILE *stream, long offset, int whence);
@@ -322,14 +332,25 @@ char *get_string_from_file_handle(FILE *file_handle, const char *filename,
 char *get_string_from_file(const char *filename, ErrorStack *error_stack);
 void write_string_to_file(const char *filename, const char *mode,
                           const char *string, ErrorStack *error_stack);
+void append_string_to_file(const char *filename, const char *string,
+                           ErrorStack *error_stack);
 FILE *fopen_or_die(const char *filename, const char *mode);
 FILE *fopen_safe(const char *filename, const char *mode,
                  ErrorStack *error_stack);
+DIR *opendir_safe(const char *dir_path, ErrorStack *error_stack);
 void fclose_or_die(FILE *stream);
 void fwrite_or_die(const void *ptr, size_t size, size_t nmemb, FILE *stream,
                    const char *description);
 void fprintf_or_die(FILE *stream, const char *format, ...);
 
 FILE *popen_or_die(const char *command, const char *mode);
+
+bool path_is_directory(const char *path);
+
+// Returns a sorted, heap-allocated array of filenames ending with suffix found
+// in dir_path. *num_files is set to the count. Caller frees each string and
+// the array. On error, pushes to error_stack and returns NULL.
+char **get_files_in_directory(const char *dir_path, const char *suffix,
+                              int *num_files, ErrorStack *error_stack);
 
 #endif
