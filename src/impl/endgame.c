@@ -708,6 +708,16 @@ void endgame_ctx_reset(EndgameCtx *es, EndgameResults *results,
   es->soft_time_limit = endgame_args->soft_time_limit;
   es->hard_time_limit = endgame_args->hard_time_limit;
   es->external_deadline_ns = endgame_args->external_deadline_ns;
+  // hard_time_limit on its own is only consulted BETWEEN depths (via the EBF
+  // projection in iterative_deepening), so a single depth whose cost the EBF
+  // underestimates runs to completion regardless of the cap. Arm an absolute
+  // deadline from it when the caller has not supplied one: workers then check
+  // it in-search and the cap is actually honoured. A caller-supplied
+  // external_deadline_ns always wins (it is the more specific request).
+  if (es->external_deadline_ns == 0 && es->hard_time_limit > 0) {
+    es->external_deadline_ns =
+        ctimer_monotonic_ns() + (int64_t)(es->hard_time_limit * 1e9);
+  }
   bool create_separate_kwgs =
       (es->dual_lexicon_mode == DUAL_LEXICON_MODE_INFORMED) && !shared_kwg;
 

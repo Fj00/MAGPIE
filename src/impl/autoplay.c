@@ -6048,13 +6048,10 @@ static bool pp_playout_outcome(EndgameCtx **es, EndgameResults *er,
             .num_top_moves = 1, .use_heuristics = true,
             .per_ply_callback = NULL, .per_ply_callback_data = NULL,
             .forced_pass_bypass = false, .soft_time_limit = cap,
+            // endgame_solver_reset arms an absolute in-search deadline from
+            // hard_time_limit, so the cap is enforced mid-depth and not just
+            // between depths.
             .hard_time_limit = cap,
-            // hard_time_limit alone is only consulted BETWEEN depths (via the
-            // EBF projection), so a single mispredicted depth could still tail
-            // the worker. Arm the absolute deadline too: workers check it
-            // in-search, which is what our own hard_deadline_ns used to do.
-            .external_deadline_ns =
-                ctimer_monotonic_ns() + (int64_t)(cap * 1e9),
             .sign_stable_k = eg_signstable_k};
         ErrorStack *err = error_stack_create();
         Timer eg_timer;
