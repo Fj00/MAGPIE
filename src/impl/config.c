@@ -3169,6 +3169,12 @@ void config_fill_endgame_args(Config *config, EndgameArgs *endgame_args) {
   const char *eg_soft = getenv("MAGPIE_ENDGAME_SOFT_TL");
   const char *eg_hard = getenv("MAGPIE_ENDGAME_HARD_TL");
   const char *eg_ssk = getenv("MAGPIE_ENDGAME_SIGN_STABLE_K");
+  // First-win: search a narrow [-1,+1] window so the solve answers only
+  // win/loss/draw instead of computing the exact spread. Much faster when the
+  // caller wants a SIGN (which is what the win% labels are); the returned
+  // value is then a bound, not a spread, so anything reading the magnitude
+  // must leave this off.
+  const char *eg_fw = getenv("MAGPIE_ENDGAME_FIRST_WIN");
   endgame_args_fill(
       config->thread_control, config->game, config->tt_fraction_of_mem,
       config->endgame_plies, DEFAULT_INITIAL_SMALL_MOVE_ARENA_SIZE,
@@ -3184,7 +3190,8 @@ void config_fill_endgame_args(Config *config, EndgameArgs *endgame_args) {
       eg_hard ? atof(eg_hard) : config->endgame_time_limit_seconds,
       /*sign_stable_k=*/eg_ssk ? atoi(eg_ssk) : 0, config->seed,
       /*skip_word_pruning=*/false, /*shared_tt=*/NULL, /*max_workers=*/0,
-      /*first_win=*/false, /*first_win_fallback_moves=*/0,
+      /*first_win=*/eg_fw && atoi(eg_fw) != 0,
+      /*first_win_fallback_moves=*/0,
       /*use_initial_window=*/false, /*initial_alpha=*/0, /*initial_beta=*/0,
       /*external_deadline_ns=*/0, /*actual_move=*/NULL, endgame_args);
 }
