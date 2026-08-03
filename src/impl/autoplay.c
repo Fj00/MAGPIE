@@ -5949,6 +5949,10 @@ static bool pp_playout_outcome(EndgameCtx **es, EndgameResults *er,
   // opponent's plays have emptied the bag does the mover play out. If the
   // opponent passes too, the standoff runs to the six-pass end.
   bool mover_plays_out = false;
+  // The mover's FIRST pass is the recorded move being labelled and is always
+  // forced. From its SECOND pass on it may break out of a standoff it loses
+  // (see below) -- so this tracks whether the recorded pass has been made.
+  bool mover_passed_once = false;
   while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
     if (force_mover_pass) {
       // Pass-relabel playout. The mover passes again until the bag is EMPTY
@@ -5958,6 +5962,50 @@ static bool pp_playout_outcome(EndgameCtx **es, EndgameResults *er,
       // CONSECUTIVE_ZEROS rack penalty automatically).
       const int on = game_get_player_on_turn_index(dg);
       if (on == mover) {
+        // BREAK OUT OF A LOSING STANDOFF. The opponent below passes back only
+        // when the six-pass tally STRICTLY wins for it, so once it starts
+        // passing, continuing to pass runs the game to CONSECUTIVE_ZEROS and
+        // the mover loses. A real mover plays instead of passing into that.
+        //
+        // Without this the mover passed unconditionally, so every such row was
+        // labelled a LOSS that a real mover would not have taken -- making the
+        // pass look worse than it is. Measured before the fix: the pass head
+        // trained on this collect under-predicted the fill's own pass rows by
+        // 3.9 points (pass_score_check.py), enough to rank a winning pass below
+        // a losing play.
+        //
+        // Timing: the mover's FIRST pass is the recorded move being labelled
+        // and stays forced, so the earliest break-out is its second pass --
+        // turn 3 of the cycle. Nothing scores between turns 3 and 5, so the
+        // position (and hence the move played) is identical at either; 3 is
+        // simply the earliest legal point.
+        //
+        // Test mirrors the opponent's, from the mover's side: the mover knows
+        // its own rack exactly, and the opponent's rack is taken worst-case for
+        // the mover (opponent holds the LOWEST-scoring tiles, so it subtracts
+        // as little as possible). Ties break out too -- a tie is not a win.
+        if (!mover_plays_out && mover_passed_once) {
+          const LetterDistribution *ld = game_get_ld(dg);
+          const int mov_s =
+              equity_to_int(player_get_score(game_get_player(dg, mover)));
+          const int opp_s =
+              equity_to_int(player_get_score(game_get_player(dg, 1 - mover)));
+          const int mov_rack = equity_to_int(
+              rack_get_score(ld, player_get_rack(game_get_player(dg, mover))));
+          const Bag *b = game_get_bag(dg);
+          const Rack *ork = player_get_rack(game_get_player(dg, 1 - mover));
+          int uns_sum = 0, uns_max = 0;
+          const int ds = rack_get_dist_size(ork);
+          for (int t = 0; t < ds; t++) {
+            const int cnt = bag_get_letter(b, t) + rack_get_letter(ork, t);
+            if (cnt <= 0) continue;
+            const int v = equity_to_int(ld_get_score(ld, t));
+            uns_sum += cnt * v;
+            if (v > uns_max) uns_max = v;
+          }
+          const int opp_min_rack = uns_sum - uns_max;
+          if ((mov_s - mov_rack) <= (opp_s - opp_min_rack)) mover_plays_out = true;
+        }
         if (mover_plays_out) {
           const Move *pm = NULL;
           if (vmodels_by_bag)
@@ -5969,6 +6017,7 @@ static bool pp_playout_outcome(EndgameCtx **es, EndgameResults *er,
           Move *sp = move_list_get_spare_move(post_ml);
           move_set_as_pass(sp);
           play_move(sp, dg, NULL);
+          mover_passed_once = true;
         }
         continue;
       }
