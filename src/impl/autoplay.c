@@ -5954,12 +5954,27 @@ static bool pp_playout_outcome(EndgameCtx **es, EndgameResults *er,
   // (see below) -- so this tracks whether the recorded pass has been made.
   bool mover_passed_once = false;
   while (game_get_game_end_reason(dg) == GAME_END_REASON_NONE) {
-    if (force_mover_pass) {
+    // Once the bag is EMPTY this is a real bag-empty endgame, so fall through
+    // to the EXACT SOLVER below instead of playing it out.
+    //
+    // Previously this branch consumed every iteration with `continue` and never
+    // reached the solver, so PASS labels were playout labels while every PLAY
+    // label was exact. Playouts flip ~25% of bag-8 signs against exact solves
+    // (~48% on near-even positions), so the two heads were trained on labels of
+    // entirely different quality — a far bigger asymmetry than the standoff
+    // rule, and the likelier reason the pass head under-scored fill-distributed
+    // passes by 3.9 points (the fill's own pass rows go through the normal
+    // endgame-POST path and ARE exact).
+    //
+    // A standoff reaching CONSECUTIVE_ZEROS without emptying the bag has no
+    // endgame to solve; it still terminates naturally inside this branch.
+    if (force_mover_pass &&
+        !(endgame && bag_get_letters(game_get_bag(dg)) == 0)) {
       // Pass-relabel playout. The mover passes again until the bag is EMPTY
       // (opponent plays that leave tiles in the bag do NOT break the
-      // commitment); once the bag empties, the mover plays out. No exact
-      // solve — play to the natural terminus (play_move applies the
-      // CONSECUTIVE_ZEROS rack penalty automatically).
+      // commitment); once the bag empties, control leaves this branch and the
+      // exact solve below produces the label (play_move still applies the
+      // CONSECUTIVE_ZEROS rack penalty on a pure-standoff terminus).
       const int on = game_get_player_on_turn_index(dg);
       if (on == mover) {
         // BREAK OUT OF A LOSING STANDOFF. The opponent below passes back only
