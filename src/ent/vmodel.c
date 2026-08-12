@@ -188,6 +188,15 @@ static bool parse_header(FILE *f, VModel *m) {
         if (!read_line(buf, sizeof(buf), f)) return false;
         p = buf;
     }
+    // Optional PASSUNSEEN (pass stratum unseen block level). Default 0.
+    m->pass_unseen = 0;
+    if (strncmp(p, "PASSUNSEEN", 10) == 0) {
+        int v = 0;
+        if (!expect_token(&p, "PASSUNSEEN") || !parse_int(&p, &v)) return false;
+        m->pass_unseen = v;
+        if (!read_line(buf, sizeof(buf), f)) return false;
+        p = buf;
+    }
     if (!expect_token(&p, "NSTRATA") || !parse_int(&p, &m->n_strata)) return false;
     return true;
 }

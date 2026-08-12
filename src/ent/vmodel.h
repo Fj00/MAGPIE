@@ -74,6 +74,9 @@ typedef struct VModel {
     // trained with --play-unseen-pairs 2 carry 801 coefs where the legacy
     // extractor builds 428, so getting this wrong fails every move.
     int       play_unseen;
+    // Pass stratum (K0_L7) unseen block, from PASSUNSEEN: 1 = 27 counts,
+    // 2 = counts + the same 373 pairs, counts FIRST.
+    int       pass_unseen;
     VStratum *strata;              // [n_strata]
 } VModel;
 

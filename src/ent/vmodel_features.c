@@ -141,7 +141,7 @@ int vmodel_extract_features(float *buf, int cap,
                              const uint8_t *leave_indices, int leave_len,
                              int diff, int bag, int turn,
                              const int *unseen_vec,
-                             int play_unseen,
+                             int play_unseen, int pass_unseen,
                              const StaticLeaves *sl) {
     bool tzs = terminal_zero_score(turn, s->kind);
     int wi = 0;
@@ -255,6 +255,32 @@ int vmodel_extract_features(float *buf, int cap,
     // Values are pair COUNTS over the unseen pool: u[a]*u[b], and
     // u[a](u[a]-1)/2 on the diagonal.
     bool is_pass_stratum = (s->kind == 0 && s->leave_length == VMODEL_RACK_SIZE);
+    // PASS block: 27 raw counts, then (level 2) the same 373 pairs. Counts
+    // first -- v_model_features._pass_unseen_values builds it that way, which
+    // is the OPPOSITE arrangement to the play path below.
+    if (pass_unseen >= 1 && is_pass_stratum) {
+        uint8_t rc_p[27];
+        count_tiles(rack_indices, rack_len, rc_p);
+        int u[27];
+        int u_total = 0;
+        if (!fill_unseen(unseen_vec, rc_p, bag, s->key, u, &u_total)) return -1;
+        for (int t2 = 0; t2 < 27; t2++) {
+            wi = append_feat(buf, cap, wi, (float)u[t2]);
+            if (wi < 0) return -1;
+        }
+        if (pass_unseen >= 2) {
+            for (int a = 0; a < 27; a++) {
+                for (int bq = a; bq < 27; bq++) {
+                    if (a == bq && TILE_BAG[a] < 2) continue;
+                    float v = (a == bq)
+                                  ? (float)((double)u[a] * (u[a] - 1) / 2.0)
+                                  : (float)((double)u[a] * (double)u[bq]);
+                    wi = append_feat(buf, cap, wi, v);
+                    if (wi < 0) return -1;
+                }
+            }
+        }
+    }
     if (play_unseen >= 1 && !is_pass_stratum) {
         uint8_t rc_up[27];
         count_tiles(rack_indices, rack_len, rc_up);
@@ -418,7 +444,7 @@ float vmodel_predict(const VModel *m,
                                      s, b, rack_indices, rack_len,
                                      leave_indices, leave_len,
                                      diff, m->bag, turn, unseen_vec,
-                                     m->play_unseen, sl);
+                                     m->play_unseen, m->pass_unseen, sl);
     if (n < 0) return -1.0f;
     double z = b->intercept;
     for (int i = 0; i < n; i++) {
