@@ -2220,6 +2220,11 @@ static _Atomic uint64_t g_pp_pick_tiles[2][8];
 static _Atomic uint64_t g_pp_pick_blank[2];
 static _Atomic uint64_t g_pp_pick_s[2];
 static _Atomic uint64_t g_pp_pick_total[2];
+// Move TYPE of each pre-endgame pick: [src][0=pass,1=exchange,2=tile-play,3=other].
+// The tiles_played=0 bucket should be unreachable through this path (movegen
+// emits no passes, and an exchange plays >=1 tile), so if it is non-empty the
+// bucketing is wrong -- measure rather than infer.
+static _Atomic uint64_t g_pp_pick_type[2][4];
 static _Atomic uint64_t g_vmodel_eg_pass_big  = 0;  // margin >= 0.05
 static _Atomic uint64_t g_vmodel_eg_pass_live = 0;  // 0.02 < pass p < 0.98
 // MAGPIE_VMODEL_PLAYOUT_NO_PASS=1: the V-model playout policy never picks a pass
@@ -2373,6 +2378,12 @@ for (int src = 0; src < 2; src++) {
                  100.0 * (double)c / (double)tot);
     }
     fprintf(stderr, "%s\n", hb);
+    fprintf(stderr, "vmodel:   %s types: pass %llu, exch %llu, play %llu, other %llu\n",
+            src ? "MODEL " : "EQUITY",
+            (unsigned long long)atomic_load_explicit(&g_pp_pick_type[src][0], memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_pp_pick_type[src][1], memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_pp_pick_type[src][2], memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_pp_pick_type[src][3], memory_order_relaxed));
     fprintf(stderr, "vmodel:   %s keeps blank %.1f%%, keeps S %.1f%%\n",
         src ? "MODEL " : "EQUITY",
         100.0 * (double)atomic_load_explicit(&g_pp_pick_blank[src], memory_order_relaxed) / (double)tot,
@@ -2838,6 +2849,14 @@ static void pp_record_pick(Game *game, const Move *m, int from_model) {
   if (tp > 7) tp = 7;
   atomic_fetch_add_explicit(&g_pp_pick_tiles[idx][tp], 1, memory_order_relaxed);
   atomic_fetch_add_explicit(&g_pp_pick_total[idx], 1, memory_order_relaxed);
+  int mt;
+  switch (move_get_type(m)) {
+    case GAME_EVENT_PASS:                mt = 0; break;
+    case GAME_EVENT_EXCHANGE:            mt = 1; break;
+    case GAME_EVENT_TILE_PLACEMENT_MOVE: mt = 2; break;
+    default:                             mt = 3; break;
+  }
+  atomic_fetch_add_explicit(&g_pp_pick_type[idx][mt], 1, memory_order_relaxed);
   const int on = game_get_player_on_turn_index(game);
   Rack *pr = player_get_rack(game_get_player(game, on));
   Rack leave;
