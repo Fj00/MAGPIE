@@ -2236,6 +2236,11 @@ static _Atomic uint64_t g_pass_p_sum      = 0;  // pass win% * 1e6
 static _Atomic uint64_t g_pass_alt_sum    = 0;  // best non-pass win% * 1e6
 static _Atomic uint64_t g_pass_no_alt     = 0;  // pass was the ONLY scoreable move
 static _Atomic uint64_t g_pass_gap_hist[10];    // (pass - best_play) in 0.1 bins
+// How playouts actually END. Tests directly whether six-pass terminations are
+// happening at all, rather than inferring it from ply counts (which is wrong
+// under MAGPIE_PP_FANOUT: one worklist line branches many playouts).
+static _Atomic uint64_t g_term_standard = 0;
+static _Atomic uint64_t g_term_sixpass  = 0;
 static _Atomic uint64_t g_vmodel_eg_pass_big  = 0;  // margin >= 0.05
 static _Atomic uint64_t g_vmodel_eg_pass_live = 0;  // 0.02 < pass p < 0.98
 // MAGPIE_VMODEL_PLAYOUT_NO_PASS=1: the V-model playout policy never picks a pass
@@ -2371,6 +2376,14 @@ static int vmodel_indices_to_pts(const uint8_t *idx, int n) {
 }
 
 void vmodel_log_stats(void) {
+  {
+    const uint64_t ts = atomic_load_explicit(&g_term_standard, memory_order_relaxed);
+    const uint64_t tz = atomic_load_explicit(&g_term_sixpass, memory_order_relaxed);
+    if (ts + tz)
+      fprintf(stderr, "vmodel: PLAYOUT TERMINI: standard-out %llu, six-pass %llu (%.2f%%)\n",
+              (unsigned long long)ts, (unsigned long long)tz,
+              100.0 * (double)tz / (double)(ts + tz));
+  }
   {
     const uint64_t pn = atomic_load_explicit(&g_pass_pick_n, memory_order_relaxed);
     if (pn) {
@@ -6349,6 +6362,9 @@ static bool pp_playout_outcome(EndgameCtx **es, EndgameResults *er,
   if (end_reason != GAME_END_REASON_STANDARD &&
       end_reason != GAME_END_REASON_CONSECUTIVE_ZEROS)
     return false;
+  atomic_fetch_add_explicit(end_reason == GAME_END_REASON_CONSECUTIVE_ZEROS
+                                ? &g_term_sixpass : &g_term_standard,
+                            1, memory_order_relaxed);
   const int mf = equity_to_int(player_get_score(game_get_player(dg, mover)));
   const int of = equity_to_int(player_get_score(game_get_player(dg, 1 - mover)));
   *f0 = equity_to_int(player_get_score(game_get_player(dg, 0)));
