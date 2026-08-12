@@ -2210,6 +2210,7 @@ static _Atomic uint64_t g_vmodel_eg_null_nomoves  = 0;  // movegen produced none
 static _Atomic uint64_t g_vmodel_eg_null_unscored = 0;  // moves existed, none scoreable
 static _Atomic uint64_t g_vmodel_eg_mv_total      = 0;  // candidate moves seen
 static _Atomic uint64_t g_vmodel_eg_mv_unscored   = 0;  // of those, returned p<0
+static _Atomic uint64_t g_vmodel_eg_list_full     = 0;  // movegen filled the list -> moves dropped
 static _Atomic uint64_t g_vmodel_eg_pass_big  = 0;  // margin >= 0.05
 static _Atomic uint64_t g_vmodel_eg_pass_live = 0;  // 0.02 < pass p < 0.98
 // MAGPIE_VMODEL_PLAYOUT_NO_PASS=1: the V-model playout policy never picks a pass
@@ -2382,6 +2383,15 @@ void vmodel_log_stats(void) {
                 ? 100.0 * (double)atomic_load_explicit(&g_vmodel_eg_mv_unscored, memory_order_relaxed)
                         / (double)atomic_load_explicit(&g_vmodel_eg_mv_total, memory_order_relaxed)
                 : 0.0);
+      {
+        const uint64_t lf = atomic_load_explicit(&g_vmodel_eg_list_full,
+                                                 memory_order_relaxed);
+        if (lf > 0) {
+          fprintf(stderr, "vmodel:   !! MOVE LIST SATURATED on %llu position(s)"
+                  " -- ranking saw a TRUNCATED candidate set\n",
+                  (unsigned long long)lf);
+        }
+      }
       {
         char hb[512]; int hn = 0;
         hn += snprintf(hb + hn, sizeof(hb) - hn, "vmodel:   no-model by bag_key:");
@@ -2835,6 +2845,18 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   if (n_moves == 0) {
     atomic_fetch_add_explicit(&g_vmodel_eg_null_nomoves, 1, memory_order_relaxed);
     return NULL;
+  }
+  // A full list means movegen produced at least as many moves as the list can
+  // hold, so the min-heap DROPPED the lowest-equity ones -- exactly the moves a
+  // win%-argmax might have wanted. Count it and say so; never truncate quietly.
+  if (n_moves >= move_list_get_capacity(ml)) {
+    atomic_fetch_add_explicit(&g_vmodel_eg_list_full, 1, memory_order_relaxed);
+    static int warned_full = 0;
+    if (warned_full++ < 4) {
+      fprintf(stderr, "vmodel: MOVE LIST SATURATED (%d moves, capacity %d) -- "
+              "low-equity moves were dropped before ranking. Raise "
+              "MAGPIE_VMODEL_MOVE_CAP.\n", n_moves, move_list_get_capacity(ml));
+    }
   }
 
   uint8_t rack_idx[16];
@@ -6293,10 +6315,24 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   // MOVE_RECORD_ALL into this list, and move_list_insert_spare_move is a
   // min-heap capped at capacity -- so it kept exactly ONE move, the
   // equity-best. The model was handed a single candidate, making its argmax
-  // identical to HastyBot's pick by construction. Needs the full move list,
-  // same as the fan-out below.
-  MoveList *post_ml = move_list_create(8192);
-  MoveList *fan_ml = move_list_create(8192);  // full move list for fan-out
+  // identical to HastyBot's pick by construction.
+  //
+  // The V-model must rank EVERY move movegen produces, not a top-N by equity:
+  // the whole premise is that win%-argmax != equity-argmax, so a truncated
+  // list drops precisely the buried moves the model exists to find. Same
+  // reasoning as force_move_list's 32768 above ("rare-leave plays often sit
+  // much deeper in the equity-sorted list"). Saturation is DETECTED below, not
+  // assumed away.
+  int vm_cap = 32768;
+  {
+    const char *e = getenv("MAGPIE_VMODEL_MOVE_CAP");
+    if (e != NULL) {
+      int v = atoi(e);
+      if (v >= 1000 && v <= 1000000) vm_cap = v;
+    }
+  }
+  MoveList *post_ml = move_list_create(vm_cap);
+  MoveList *fan_ml = move_list_create(vm_cap);  // full move list for fan-out
   // MAGPIE_PP_FANOUT=1: branch a playout per distinct (kind,score,leave) cell of
   // the injected rack's move list (counterfactual coverage), instead of only
   // the best move. Composes with REROLLS (each re-rolled rack is fanned out).
