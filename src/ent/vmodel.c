@@ -487,6 +487,16 @@ int vmodel_stratum_index(const VModel *m, int kind, int leave_length,
         typ_str = "all";
     } else if (tzs) {
         typ_str = "all";
+    } else if (kind == 1) {
+        // EXCHANGES never type-split, at any length. is_split_length's contract
+        // is "only L5/L6 PLAY leaves split; all other lengths and all exchanges
+        // are 'all'", and aggregate_trajectory_strata:69 writes exchange rows to
+        // K1/L<n>/all.csv to match -- so the model holds K1_L5_all while this
+        // built K1_L5_cons and matched nothing. Every exchange keeping 5 or 6
+        // tiles went unranked and fell back to HastyBot. Exchanges need 7 tiles
+        // in the physical bag, so they exist only at bag >= 14, which is why
+        // bags 8-13 never exposed this.
+        typ_str = "all";
     } else {
         switch (type) {
             case VMODEL_TYPE_CONS:  typ_str = "cons";  break;
