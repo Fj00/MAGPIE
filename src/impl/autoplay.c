@@ -2355,6 +2355,29 @@ static int vmodel_indices_to_pts(const uint8_t *idx, int n) {
 }
 
 void vmodel_log_stats(void) {
+  // Pre-endgame pick shape. OUTSIDE the `if (egc)` gate on purpose: the
+  // equity-only arm of the fishing A/B loads no models, so egc is 0 and this
+  // would print nothing exactly when it is needed for comparison.
+for (int src = 0; src < 2; src++) {
+    const uint64_t tot = atomic_load_explicit(&g_pp_pick_total[src],
+                                          memory_order_relaxed);
+    if (tot == 0) continue;
+    char hb[512]; int hn = 0;
+    hn += snprintf(hb + hn, sizeof(hb) - hn,
+               "vmodel: PRE-ENDGAME picks by %s (%llu): tiles",
+               src ? "MODEL " : "EQUITY", (unsigned long long)tot);
+    for (int k = 0; k <= 7; k++) {
+      const uint64_t c = atomic_load_explicit(&g_pp_pick_tiles[src][k],
+                                          memory_order_relaxed);
+      hn += snprintf(hb + hn, sizeof(hb) - hn, " %d:%.1f%%", k,
+                 100.0 * (double)c / (double)tot);
+    }
+    fprintf(stderr, "%s\n", hb);
+    fprintf(stderr, "vmodel:   %s keeps blank %.1f%%, keeps S %.1f%%\n",
+        src ? "MODEL " : "EQUITY",
+        100.0 * (double)atomic_load_explicit(&g_pp_pick_blank[src], memory_order_relaxed) / (double)tot,
+        100.0 * (double)atomic_load_explicit(&g_pp_pick_s[src], memory_order_relaxed) / (double)tot);
+  }
   // Endgame chain: pre-endgame model picks (MAGPIE_VMODEL_BAGS). "found" =
   // a model existed for the current unseen bag; "picked" = it returned a move.
   {
@@ -2392,26 +2415,6 @@ void vmodel_log_stats(void) {
                 ? 100.0 * (double)atomic_load_explicit(&g_vmodel_eg_mv_unscored, memory_order_relaxed)
                         / (double)atomic_load_explicit(&g_vmodel_eg_mv_total, memory_order_relaxed)
                 : 0.0);
-      for (int src = 0; src < 2; src++) {
-        const uint64_t tot = atomic_load_explicit(&g_pp_pick_total[src],
-                                                  memory_order_relaxed);
-        if (tot == 0) continue;
-        char hb[512]; int hn = 0;
-        hn += snprintf(hb + hn, sizeof(hb) - hn,
-                       "vmodel: PRE-ENDGAME picks by %s (%llu): tiles",
-                       src ? "MODEL " : "EQUITY", (unsigned long long)tot);
-        for (int k = 0; k <= 7; k++) {
-          const uint64_t c = atomic_load_explicit(&g_pp_pick_tiles[src][k],
-                                                  memory_order_relaxed);
-          hn += snprintf(hb + hn, sizeof(hb) - hn, " %d:%.1f%%", k,
-                         100.0 * (double)c / (double)tot);
-        }
-        fprintf(stderr, "%s\n", hb);
-        fprintf(stderr, "vmodel:   %s keeps blank %.1f%%, keeps S %.1f%%\n",
-                src ? "MODEL " : "EQUITY",
-                100.0 * (double)atomic_load_explicit(&g_pp_pick_blank[src], memory_order_relaxed) / (double)tot,
-                100.0 * (double)atomic_load_explicit(&g_pp_pick_s[src], memory_order_relaxed) / (double)tot);
-      }
       {
         const uint64_t lf = atomic_load_explicit(&g_vmodel_eg_list_full,
                                                  memory_order_relaxed);
