@@ -344,10 +344,30 @@ float vmodel_predict(const VModel *m,
     }
     VModelLeaveType lt = vmodel_classify_leave(leave_indices, leave_len);
     int si = vmodel_stratum_index(m, kind, leave_len, lt, turn);
-    if (si < 0) return -1.0f;
+    // These two paths returned -1 SILENTLY, so a model that scored nothing at
+    // all was indistinguishable from one that scored everything: every fill
+    // since bag 8 logged "moves unscored 100.000%" with no other diagnostic.
+    // Cap the noise but never let it be silent again.
+    if (si < 0) {
+        static int warned_stratum = 0;  // benign race; only bounds log volume
+        if (warned_stratum++ < 8) {
+            log_warn("vmodel: NO STRATUM kind=%d leave_len=%d type=%d turn=%d "
+                     "bag=%d (n_strata=%d) -> move unscored",
+                     kind, leave_len, (int)lt, turn, m->bag, m->n_strata);
+        }
+        return -1.0f;
+    }
     const VStratum *s = &m->strata[si];
     int bi = vmodel_bucket_index(s, diff);
-    if (bi < 0) return -1.0f;
+    if (bi < 0) {
+        static int warned_bucket = 0;
+        if (warned_bucket++ < 8) {
+            log_warn("vmodel: NO BUCKET in %s for diff=%d (n_buckets=%d, "
+                     "bag=%d) -> move unscored", s->key, diff, s->n_buckets,
+                     m->bag);
+        }
+        return -1.0f;
+    }
     const VBucket *b = &s->buckets[bi];
 
     // Stack buffer — biggest bucket has ~430 features.

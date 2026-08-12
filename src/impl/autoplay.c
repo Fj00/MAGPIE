@@ -6287,7 +6287,15 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   TrajectoryRecorder *traj_r = sd->trajectory_recorder;
   OpenerPool *op = sd->opener_pool;
   const int n = op ? opener_pool_count(op) : position_pool_count(pp);
-  MoveList *post_ml = move_list_create(1);
+  // post_ml was capacity 1, which was right for get_top_equity_move (it only
+  // needs the best move) but SILENTLY BROKE the V-model chain: since
+  // 2026-08 every vmodel_endgame_pick_move call generated moves with
+  // MOVE_RECORD_ALL into this list, and move_list_insert_spare_move is a
+  // min-heap capped at capacity -- so it kept exactly ONE move, the
+  // equity-best. The model was handed a single candidate, making its argmax
+  // identical to HastyBot's pick by construction. Needs the full move list,
+  // same as the fan-out below.
+  MoveList *post_ml = move_list_create(8192);
   MoveList *fan_ml = move_list_create(8192);  // full move list for fan-out
   // MAGPIE_PP_FANOUT=1: branch a playout per distinct (kind,score,leave) cell of
   // the injected rack's move list (counterfactual coverage), instead of only
