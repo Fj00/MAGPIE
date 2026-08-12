@@ -2211,6 +2211,15 @@ static _Atomic uint64_t g_vmodel_eg_null_unscored = 0;  // moves existed, none s
 static _Atomic uint64_t g_vmodel_eg_mv_total      = 0;  // candidate moves seen
 static _Atomic uint64_t g_vmodel_eg_mv_unscored   = 0;  // of those, returned p<0
 static _Atomic uint64_t g_vmodel_eg_list_full     = 0;  // movegen filled the list -> moves dropped
+// PRE-ENDGAME pick shape, split by who chose: [0]=HastyBot equity, [1]=V-model.
+// Tests whether the model fishes (1-tile plays keeping blanks/S) far more than
+// equity does -- a fishing policy leaves 6 tiles on the rack, so the endgame it
+// hands the solver is deeper and much more expensive. Only counts plies with
+// tiles still in the bag; the 0-in-bag tail is exact-solved, not policy-chosen.
+static _Atomic uint64_t g_pp_pick_tiles[2][8];
+static _Atomic uint64_t g_pp_pick_blank[2];
+static _Atomic uint64_t g_pp_pick_s[2];
+static _Atomic uint64_t g_pp_pick_total[2];
 static _Atomic uint64_t g_vmodel_eg_pass_big  = 0;  // margin >= 0.05
 static _Atomic uint64_t g_vmodel_eg_pass_live = 0;  // 0.02 < pass p < 0.98
 // MAGPIE_VMODEL_PLAYOUT_NO_PASS=1: the V-model playout policy never picks a pass
@@ -2383,6 +2392,26 @@ void vmodel_log_stats(void) {
                 ? 100.0 * (double)atomic_load_explicit(&g_vmodel_eg_mv_unscored, memory_order_relaxed)
                         / (double)atomic_load_explicit(&g_vmodel_eg_mv_total, memory_order_relaxed)
                 : 0.0);
+      for (int src = 0; src < 2; src++) {
+        const uint64_t tot = atomic_load_explicit(&g_pp_pick_total[src],
+                                                  memory_order_relaxed);
+        if (tot == 0) continue;
+        char hb[512]; int hn = 0;
+        hn += snprintf(hb + hn, sizeof(hb) - hn,
+                       "vmodel: PRE-ENDGAME picks by %s (%llu): tiles",
+                       src ? "MODEL " : "EQUITY", (unsigned long long)tot);
+        for (int k = 0; k <= 7; k++) {
+          const uint64_t c = atomic_load_explicit(&g_pp_pick_tiles[src][k],
+                                                  memory_order_relaxed);
+          hn += snprintf(hb + hn, sizeof(hb) - hn, " %d:%.1f%%", k,
+                         100.0 * (double)c / (double)tot);
+        }
+        fprintf(stderr, "%s\n", hb);
+        fprintf(stderr, "vmodel:   %s keeps blank %.1f%%, keeps S %.1f%%\n",
+                src ? "MODEL " : "EQUITY",
+                100.0 * (double)atomic_load_explicit(&g_pp_pick_blank[src], memory_order_relaxed) / (double)tot,
+                100.0 * (double)atomic_load_explicit(&g_pp_pick_s[src], memory_order_relaxed) / (double)tot);
+      }
       {
         const uint64_t lf = atomic_load_explicit(&g_vmodel_eg_list_full,
                                                  memory_order_relaxed);
@@ -2793,6 +2822,30 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
 // Defined further down (near the position-pool code); needed here for the
 // standoff guard.
 static int pp_sixpass_diff(const Game *game, int mover, int pre_diff);
+
+// Record the shape of a pre-endgame pick. from_model: 1 = V-model argmax,
+// 0 = HastyBot equity. English ld letter indices: blank 0, A 1 .. S 19 .. Z 26.
+static void pp_record_pick(Game *game, const Move *m, int from_model) {
+  if (m == NULL) return;
+  const Bag *b = game_get_bag(game);
+  if (bag_get_letters(b) <= 0) return;  // endgame tail is solved, not chosen
+  const int idx = from_model ? 1 : 0;
+  int tp = move_get_tiles_played(m);
+  if (tp < 0) tp = 0;
+  if (tp > 7) tp = 7;
+  atomic_fetch_add_explicit(&g_pp_pick_tiles[idx][tp], 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_pp_pick_total[idx], 1, memory_order_relaxed);
+  const int on = game_get_player_on_turn_index(game);
+  Rack *pr = player_get_rack(game_get_player(game, on));
+  Rack leave;
+  rack_set_dist_size(&leave, rack_get_dist_size(pr));
+  rack_reset(&leave);
+  get_leave_for_move(m, game, &leave);
+  if (rack_get_letter(&leave, 0) > 0)
+    atomic_fetch_add_explicit(&g_pp_pick_blank[idx], 1, memory_order_relaxed);
+  if (rack_get_letter(&leave, 19) > 0)
+    atomic_fetch_add_explicit(&g_pp_pick_s[idx], 1, memory_order_relaxed);
+}
 
 static const Move *vmodel_endgame_pick_move(Game *game,
                                             VModel *const *vmodels_by_bag,
@@ -6048,7 +6101,9 @@ static bool pp_playout_outcome(EndgameCtx **es, EndgameResults *er,
           if (vmodels_by_bag)
             pm = vmodel_endgame_pick_move(dg, vmodels_by_bag, vmodel_sl,
                                           worker_index, post_ml);
+          const int pm_from_model = (pm != NULL);
           if (!pm) pm = get_top_equity_move(dg, post_ml);
+          pp_record_pick(dg, pm, pm_from_model);
           play_move(pm, dg, NULL);
         } else {
           Move *sp = move_list_get_spare_move(post_ml);
@@ -6093,7 +6148,9 @@ static bool pp_playout_outcome(EndgameCtx **es, EndgameResults *er,
         if (vmodels_by_bag)
           pm = vmodel_endgame_pick_move(dg, vmodels_by_bag, vmodel_sl,
                                         worker_index, post_ml);
+        const int pm_from_model2 = (pm != NULL);
         if (!pm) pm = get_top_equity_move(dg, post_ml);
+        pp_record_pick(dg, pm, pm_from_model2);
         const game_event_t opp_mt = move_get_type(pm);
         play_move(pm, dg, NULL);
         // The mover's pass commitment holds while tiles remain in the bag:
@@ -6205,7 +6262,9 @@ static bool pp_playout_outcome(EndgameCtx **es, EndgameResults *er,
       pm = vmodel_endgame_pick_move(dg, vmodels_by_bag, vmodel_sl,
                                     worker_index, post_ml);
     }
+    const int pm_from_model3 = (pm != NULL);
     if (!pm) pm = get_top_equity_move(dg, post_ml);
+    pp_record_pick(dg, pm, pm_from_model3);
     play_move(pm, dg, NULL);
   }
   // Commit a natural terminus: a standard out OR the six-pass (CONSECUTIVE_
