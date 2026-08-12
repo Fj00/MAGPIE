@@ -1,6 +1,7 @@
 #include "vmodel_features.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -293,9 +294,15 @@ int vmodel_extract_features(float *buf, int cap,
     }
 
     if (wi != b->n_coefs) {
-        log_warn("vmodel_features: shape mismatch in %s bucket [%d,%d]: "
-                 "got %d feats, need %d",
-                 s->key, b->diff_lo, b->diff_hi, wi, b->n_coefs);
+        // stderr, not log_warn: current_log_level defaults to LOG_FATAL, so
+        // every log_warn in this file was suppressed -- which is why a model
+        // scoring NOTHING looked identical to one scoring everything.
+        static int warned_shape = 0;
+        if (warned_shape++ < 8) {
+            fprintf(stderr, "vmodel_features: SHAPE MISMATCH in %s bucket "
+                    "[%d,%d]: got %d feats, need %d\n",
+                    s->key, b->diff_lo, b->diff_hi, wi, b->n_coefs);
+        }
         return -1;
     }
     return wi;
@@ -351,9 +358,9 @@ float vmodel_predict(const VModel *m,
     if (si < 0) {
         static int warned_stratum = 0;  // benign race; only bounds log volume
         if (warned_stratum++ < 8) {
-            log_warn("vmodel: NO STRATUM kind=%d leave_len=%d type=%d turn=%d "
-                     "bag=%d (n_strata=%d) -> move unscored",
-                     kind, leave_len, (int)lt, turn, m->bag, m->n_strata);
+            fprintf(stderr, "vmodel: NO STRATUM kind=%d leave_len=%d type=%d "
+                    "turn=%d bag=%d (n_strata=%d) -> move unscored\n",
+                    kind, leave_len, (int)lt, turn, m->bag, m->n_strata);
         }
         return -1.0f;
     }
@@ -362,9 +369,9 @@ float vmodel_predict(const VModel *m,
     if (bi < 0) {
         static int warned_bucket = 0;
         if (warned_bucket++ < 8) {
-            log_warn("vmodel: NO BUCKET in %s for diff=%d (n_buckets=%d, "
-                     "bag=%d) -> move unscored", s->key, diff, s->n_buckets,
-                     m->bag);
+            fprintf(stderr, "vmodel: NO BUCKET in %s for diff=%d "
+                    "(n_buckets=%d, bag=%d) -> move unscored\n",
+                    s->key, diff, s->n_buckets, m->bag);
         }
         return -1.0f;
     }
