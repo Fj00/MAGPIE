@@ -6323,7 +6323,12 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   // reasoning as force_move_list's 32768 above ("rare-leave plays often sit
   // much deeper in the equity-sorted list"). Saturation is DETECTED below, not
   // assumed away.
-  int vm_cap = 32768;
+  // 32768 SATURATED on real bag-14 positions (the detector below fired), so
+  // it was still truncating the ranking. 250000 matches magpie's own
+  // DEFAULT_SMALL_MOVE_LIST_CAPACITY, i.e. what the codebase already
+  // treats as the worst-case move count. ~8MB/worker/list; the detector
+  // stays, because a cap is a guess and a dropped move is silent.
+  int vm_cap = 250000;
   {
     const char *e = getenv("MAGPIE_VMODEL_MOVE_CAP");
     if (e != NULL) {
