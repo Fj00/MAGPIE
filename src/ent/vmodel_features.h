@@ -27,6 +27,7 @@ int vmodel_extract_features(float *feature_buf, int buf_capacity,
                              const uint8_t *leave_indices, int leave_len,
                              int diff, int bag, int turn,
                              const int *unseen_vec,
+                             int play_unseen,
                              const StaticLeaves *sl);
 
 // Convenience: extract features, dot-product with coefs + intercept,

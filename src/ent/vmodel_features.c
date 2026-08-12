@@ -141,6 +141,7 @@ int vmodel_extract_features(float *buf, int cap,
                              const uint8_t *leave_indices, int leave_len,
                              int diff, int bag, int turn,
                              const int *unseen_vec,
+                             int play_unseen,
                              const StaticLeaves *sl) {
     bool tzs = terminal_zero_score(turn, s->kind);
     int wi = 0;
@@ -247,6 +248,30 @@ int vmodel_extract_features(float *buf, int cap,
         }
     }
 
+    // Unseen-pool PAIR block (373), on NON-PASS strata only. Mirrors
+    // v_model_features._unseen_pair_names/_unseen_pair_values exactly: the
+    // 27-tile upper triangle including the diagonal, SKIPPING doubles of
+    // single-copy tiles (J,K,Q,X,Z) -> 378 - 5 = 373, in that iteration order.
+    // Values are pair COUNTS over the unseen pool: u[a]*u[b], and
+    // u[a](u[a]-1)/2 on the diagonal.
+    bool is_pass_stratum = (s->kind == 0 && s->leave_length == VMODEL_RACK_SIZE);
+    if (play_unseen >= 1 && !is_pass_stratum) {
+        uint8_t rc_up[27];
+        count_tiles(rack_indices, rack_len, rc_up);
+        int u[27];
+        int u_total = 0;
+        if (!fill_unseen(unseen_vec, rc_up, bag, s->key, u, &u_total)) return -1;
+        for (int a = 0; a < 27; a++) {
+            for (int bq = a; bq < 27; bq++) {
+                if (a == bq && TILE_BAG[a] < 2) continue;
+                float v = (a == bq) ? (float)((double)u[a] * (u[a] - 1) / 2.0)
+                                    : (float)((double)u[a] * (double)u[bq]);
+                wi = append_feat(buf, cap, wi, v);
+                if (wi < 0) return -1;
+            }
+        }
+    }
+
     // bag_exp: skip for K0_L7 (pass — tiles_played=0).
     bool emit_bag_block = !(s->kind == 0 && s->leave_length == VMODEL_RACK_SIZE);
     if (emit_bag_block) {
@@ -264,9 +289,19 @@ int vmodel_extract_features(float *buf, int cap,
         for (int i = 0; i < b->n_bag; i++) ind_mask[b->bag_tiles[i]] = true;
         for (int t = 0; t < 27; t++) {
             if (ind_mask[t]) continue;
-            float bv = 0.0f;
-            if (unseen_total > 0 && tp > 0) {
-                bv = (float)((double)tp * (double)unseen[t] / (double)unseen_total);
+            float bv;
+            if (play_unseen >= 2) {
+                // unseen_count_<t>: the RAW count. Within a (bag, stratum) the
+                // expectation form tp*u[t]/N is this same feature times a
+                // constant, but it sits on a different scale per stratum, so
+                // the trainer switched to counts. Must match or every coef is
+                // scaled wrong.
+                bv = (float)unseen[t];
+            } else {
+                bv = 0.0f;
+                if (unseen_total > 0 && tp > 0) {
+                    bv = (float)((double)tp * (double)unseen[t] / (double)unseen_total);
+                }
             }
             wi = append_feat(buf, cap, wi, bv);
             if (wi < 0) return -1;
@@ -382,7 +417,8 @@ float vmodel_predict(const VModel *m,
     int n = vmodel_extract_features(feats, (int)(sizeof(feats)/sizeof(feats[0])),
                                      s, b, rack_indices, rack_len,
                                      leave_indices, leave_len,
-                                     diff, m->bag, turn, unseen_vec, sl);
+                                     diff, m->bag, turn, unseen_vec,
+                                     m->play_unseen, sl);
     if (n < 0) return -1.0f;
     double z = b->intercept;
     for (int i = 0; i < n; i++) {

@@ -178,6 +178,16 @@ static bool parse_header(FILE *f, VModel *m) {
         if (!read_line(buf, sizeof(buf), f)) return false;
         p = buf;
     }
+    // Optional PLAYUNSEEN (unseen-pool block level on non-pass strata).
+    // Default 0 keeps the legacy bag_exp schema for older models.
+    m->play_unseen = 0;
+    if (strncmp(p, "PLAYUNSEEN", 10) == 0) {
+        int v = 0;
+        if (!expect_token(&p, "PLAYUNSEEN") || !parse_int(&p, &v)) return false;
+        m->play_unseen = v;
+        if (!read_line(buf, sizeof(buf), f)) return false;
+        p = buf;
+    }
     if (!expect_token(&p, "NSTRATA") || !parse_int(&p, &m->n_strata)) return false;
     return true;
 }

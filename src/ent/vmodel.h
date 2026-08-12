@@ -68,6 +68,12 @@ typedef struct VModel {
     // stratum/bucket lookup and the move_score feature. Set from the .vmt PASS6
     // header flag (export_v_model_text.py); false for older lead-bucketed models.
     bool      pass_sixpass;
+    // Unseen-pool block on non-pass strata, from the .vmt PLAYUNSEEN header.
+    // 2 = 373 unseen_pair counts + 27 RAW unseen counts (the latter REPLACING
+    // the older bag_exp expectations). 0 = legacy bag_exp schema. Models
+    // trained with --play-unseen-pairs 2 carry 801 coefs where the legacy
+    // extractor builds 428, so getting this wrong fails every move.
+    int       play_unseen;
     VStratum *strata;              // [n_strata]
 } VModel;
 
