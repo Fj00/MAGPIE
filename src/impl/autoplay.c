@@ -2225,6 +2225,17 @@ static _Atomic uint64_t g_pp_pick_total[2];
 // emits no passes, and an exchange plays >=1 tile), so if it is non-empty the
 // bucketing is wrong -- measure rather than infer.
 static _Atomic uint64_t g_pp_pick_type[2][4];
+// When the model PICKS A PASS, how much win% does it claim over the best tile
+// play it declined? At bag_key 8 the physical bag holds 1 tile, so a pass draws
+// nothing -- it cannot improve the rack, it only burns tempo, and six end the
+// game. A large claimed edge there is far more likely a mis-scored pass head
+// (K0_L7 is sixpass_diff-bucketed) than a real judgement. Sums are in
+// micro-units to keep the atomics integral.
+static _Atomic uint64_t g_pass_pick_n     = 0;
+static _Atomic uint64_t g_pass_p_sum      = 0;  // pass win% * 1e6
+static _Atomic uint64_t g_pass_alt_sum    = 0;  // best non-pass win% * 1e6
+static _Atomic uint64_t g_pass_no_alt     = 0;  // pass was the ONLY scoreable move
+static _Atomic uint64_t g_pass_gap_hist[10];    // (pass - best_play) in 0.1 bins
 static _Atomic uint64_t g_vmodel_eg_pass_big  = 0;  // margin >= 0.05
 static _Atomic uint64_t g_vmodel_eg_pass_live = 0;  // 0.02 < pass p < 0.98
 // MAGPIE_VMODEL_PLAYOUT_NO_PASS=1: the V-model playout policy never picks a pass
@@ -2360,6 +2371,31 @@ static int vmodel_indices_to_pts(const uint8_t *idx, int n) {
 }
 
 void vmodel_log_stats(void) {
+  {
+    const uint64_t pn = atomic_load_explicit(&g_pass_pick_n, memory_order_relaxed);
+    if (pn) {
+      const uint64_t noalt = atomic_load_explicit(&g_pass_no_alt, memory_order_relaxed);
+      const uint64_t withalt = pn - noalt;
+      fprintf(stderr, "vmodel: MODEL CHOSE PASS %llu time(s); only-legal-move %llu\n",
+              (unsigned long long)pn, (unsigned long long)noalt);
+      if (withalt) {
+        fprintf(stderr, "vmodel:   mean win%% claimed for the pass %.4f vs best "
+                "declined play %.4f (edge %+.4f)\n",
+                (double)atomic_load_explicit(&g_pass_p_sum, memory_order_relaxed) / 1e6 / (double)pn,
+                (double)atomic_load_explicit(&g_pass_alt_sum, memory_order_relaxed) / 1e6 / (double)withalt,
+                ((double)atomic_load_explicit(&g_pass_p_sum, memory_order_relaxed) / (double)pn
+                 - (double)atomic_load_explicit(&g_pass_alt_sum, memory_order_relaxed) / (double)withalt) / 1e6);
+        char hb[400]; int hn = 0;
+        hn += snprintf(hb + hn, sizeof(hb) - hn, "vmodel:   edge histogram:");
+        for (int i = 0; i < 10; i++) {
+          hn += snprintf(hb + hn, sizeof(hb) - hn, " %.1f-%.1f:%llu", i / 10.0,
+                         (i + 1) / 10.0,
+                         (unsigned long long)atomic_load_explicit(&g_pass_gap_hist[i], memory_order_relaxed));
+        }
+        fprintf(stderr, "%s\n", hb);
+      }
+    }
+  }
   // Pre-endgame pick shape. OUTSIDE the `if (egc)` gate on purpose: the
   // equity-only arm of the fishing A/B loads no models, so egc is 0 and this
   // would print nothing exactly when it is needed for comparison.
@@ -2942,6 +2978,7 @@ static const Move *vmodel_endgame_pick_move(Game *game,
 
   Move *best_move = NULL;
   float best_win = -1.0f;
+  float best_nonpass = -1.0f;  // best win% among NON-pass moves
   Rack leave_rack;
   rack_set_dist_size(&leave_rack, rack_get_dist_size(player_rack));
 
@@ -2973,6 +3010,22 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     if (p_round > best_win) {  // strict > keeps equity-sorted tie order
       best_win = p_round;
       best_move = m;
+    }
+    if (kind != 0 && p_round > best_nonpass) best_nonpass = p_round;
+  }
+  if (best_move != NULL && move_get_type(best_move) == GAME_EVENT_PASS) {
+    atomic_fetch_add_explicit(&g_pass_pick_n, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_pass_p_sum, (uint64_t)(best_win * 1e6f),
+                              memory_order_relaxed);
+    if (best_nonpass < 0.0f) {
+      atomic_fetch_add_explicit(&g_pass_no_alt, 1, memory_order_relaxed);
+    } else {
+      atomic_fetch_add_explicit(&g_pass_alt_sum, (uint64_t)(best_nonpass * 1e6f),
+                                memory_order_relaxed);
+      int gi = (int)((best_win - best_nonpass) * 10.0f);
+      if (gi < 0) gi = 0;
+      if (gi > 9) gi = 9;
+      atomic_fetch_add_explicit(&g_pass_gap_hist[gi], 1, memory_order_relaxed);
     }
   }
   // Movegen does NOT emit a pass, so (unlike vmodel_pick_top_move, which adds
