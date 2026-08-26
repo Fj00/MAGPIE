@@ -133,6 +133,83 @@ static _Atomic uint64_t g_eb_l3p_gate_iter_by_prio[4] = {0};
 // turns in all games. Read/reset via autoplay_get_total_sim_iterations().
 static _Atomic uint64_t autoplay_total_sim_iterations;
 
+// ---- index_build sign sampling -------------------------------------------
+// The catalog emits 12 columns; eleven come from one generate_moves() plus
+// pp_match_force_cells(). The twelfth, `sign`, costs a COMPLETE PLAYOUT of the
+// position (pp_playout_outcome below), and the catalog force table demands
+// CATPOS = EPV_TOP*428*2 = 42,800 credits per stratum cell. Measured on bag 15
+// (24.1M positions): 152,807,315,592 vmodel_predict() calls, ~14.4 playout
+// plies per position, 2h01m -- 78% of the whole fill, for one bit per row.
+//
+// The only consumer of `sign` is size_targets_natural.py's p_hat, which feeds
+// ci_npos = z^2*max(p(1-p),0.09)/eps^2. That is clamped to [1124, 3122]; p only
+// moves it for p in (0.113, 0.887), a +/-0.01 error shifts the target ~1.3%,
+// and the file's own docstring calls the sizing error second-order. It needs
+// ~10^2-10^3 rows per cell, not 42,800.
+//
+// So: cap the PLAYOUT per cell, never the emission. Rows past the cap are
+// emitted with sign = PP_SIGN_UNSAMPLED and still credit the force table --
+// crediting is sign-blind under natural-ratio semantics (force_table.c:506
+// "each credit here is one position -> one deficit decrement, regardless of
+// outcome"), so cell_ords, nat_supply_pos and STOP_ON_EXHAUST are untouched.
+// Only the StratumTally W/L diagnostic loses those rows.
+//
+// MAGPIE_PP_SIGN_CAP=0 restores the old behaviour (playout every row).
+#define PP_SIGN_UNSAMPLED (-1)
+static _Atomic int *g_pp_sign_count = NULL;  // per force-target ordinal
+static int g_pp_sign_count_n = 0;
+static int g_pp_sign_cap = 0;
+static _Atomic long g_pp_sign_played = 0;
+static _Atomic long g_pp_sign_skipped = 0;
+
+// Allocate once, before workers start. Returns false if the cap is disabled.
+static bool pp_sign_cap_init(const ForceTable *ft) {
+  const char *env = getenv("MAGPIE_PP_SIGN_CAP");
+  g_pp_sign_cap = env ? atoi(env) : 1000;
+  if (g_pp_sign_cap <= 0 || ft == NULL) {
+    g_pp_sign_cap = 0;
+    return false;
+  }
+  g_pp_sign_count_n = force_table_num_targets(ft);
+  if (g_pp_sign_count_n <= 0) {
+    g_pp_sign_cap = 0;
+    return false;
+  }
+  g_pp_sign_count =
+      (_Atomic int *)calloc((size_t)g_pp_sign_count_n, sizeof(_Atomic int));
+  if (g_pp_sign_count == NULL) {
+    g_pp_sign_cap = 0;
+    return false;
+  }
+  return true;
+}
+
+// True if EVERY cell this move matches has already banked `cap` signs, so the
+// playout would add nothing any consumer reads. One cell still under quota is
+// enough to justify the playout, since the row credits all of them.
+static bool pp_sign_all_capped(const ForceTable *ft, ForceTarget **ftgts,
+                               int nft) {
+  if (g_pp_sign_cap <= 0 || g_pp_sign_count == NULL) return false;
+  for (int i = 0; i < nft; i++) {
+    const int ord = force_table_target_index(ft, ftgts[i]);
+    if (ord < 0 || ord >= g_pp_sign_count_n) return false;  // unknown -> sample
+    if (atomic_load_explicit(&g_pp_sign_count[ord], memory_order_relaxed) <
+        g_pp_sign_cap) {
+      return false;
+    }
+  }
+  return nft > 0;
+}
+
+static void pp_sign_bump(const ForceTable *ft, ForceTarget **ftgts, int nft) {
+  if (g_pp_sign_cap <= 0 || g_pp_sign_count == NULL) return;
+  for (int i = 0; i < nft; i++) {
+    const int ord = force_table_target_index(ft, ftgts[i]);
+    if (ord >= 0 && ord < g_pp_sign_count_n) {
+      atomic_fetch_add_explicit(&g_pp_sign_count[ord], 1, memory_order_relaxed);
+    }
+  }
+}
 uint64_t autoplay_get_total_sim_iterations(void) {
   return atomic_load_explicit(&autoplay_total_sim_iterations,
                               memory_order_relaxed);
@@ -825,6 +902,21 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
       shared_data->force_table != NULL) {
     force_table_resume_from_dump(shared_data->force_table, resume_path,
                                   args->game_args->ld);
+  }
+  // Sign sampling for the index_build catalog. Sized off the force table, so it
+  // must happen after force_table_create and before any worker starts.
+  if (shared_data->force_table != NULL) {
+    const char *ib = getenv("MAGPIE_PP_INDEX_BUILD");
+    if (ib && ib[0] == '1') {
+      if (pp_sign_cap_init(shared_data->force_table)) {
+        log_warn("pp_index: sign cap %d playouts/cell over %d targets "
+                 "(MAGPIE_PP_SIGN_CAP=0 to disable)",
+                 g_pp_sign_cap, g_pp_sign_count_n);
+      } else {
+        log_warn("pp_index: sign cap DISABLED -- every catalog row plays a "
+                 "full game (the 2h/rung path)");
+      }
+    }
   }
   shared_data->stop_on_force_exhaust =
       shared_data->force_table != NULL &&
@@ -2483,6 +2575,17 @@ for (int src = 0; src < 2; src++) {
                   " -- ranking saw a TRUNCATED candidate set\n",
                   (unsigned long long)lf);
         }
+      }
+      if (g_pp_sign_cap > 0) {
+        const long pl = atomic_load_explicit(&g_pp_sign_played,
+                                             memory_order_relaxed);
+        const long sk = atomic_load_explicit(&g_pp_sign_skipped,
+                                             memory_order_relaxed);
+        fprintf(stderr,
+                "pp_index: sign playouts %ld, skipped %ld (%.1f%% skipped, "
+                "cap %d/cell) -- skipped rows emit sign=%d and still credit\n",
+                pl, sk, (pl + sk) ? 100.0 * (double)sk / (double)(pl + sk) : 0.0,
+                g_pp_sign_cap, PP_SIGN_UNSAMPLED);
       }
       {
         char hb[512]; int hn = 0;
@@ -5978,6 +6081,7 @@ static _Atomic int g_tail_hi[16][8];
 // until it has refine_min samples. g_refine_lo/hi = loss/win window counts.
 static _Atomic int g_refine_lo[16][8];
 static _Atomic int g_refine_hi[16][8];
+
 static bool load_cutoff_table(const char *path, int loss[16][8], int win[16][8]) {
   for (int b = 0; b < 16; b++)
     for (int l = 0; l < 8; l++) { loss[b][l] = -100000; win[b][l] = 100000; }
@@ -7166,22 +7270,40 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
               // Credit per-(cell,side) via force_table_credit_game so BOTH the win and
               // loss sides of each stratum bank ~K*target candidates (load this catalog
               // force table with per_side = K*target); features stay count-based.
-              Game *cg = game_duplicate(gr->game);
-              play_move(mv, cg, NULL);
+              // Sign sampling: if every cell this move matches has already
+              // banked its quota of playout outcomes, emit the row WITHOUT
+              // playing the game out. Membership and crediting are unaffected
+              // (see pp_sign_cap_init).
               bool iwin = false, itie = false;
-              int if0 = 0, if1 = 0;
-              double ispent = 0.0;
-              const bool ok = pp_playout_outcome(
-                  &es, er, eg_tc, cg, post_ml, worker->worker_index, on_idx,
-                  /*endgame=*/false, eg_plies, eg_caps, eg_signstable_k, eg_diffgate,
-                  eg_first_win,
-                  eg_tt_frac, &ispent, eg_pos_budget, eg_overflow_cap, &iwin, &itie,
-                  &if0, &if1, NULL,
-                  sd->vmodel_bags_any_loaded ? sd->vmodels_by_bag : NULL,
-                  sd->vmodel_static_leaves);
-              game_destroy(cg);
+              bool ok = true;
+              bool sampled = false;
+              if (pp_sign_all_capped(ft, ftgts, nft)) {
+                atomic_fetch_add_explicit(&g_pp_sign_skipped, 1,
+                                          memory_order_relaxed);
+              } else {
+                Game *cg = game_duplicate(gr->game);
+                play_move(mv, cg, NULL);
+                int if0 = 0, if1 = 0;
+                double ispent = 0.0;
+                ok = pp_playout_outcome(
+                    &es, er, eg_tc, cg, post_ml, worker->worker_index, on_idx,
+                    /*endgame=*/false, eg_plies, eg_caps, eg_signstable_k, eg_diffgate,
+                    eg_first_win,
+                    eg_tt_frac, &ispent, eg_pos_budget, eg_overflow_cap, &iwin, &itie,
+                    &if0, &if1, NULL,
+                    sd->vmodel_bags_any_loaded ? sd->vmodels_by_bag : NULL,
+                    sd->vmodel_static_leaves);
+                game_destroy(cg);
+                if (ok) {
+                  sampled = true;
+                  pp_sign_bump(ft, ftgts, nft);
+                  atomic_fetch_add_explicit(&g_pp_sign_played, 1,
+                                            memory_order_relaxed);
+                }
+              }
               if (ok) {
-                const int sign = itie ? 2 : (iwin ? 1 : 0);
+                const int sign =
+                    !sampled ? PP_SIGN_UNSAMPLED : (itie ? 2 : (iwin ? 1 : 0));
                 int band = 0;
                 if (eg_cut_loaded && gate_bag >= 0 && gate_bag < 16 && llen < 8) {
                   band = (eff_diff >= eg_cut_lo[gate_bag][llen] &&
