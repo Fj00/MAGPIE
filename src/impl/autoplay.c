@@ -163,10 +163,32 @@ static _Atomic long g_pp_sign_played = 0;
 static _Atomic long g_pp_sign_skipped = 0;
 
 // Allocate once, before workers start. Returns false if the cap is disabled.
+//
+// MAGPIE_PP_SIGN_CAP:
+//    >0  cap  -- play out the first N rows per cell, then emit sign=-1
+//     0  off  -- play out every row (the original ~2h/rung behaviour)
+//    <0  NONE -- never play out; every row emits sign=-1
+//
+// <0 is what production wants once size_targets_natural takes --bucket-winpct:
+// `p` then comes from the wl aggregate, nothing reads `sign`, and the playout
+// has no consumer at all. It needs its own value because 0 already meant
+// unlimited, and because a per-cell counter cannot express "none" -- counters
+// start at 0, so the first row of every cell would always be played out.
+//
+// A small positive cap remains useful as a cheap calibration probe: it measures
+// how far the wl p drifts from the population actually being collected, for a
+// fraction of the full cost. The cap alone plateaus at ~1.8x (measured 47.3%
+// skipped at cap=200 vs 46.6% at cap=1000 -- coverage is so skewed that common
+// cells saturate at any cap while most cells never reach it), which is why the
+// wl substitution rather than the cap is the real fix.
 static bool pp_sign_cap_init(const ForceTable *ft) {
   const char *env = getenv("MAGPIE_PP_SIGN_CAP");
   g_pp_sign_cap = env ? atoi(env) : 1000;
-  if (g_pp_sign_cap <= 0 || ft == NULL) {
+  if (g_pp_sign_cap < 0) {
+    g_pp_sign_count_n = 0;   // no per-cell state needed for "never"
+    return true;
+  }
+  if (g_pp_sign_cap == 0 || ft == NULL) {
     g_pp_sign_cap = 0;
     return false;
   }
@@ -189,7 +211,8 @@ static bool pp_sign_cap_init(const ForceTable *ft) {
 // enough to justify the playout, since the row credits all of them.
 static bool pp_sign_all_capped(const ForceTable *ft, ForceTarget **ftgts,
                                int nft) {
-  if (g_pp_sign_cap <= 0 || g_pp_sign_count == NULL) return false;
+  if (g_pp_sign_cap < 0) return true;   // "never play out" -- always skip
+  if (g_pp_sign_cap == 0 || g_pp_sign_count == NULL) return false;
   for (int i = 0; i < nft; i++) {
     const int ord = force_table_target_index(ft, ftgts[i]);
     if (ord < 0 || ord >= g_pp_sign_count_n) return false;  // unknown -> sample
@@ -2576,7 +2599,7 @@ for (int src = 0; src < 2; src++) {
                   (unsigned long long)lf);
         }
       }
-      if (g_pp_sign_cap > 0) {
+      if (g_pp_sign_cap != 0) {   // >0 capped, <0 never -- both worth reporting
         const long pl = atomic_load_explicit(&g_pp_sign_played,
                                              memory_order_relaxed);
         const long sk = atomic_load_explicit(&g_pp_sign_skipped,
