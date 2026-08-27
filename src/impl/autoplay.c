@@ -3339,13 +3339,28 @@ static void eb_stage_trajectory_row(GameRunner *game_runner, Game *game,
 // mirrors the per-worker shard pattern of trajectory_recorder.c:tr_get_own_file.
 // action_repr/rack/leave are comma-free (letters, digits, spaces), so the CSV
 // needs no quoting.
+// PP_INDEX_MAX_BAG: bag_key is physical bag + RACK_SIZE, so the full range is
+// 7 (bag empty) .. 93 (opener). This was 16 -- sized when the catalog only ever
+// ran on the 8-14 endgame rungs -- and pp_index_emit RETURNED SILENTLY above it.
+// Bag 15 was the last value that fit; bag 16 catalogued for 33 minutes, matched
+// cells and credited the force table to 80.4%, and wrote zero rows, so every one
+// of its 1,624 stratum cells came back zero-data and the rung aborted at GATE 5a
+// with "no new natural positions available". Nothing in the log said why.
+#define PP_INDEX_MAX_BAG 94
 static void pp_index_emit(FILE **idx_fhs, const char *dir, int worker_index,
                           int bag, int pool_idx, uint64_t pos_id, Game *game,
                           int on_idx, const Move *mv, int score,
                           const char *leave, int leave_len, int eff_diff,
                           ForceTable *ft, ForceTarget **ftgts, int nft,
                           int sign, int band) {
-  if (bag < 0 || bag >= 16) {
+  if (bag < 0 || bag >= PP_INDEX_MAX_BAG) {
+    // Loud, not silent: a dropped row here is invisible downstream -- the cell
+    // simply reports zero supply and the rung dies several stages later.
+    static _Atomic int warned = 0;
+    if (atomic_fetch_add_explicit(&warned, 1, memory_order_relaxed) == 0) {
+      fprintf(stderr, "pp_index: !! bag %d outside [0,%d) -- rows DROPPED. "
+              "Raise PP_INDEX_MAX_BAG.\n", bag, PP_INDEX_MAX_BAG);
+    }
     return;
   }
   FILE *fh = idx_fhs[bag];
@@ -6642,7 +6657,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   // precomputed set-cover worklist (cgp\track position pool) injects the exact
   // paired rack, then (with ENDGAME=0) HastyBot-plays-out + records the fanout.
   const bool paired = pp_paired_env && pp_paired_env[0] == '1';
-  FILE *pp_index_fhs[16] = {NULL};  // per-bag lazy-opened index shards
+  FILE *pp_index_fhs[PP_INDEX_MAX_BAG] = {NULL};  // per-bag lazy-opened index shards
   // MAGPIE_PP_REROLLS=K: if K>0, inject K randomly re-rolled on-turn racks per
   // position (rack injection for coverage), each a separate playout. K=0 (or
   // unset) = baseline: one playout with the loaded natural rack. The re-roll
@@ -7508,7 +7523,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
   if (er) endgame_results_destroy(er);
   if (eg_tc) thread_control_destroy(eg_tc);
   if (spread_fp) fclose(spread_fp);
-  for (int b = 0; b < 16; b++)
+  for (int b = 0; b < PP_INDEX_MAX_BAG; b++)
     if (pp_index_fhs[b]) fclose(pp_index_fhs[b]);  // Stage-1 index shards
   if (lpi) late_play_index_destroy(lpi);
   // Edge-prefilter: dump per-(bag, leave_len) candidate counts so the analysis
