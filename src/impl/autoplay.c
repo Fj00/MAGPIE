@@ -7190,12 +7190,21 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           // walks canonical subsets, so a rack with multiplicities c_i yields
           // prod(c_i+1)-1), against <=7 today. Bag 15 goes ~18.9M -> ~202M rows
           // and its LABEL stage ~23m -> ~4h.
+          //
+          // NOT in the catalog (index_build). NAT-CAT exists to count, per
+          // cell, how many DISTINCT POSITIONS could supply it and what their
+          // p_hat is -- both per-position quantities that one representative
+          // answers exactly as well as a hundred. Fanning there would have
+          // written 24.1M x ~100 = 2.4 BILLION rows (~144 GB) for bag 15 and
+          // changed neither nat_supply_pos nor the sizing. The cap exemption
+          // still applies to it, so the catalog keeps its pass/exchange
+          // coverage; only the fill pays for the full enumeration.
           static _Thread_local int nonplay_fan_cache = -1;
           if (nonplay_fan_cache < 0) {
             const char *e = getenv("MAGPIE_PP_NONPLAY_FANOUT");
             nonplay_fan_cache = (e && e[0] == '0') ? 0 : 1;
           }
-          nonplay_fan = nonplay_fan_cache;
+          nonplay_fan = nonplay_fan_cache && !index_build;
           const int fcap = pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX;
           const int nlim = nm < fcap ? nm : fcap;
           const int nscan = nm < PP_FEAT_MAX ? nm : PP_FEAT_MAX;
