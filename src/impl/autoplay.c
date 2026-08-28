@@ -211,6 +211,13 @@ static bool pp_sign_cap_init(const ForceTable *ft) {
 // enough to justify the playout, since the row credits all of them.
 static bool pp_sign_all_capped(const ForceTable *ft, ForceTarget **ftgts,
                                int nft) {
+  // nft==0 is reachable only under MAGPIE_PP_NONPLAY_FANOUT, which catalogs a
+  // pass/exchange that matches no deficient cell. `sign` exists solely to give
+  // size_targets_natural a per-bucket p_hat, so with no cell to size there is
+  // nothing to sample for -- skip the playout rather than pay for a bit no
+  // consumer reads. (Before that flag the caller's `nft == 0 -> continue`
+  // meant this could never be hit, which is what `return nft > 0` guarded.)
+  if (nft == 0) return true;
   if (g_pp_sign_cap < 0) return true;   // "never play out" -- always skip
   if (g_pp_sign_cap == 0 || g_pp_sign_count == NULL) return false;
   for (int i = 0; i < nft; i++) {
@@ -7141,6 +7148,8 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         if (pp_feat_fan_cache < 0)
           pp_feat_fan_cache = getenv("MAGPIE_PP_FEATURE_FANOUT") ? 1 : 0;
         const bool pp_feat_fan = pp_fan1 && pp_feat_fan_cache;
+        // Set inside the pp_fan1 block below; read again by the emission loop.
+        bool nonplay_fan = false;
         if (pp_fan1) {
           // Feature-fanout scans the full move list (rare keep-?? / keep-BB
           // plays are buried far below the top-512 by equity); the stratum-only
@@ -7155,6 +7164,38 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           // exemption: only 55.5% of catalogued positions and 79.0% of filled
           // positions yielded a pass row, 85.7% an exchange -- the design calls
           // for both from EVERY position.
+          //
+          // MAGPIE_PP_NONPLAY_FANOUT (default ON) goes further: EVERY pass and
+          // EVERY distinct exchange is recorded from EVERY position, with no
+          // deficient-cell gate at all. Two measurements forced this.
+          //
+          //   1. The cap exemption alone still left non-plays behind the
+          //      one-representative-per-deficient-cell pick, so once a K0/K1
+          //      cell reached target the position stopped emitting: measured on
+          //      bag 16, exchange coverage was 100% for the first 120K pool
+          //      positions and 71% after.
+          //   2. The pick keeps ONE exchange per leave LENGTH (7 cells,
+          //      K1_L0..L6) out of the ~99.9 distinct exchanges an average
+          //      7-tile rack offers. Which one is a uniform hash draw, so the
+          //      leave COMPOSITION inside each K1 bucket was a 1-in-14 sample --
+          //      keeping a J or a bag of duds showed up only by luck.
+          //
+          // Rows with no matching cell are emitted and recorded but credit
+          // nothing (the credit loops iterate ftgts[0..nft), so nft==0 is a
+          // no-op). The natural-ratio CI is therefore unchanged: stratum cells
+          // still bank one distinct position each via pp_credit_once, and the
+          // fill still terminates on the same condition. This only ADDS rows.
+          //
+          // Cost, measured: ~99.91 distinct exchanges/position (exact -- movegen
+          // walks canonical subsets, so a rack with multiplicities c_i yields
+          // prod(c_i+1)-1), against <=7 today. Bag 15 goes ~18.9M -> ~202M rows
+          // and its LABEL stage ~23m -> ~4h.
+          static _Thread_local int nonplay_fan_cache = -1;
+          if (nonplay_fan_cache < 0) {
+            const char *e = getenv("MAGPIE_PP_NONPLAY_FANOUT");
+            nonplay_fan_cache = (e && e[0] == '0') ? 0 : 1;
+          }
+          nonplay_fan = nonplay_fan_cache;
           const int fcap = pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX;
           const int nlim = nm < fcap ? nm : fcap;
           const int nscan = nm < PP_FEAT_MAX ? nm : PP_FEAT_MAX;
@@ -7168,6 +7209,10 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             // Plays stop at the equity cap; pass/exchange are scanned wherever
             // they land in the list.
             const bool pv_np = move_get_type(pv) != GAME_EVENT_TILE_PLACEMENT_MOVE;
+            // Under nonplay_fanout a pass/exchange needs no registration at all:
+            // the emission loop lets every non-play through on its type, so it
+            // is not bounded by pp_keep's PP_FEAT_MAX indexing either.
+            if (pv_np && nonplay_fan) continue;
             if (mm >= nlim && !pv_np) continue;
             char plf[RACK_SIZE + 2];
             pp_render_leave(pv, gr->game, plf, sizeof(plf));
@@ -7239,13 +7284,18 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           // PP_FEAT_MAX, so that is the real bound either way.
           if (pp_fan1) {
             const int kcap = pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX;
-            const bool m_np =
-                m < PP_FEAT_MAX &&
-                move_get_type(move_list_get_move(fan_ml, m)) !=
-                    GAME_EVENT_TILE_PLACEMENT_MOVE;
-            if (m >= PP_FEAT_MAX) continue;
-            if (!m_np && m >= kcap) continue;
-            if (!pp_keep[m]) continue;
+            const bool m_np = move_get_type(move_list_get_move(fan_ml, m)) !=
+                              GAME_EVENT_TILE_PLACEMENT_MOVE;
+            // nonplay_fanout: every pass/exchange passes on its type alone, at
+            // ANY index. pp_keep is only PP_FEAT_MAX wide and the registration
+            // loop only scans that far, so a non-play sitting deeper in the
+            // (heap-ordered, NOT equity-sorted) move list would otherwise be
+            // dropped -- which is how coverage fell to 71% before.
+            if (!(m_np && nonplay_fan)) {
+              if (m >= PP_FEAT_MAX) continue;
+              if (!m_np && m >= kcap) continue;
+              if (!pp_keep[m]) continue;
+            }
           }
           const Move *mv = move_list_get_move(fan_ml, m);
           if (pass_only && move_get_type(mv) != GAME_EVENT_PASS)
@@ -7322,7 +7372,16 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           } else if (ft != NULL) {
             nft = pp_match_force_cells(ft, gr->game, mv, on_idx, eff_diff,
                                        is_exch_mv, ftgts, PP_FT_MAX);
-            if (nft == 0) continue;
+            // nonplay_fanout: a pass/exchange is recorded even when it matches
+            // no deficient cell. Every credit loop below iterates ftgts[0..nft),
+            // so nft==0 records the row and banks nothing -- the cells still
+            // fill on distinct positions and the fill's stop condition is
+            // untouched. Plays keep the old gate (no point paying for a playout
+            // on a satisfied cell when the next position offers another).
+            if (nft == 0 &&
+                !(nonplay_fan &&
+                  move_get_type(mv) != GAME_EVENT_TILE_PLACEMENT_MOVE))
+              continue;
             if (index_build) {
               // Stage-1 SIGN-AWARE catalog: HastyBot-play the position out (endgame
               // OFF -> pure greedy playout returning a real win/loss) to record the
