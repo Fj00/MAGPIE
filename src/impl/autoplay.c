@@ -7146,15 +7146,29 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           // plays are buried far below the top-512 by equity); the stratum-only
           // path keeps the 512 cap (a representative play is all declustering
           // needs, and the deep tail would only add solves).
+          //
+          // PASS and EXCHANGE are exempt from that cap. They are not plays and
+          // must not compete for a slot in the play window: there is exactly one
+          // pass per position and a handful of exchanges, they carry their own
+          // strata (K0/K1), and dropping one costs a whole coefficient rather
+          // than one of many interchangeable candidates. Measured before this
+          // exemption: only 55.5% of catalogued positions and 79.0% of filled
+          // positions yielded a pass row, 85.7% an exchange -- the design calls
+          // for both from EVERY position.
           const int fcap = pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX;
           const int nlim = nm < fcap ? nm : fcap;
-          for (int mm = 0; mm < nlim; mm++) pp_keep[mm] = false;
+          const int nscan = nm < PP_FEAT_MAX ? nm : PP_FEAT_MAX;
+          for (int mm = 0; mm < nscan; mm++) pp_keep[mm] = false;
           int rc_ord[PP_FEAT_MAX];
           uint64_t rc_h[PP_FEAT_MAX];
           int rc_m[PP_FEAT_MAX];
           int rc_n = 0;
-          for (int mm = 0; mm < nlim; mm++) {
+          for (int mm = 0; mm < nscan; mm++) {
             const Move *pv = move_list_get_move(fan_ml, mm);
+            // Plays stop at the equity cap; pass/exchange are scanned wherever
+            // they land in the list.
+            const bool pv_np = move_get_type(pv) != GAME_EVENT_TILE_PLACEMENT_MOVE;
+            if (mm >= nlim && !pv_np) continue;
             char plf[RACK_SIZE + 2];
             pp_render_leave(pv, gr->game, plf, sizeof(plf));
             if ((int)strlen(plf) > 7) continue;
@@ -7220,9 +7234,19 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         for (int oi = 0; oi < pp_iter_n &&
                          (all_plays || nseen < PP_FANOUT_MAX); oi++) {
           const int m = all_plays ? oi : rr_order[oi];
-          if (pp_fan1 && (m >= (pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX) ||
-                          !pp_keep[m]))
-            continue;
+          // Mirror the registration exemption: the play cap must not discard a
+          // pass/exchange that pp_keep marked from beyond it. pp_keep is sized
+          // PP_FEAT_MAX, so that is the real bound either way.
+          if (pp_fan1) {
+            const int kcap = pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX;
+            const bool m_np =
+                m < PP_FEAT_MAX &&
+                move_get_type(move_list_get_move(fan_ml, m)) !=
+                    GAME_EVENT_TILE_PLACEMENT_MOVE;
+            if (m >= PP_FEAT_MAX) continue;
+            if (!m_np && m >= kcap) continue;
+            if (!pp_keep[m]) continue;
+          }
           const Move *mv = move_list_get_move(fan_ml, m);
           if (pass_only && move_get_type(mv) != GAME_EVENT_PASS)
             continue;  // pass-only relabel: skip plays/exchanges
