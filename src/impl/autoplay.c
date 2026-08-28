@@ -5982,11 +5982,24 @@ static void pp_render_leave(const Move *move, const Game *game, char *out,
 }
 
 #define PP_FANOUT_MAX 512  // max distinct (kind,score,leave) branches per rack
-// MAGPIE_PP_FEATURE_FANOUT scans the WHOLE equity-sorted move list (fan_ml is
-// created at 8192), not just the top-512: a rare-leave play (keep-??, keep BB)
-// is low-equity and buried far below the rack's bingos, so the 512 cap hides it.
+// MAGPIE_PP_FEATURE_FANOUT scans the WHOLE move list, not just the top-512: a
+// rare-leave play (keep-??, keep BB) is low-equity and buried far below the
+// rack's bingos, so the 512 cap hides it. NB "equity-sorted" is wrong and was
+// wrong when written -- fan_ml is a max-HEAP (move_list_insert_spare_move
+// up-heapifies; move_list_sort_moves is never called on this path), so only
+// moves[0] is the best and index order is otherwise arbitrary. That is why the
+// 512 window cut exchanges in a way that looked like an equity effect but was
+// not: pre-exemption, blank racks recorded the throw-the-blank keep-6 exchange
+// 96.8% of the time, where a uniform pick gives 6/7 = 85.7%.
 #define PP_FEAT_MAX 8192
 #define PP_FT_MAX 32       // max force cells credited per fan-out branch
+// Distinct force cells one position's exchange set can register against: a
+// 6-tile leave alone gives 1 stratum + 6 leave_count + 15 leave_pair, and a
+// full rack offers up to 127 exchanges. 4096 is slack over the observed union.
+#define PP_XC_MAX 4096
+// Exchange picks kept per position, bounded by the number of distinct
+// exchanges a 7-tile rack can produce (2^7 - 1 = 127).
+#define PP_XPICK_MAX 128
 
 // Match a fan-out move's force-table cells: leave cells (stratum/tile/pair via
 // the tile-bitmap predicate) + bag_tile cells (via the pre-move-rack predicate).
@@ -7150,6 +7163,13 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         const bool pp_feat_fan = pp_fan1 && pp_feat_fan_cache;
         // Set inside the pp_fan1 block below; read again by the emission loop.
         bool nonplay_fan = false;
+        bool exch_feat = false;
+        // Exchange picks, by move index. Not pp_keep: an exchange can sit past
+        // PP_FEAT_MAX in the heap-ordered move list. At most one entry per
+        // distinct exchange the rack offers (<=127), so the emission loop's
+        // linear membership test runs <=127 times per position.
+        int xpick[PP_XPICK_MAX];
+        int n_xpick = 0;
         if (pp_fan1) {
           // Feature-fanout scans the full move list (rare keep-?? / keep-BB
           // plays are buried far below the top-512 by equity); the stratum-only
@@ -7165,46 +7185,58 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           // positions yielded a pass row, 85.7% an exchange -- the design calls
           // for both from EVERY position.
           //
-          // MAGPIE_PP_NONPLAY_FANOUT (default ON) goes further: EVERY pass and
-          // EVERY distinct exchange is recorded from EVERY position, with no
-          // deficient-cell gate at all. Two measurements forced this.
+          // MAGPIE_PP_NONPLAY_FANOUT (default ON) goes further, and PASS and
+          // EXCHANGE are handled differently under it because they are
+          // different problems.
           //
-          //   1. The cap exemption alone still left non-plays behind the
-          //      one-representative-per-deficient-cell pick, so once a K0/K1
-          //      cell reached target the position stopped emitting: measured on
-          //      bag 16, exchange coverage was 100% for the first 120K pool
-          //      positions and 71% after.
-          //   2. The pick keeps ONE exchange per leave LENGTH (7 cells,
-          //      K1_L0..L6) out of the ~99.9 distinct exchanges an average
-          //      7-tile rack offers. Which one is a uniform hash draw, so the
-          //      leave COMPOSITION inside each K1 bucket was a 1-in-14 sample --
-          //      keeping a J or a bag of duds showed up only by luck.
+          // PASS is unconditional: one per position, no deficient-cell gate.
+          // There is exactly one pass available and it is the baseline every
+          // other move is judged against, so it costs one row and dropping it
+          // costs a whole coefficient. With only the cap exemption it was still
+          // behind the one-representative-per-deficient-cell pick, so a position
+          // stopped emitting it once K0_L7 reached target -- measured on bag 16,
+          // coverage was 100% for the first 120K pool positions and 71% after.
           //
-          // Rows with no matching cell are emitted and recorded but credit
-          // nothing (the credit loops iterate ftgts[0..nft), so nft==0 is a
-          // no-op). The natural-ratio CI is therefore unchanged: stratum cells
-          // still bank one distinct position each via pp_credit_once, and the
-          // fill still terminates on the same condition. This only ADDS rows.
+          // EXCHANGE is force-table-driven, exactly like a play. Recording all
+          // of them was overkill: ~99.91 distinct exchanges per position (exact
+          // -- movegen walks canonical subsets, so multiplicities c_i give
+          // prod(c_i+1)-1), which took bag 15 from ~18.9M to ~202M rows and its
+          // LABEL stage from ~23m to ~4h, most of it re-measuring leaves that
+          // were already covered.
           //
-          // Cost, measured: ~99.91 distinct exchanges/position (exact -- movegen
-          // walks canonical subsets, so a rack with multiplicities c_i yields
-          // prod(c_i+1)-1), against <=7 today. Bag 15 goes ~18.9M -> ~202M rows
-          // and its LABEL stage ~23m -> ~4h.
+          // The reason the ordinary pick gave only 7 was NOT a cap. An exchange
+          // registers against the cells pp_match_force_cells says it would
+          // credit, and the filter below dropped every non-STRATUM cell unless
+          // MAGPIE_PP_FEATURE_FANOUT was set. The exchange STRATA are just
+          // K1_L0..K1_L6 -- seven cells, distinguished by leave LENGTH and
+          // nothing else -- so one-per-cell is seven, and which of the ~14
+          // same-length candidates you got was a uniform hash draw. The cells
+          // that actually distinguish WHICH leave (leave_count_J, leave_pair_QZ,
+          // ...) were invisible to it.
+          //
+          // So exchanges register against their FEATURE cells too, always, not
+          // only under FEATURE_FANOUT. Feature rows carry their own `exchange`
+          // column (bag 15's residual: 42,767 rows at exchange=0 and 49,707 at
+          // exchange=1), so plays and exchanges never contend for the same
+          // feature cell. The count per position is then whatever the force
+          // table still needs -- larger early, decaying to ~7 as the rare-leave
+          // cells fill -- instead of a fixed 7 or a fixed 100.
+          //
+          // Rows matching no cell are still emitted for PASS only; an exchange
+          // that resolves nothing is skipped, same as a play.
           //
           // NOT in the catalog (index_build). NAT-CAT exists to count, per
           // cell, how many DISTINCT POSITIONS could supply it and what their
           // p_hat is -- both per-position quantities that one representative
-          // answers exactly as well as a hundred. Fanning there would have
-          // written 24.1M x ~100 = 2.4 BILLION rows (~144 GB) for bag 15 and
-          // changed neither nat_supply_pos nor the sizing. The cap exemption
-          // still applies to it, so the catalog keeps its pass/exchange
-          // coverage; only the fill pays for the full enumeration.
+          // answers exactly as well as a hundred. The cap exemption still
+          // applies to it, so the catalog keeps its pass/exchange coverage.
           static _Thread_local int nonplay_fan_cache = -1;
           if (nonplay_fan_cache < 0) {
             const char *e = getenv("MAGPIE_PP_NONPLAY_FANOUT");
             nonplay_fan_cache = (e && e[0] == '0') ? 0 : 1;
           }
           nonplay_fan = nonplay_fan_cache && !index_build;
+          exch_feat = nonplay_fan;
           const int fcap = pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX;
           const int nlim = nm < fcap ? nm : fcap;
           const int nscan = nm < PP_FEAT_MAX ? nm : PP_FEAT_MAX;
@@ -7218,9 +7250,9 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             // Plays stop at the equity cap; pass/exchange are scanned wherever
             // they land in the list.
             const bool pv_np = move_get_type(pv) != GAME_EVENT_TILE_PLACEMENT_MOVE;
-            // Under nonplay_fanout a pass/exchange needs no registration at all:
-            // the emission loop lets every non-play through on its type, so it
-            // is not bounded by pp_keep's PP_FEAT_MAX indexing either.
+            // A pass needs no registration -- the emission loop lets it through
+            // on its type -- and an exchange is registered by the separate pass
+            // below, which scans the whole list and takes feature cells too.
             if (pv_np && nonplay_fan) continue;
             if (mm >= nlim && !pv_np) continue;
             char plf[RACK_SIZE + 2];
@@ -7284,6 +7316,79 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             }
           }
           for (int r = 0; r < rc_n; r++) pp_keep[rc_m[r]] = true;
+
+          // EXCHANGES: the same deficient-cell pick a play gets, with two
+          // differences forced by what an exchange is.
+          //
+          //   - scanned over the WHOLE move list. fan_ml is a max-HEAP, not a
+          //     sorted array (move_list_insert_spare_move up-heapifies and
+          //     move_list_sort_moves is never called on this path), so a
+          //     low-equity exchange can sit at any index, well past pp_keep's
+          //     PP_FEAT_MAX width. Picks go in xpick[] instead, which the
+          //     emission loop consults only for exchange moves -- at most ~127
+          //     of them per position, so the linear membership test is cheap.
+          //
+          //   - registered against FEATURE cells, not just strata. This is the
+          //     whole point: the exchange strata are K1_L0..K1_L6, seven cells
+          //     keyed on leave LENGTH, so a stratum-only pick can never yield
+          //     more than seven and cannot tell keeping AEINRT from keeping
+          //     JQVWXZ. leave_count_* / leave_pair_* cells can, and feature
+          //     rows carry their own `exchange` column, so an exchange and a
+          //     play never contend for the same one.
+          //
+          // The result is self-limiting: a position emits as many exchanges as
+          // the force table still has open cells for, which is large in the
+          // early pool and decays toward seven as the rare-leave cells close.
+          if (exch_feat) {
+            int xc_ord[PP_XC_MAX];
+            uint64_t xc_h[PP_XC_MAX];
+            int xc_m[PP_XC_MAX];
+            int xc_n = 0;
+            for (int mm = 0; mm < nm; mm++) {
+              const Move *pv = move_list_get_move(fan_ml, mm);
+              if (move_get_type(pv) != GAME_EVENT_EXCHANGE) continue;
+              char plf[RACK_SIZE + 2];
+              pp_render_leave(pv, gr->game, plf, sizeof(plf));
+              if ((int)strlen(plf) > 7) continue;
+              ForceTarget *mt[PP_FT_MAX];
+              // An exchange scores 0, so eff_diff is the position's pre_diff.
+              const int mn = pp_match_force_cells(ft, gr->game, pv, on_idx,
+                                                  pre_diff, true, mt,
+                                                  PP_FT_MAX);
+              for (int k = 0; k < mn; k++) {
+                const int cord = force_table_target_index(ft, mt[k]);
+                const uint64_t h = pp_splitmix64(
+                    ((uint64_t)pos_id << 20) ^ ((uint64_t)(uint32_t)cord << 1) ^
+                    (uint64_t)(uint32_t)mm);
+                int slot = -1;
+                for (int r = 0; r < xc_n; r++)
+                  if (xc_ord[r] == cord) {
+                    slot = r;
+                    break;
+                  }
+                if (slot < 0) {
+                  if (xc_n < PP_XC_MAX) {
+                    xc_ord[xc_n] = cord;
+                    xc_h[xc_n] = h;
+                    xc_m[xc_n] = mm;
+                    xc_n++;
+                  }
+                } else if (h < xc_h[slot]) {
+                  xc_h[slot] = h;
+                  xc_m[slot] = mm;
+                }
+              }
+            }
+            for (int r = 0; r < xc_n && n_xpick < PP_XPICK_MAX; r++) {
+              bool dup = false;
+              for (int q = 0; q < n_xpick; q++)
+                if (xpick[q] == xc_m[r]) {
+                  dup = true;
+                  break;
+                }
+              if (!dup) xpick[n_xpick++] = xc_m[r];
+            }
+          }
         }
         for (int oi = 0; oi < pp_iter_n &&
                          (all_plays || nseen < PP_FANOUT_MAX); oi++) {
@@ -7293,14 +7398,23 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           // PP_FEAT_MAX, so that is the real bound either way.
           if (pp_fan1) {
             const int kcap = pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX;
-            const bool m_np = move_get_type(move_list_get_move(fan_ml, m)) !=
-                              GAME_EVENT_TILE_PLACEMENT_MOVE;
-            // nonplay_fanout: every pass/exchange passes on its type alone, at
-            // ANY index. pp_keep is only PP_FEAT_MAX wide and the registration
-            // loop only scans that far, so a non-play sitting deeper in the
-            // (heap-ordered, NOT equity-sorted) move list would otherwise be
-            // dropped -- which is how coverage fell to 71% before.
-            if (!(m_np && nonplay_fan)) {
+            const game_event_t mty = move_get_type(move_list_get_move(fan_ml, m));
+            const bool m_pass = mty == GAME_EVENT_PASS;
+            const bool m_exch = mty == GAME_EVENT_EXCHANGE;
+            if (m_pass && nonplay_fan) {
+              // unconditional: one pass per position, no cell gate
+            } else if (m_exch && exch_feat) {
+              // force-table-driven, but keyed on xpick rather than pp_keep so
+              // it is not bounded by PP_FEAT_MAX. Only exchanges reach here.
+              bool picked = false;
+              for (int q = 0; q < n_xpick; q++)
+                if (xpick[q] == m) {
+                  picked = true;
+                  break;
+                }
+              if (!picked) continue;
+            } else {
+              const bool m_np = m_pass || m_exch;
               if (m >= PP_FEAT_MAX) continue;
               if (!m_np && m >= kcap) continue;
               if (!pp_keep[m]) continue;
@@ -7381,15 +7495,16 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           } else if (ft != NULL) {
             nft = pp_match_force_cells(ft, gr->game, mv, on_idx, eff_diff,
                                        is_exch_mv, ftgts, PP_FT_MAX);
-            // nonplay_fanout: a pass/exchange is recorded even when it matches
-            // no deficient cell. Every credit loop below iterates ftgts[0..nft),
-            // so nft==0 records the row and banks nothing -- the cells still
-            // fill on distinct positions and the fill's stop condition is
-            // untouched. Plays keep the old gate (no point paying for a playout
-            // on a satisfied cell when the next position offers another).
+            // A PASS is recorded even when it matches no deficient cell. Every
+            // credit loop below iterates ftgts[0..nft), so nft==0 records the
+            // row and banks nothing -- the cells still fill on distinct
+            // positions and the fill's stop condition is untouched.
+            //
+            // Exchanges and plays keep the gate: both are picked BECAUSE they
+            // resolve an open cell, so one that resolves nothing is not worth a
+            // playout when the next position offers another.
             if (nft == 0 &&
-                !(nonplay_fan &&
-                  move_get_type(mv) != GAME_EVENT_TILE_PLACEMENT_MOVE))
+                !(nonplay_fan && move_get_type(mv) == GAME_EVENT_PASS))
               continue;
             if (index_build) {
               // Stage-1 SIGN-AWARE catalog: HastyBot-play the position out (endgame
