@@ -129,6 +129,19 @@ static _Atomic uint64_t g_eb_l3plus_outer_loop = 0;
 // Per-priority gate matched count at length>=3
 static _Atomic uint64_t g_eb_l3p_gate_match_by_prio[4] = {0};
 static _Atomic uint64_t g_eb_l3p_gate_iter_by_prio[4] = {0};
+// Pass/exchange scan window on the non-feature fan-out path; see the notes at
+// PP_FANOUT_MAX. Defined here because the end-of-run summary prints it.
+#define PP_FEAT_MAX 8192
+// Feature fan-out move-list coverage, by blanks on the mover's rack (0,1,2+).
+// pos: positions fanned; nm: moves generated; over: positions whose list was
+// longer than PP_FEAT_MAX; trunc: positions where some moves were NOT scanned.
+// trunc must read 0 -- a nonzero value means rare-leave cells can come up
+// short while every position was visited, which the fill script's
+// positions-scanned check cannot see.
+static _Atomic uint64_t g_pp_feat_pos[3] = {0};
+static _Atomic uint64_t g_pp_feat_nm[3] = {0};
+static _Atomic uint64_t g_pp_feat_over[3] = {0};
+static _Atomic uint64_t g_pp_feat_trunc[3] = {0};
 // Benchmark instrumentation: accumulates total sim iterations across all
 // turns in all games. Read/reset via autoplay_get_total_sim_iterations().
 static _Atomic uint64_t autoplay_total_sim_iterations;
@@ -1429,6 +1442,18 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
   }
   prng_destroy(shared_data->prng);
   leavegen_shared_data_destroy(shared_data->leavegen_shared_data);
+  if (g_pp_feat_pos[0] + g_pp_feat_pos[1] + g_pp_feat_pos[2] > 0) {
+    for (int b = 0; b < 3; b++) {
+      const uint64_t np = g_pp_feat_pos[b];
+      fprintf(stderr,
+              "feature_fanout: blanks=%d%s positions=%llu mean_moves=%.0f "
+              "over_%d=%llu truncated=%llu\n",
+              b, b == 2 ? "+" : "", (unsigned long long)np,
+              np ? (double)g_pp_feat_nm[b] / (double)np : 0.0, PP_FEAT_MAX,
+              (unsigned long long)g_pp_feat_over[b],
+              (unsigned long long)g_pp_feat_trunc[b]);
+    }
+  }
   if (shared_data->force_table) {
     fprintf(stderr, "force_table: remaining deficit = %lld across %d targets\n",
             (long long)force_table_total_remaining(shared_data->force_table),
@@ -5991,7 +6016,16 @@ static void pp_render_leave(const Move *move, const Game *game, char *out,
 // 512 window cut exchanges in a way that looked like an equity effect but was
 // not: pre-exemption, blank racks recorded the throw-the-blank keep-6 exchange
 // 96.8% of the time, where a uniform pick gives 6/7 = 85.7%.
-#define PP_FEAT_MAX 8192
+//
+// That first sentence was also false for PLAYS until 2026-09-16: the play
+// registration and emission loops both stopped at index PP_FEAT_MAX, so on a
+// long list only an arbitrary 8192-move slice was ever eligible. A double-blank
+// rack generates far more than 8192 moves, most of them using a blank, so the
+// keep-?? plays were mostly invisible -- `pair ??` feature cells came up short
+// at bags 20-24 with 112K double-blank positions available, and were logged as
+// supply-limited. Under feature fan-out the window is now the full list
+// (MAGPIE_PP_FEAT_LEGACY_CAP=1 restores the old window, for A/B only).
+// PP_FEAT_MAX (defined near the globals) still bounds the non-feature path.
 #define PP_FT_MAX 32       // max force cells credited per fan-out branch
 // Distinct force cells one position's exchange set can register against: a
 // 6-tile leave alone gives 1 stratum + 6 leave_count + 15 leave_pair, and a
@@ -7146,7 +7180,12 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         // equity order, so it doesn't skew toward best-plays. Feature-only
         // deficient plays are still kept (count-based coverage). index_build
         // (catalog) still sees ALL plays -- it needs full sign/supply coverage.
-        static _Thread_local bool pp_keep[PP_FEAT_MAX];
+        // Sized to the scanned window, which under feature fan-out is the whole
+        // move list (up to vm_cap). Grown on demand, never shrunk; pp_keep_n is
+        // how many entries are valid for THIS position.
+        static _Thread_local bool *pp_keep = NULL;
+        static _Thread_local int pp_keep_cap = 0;
+        int pp_keep_n = 0;
         // Applies to BOTH the paired solve path (declusters the base rate) and
         // the index_build catalog (the scout only needs one HastyBot sign per
         // cell per position for p-hat + supply; ~9x fewer playouts + a ~9x
@@ -7237,10 +7276,34 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           }
           nonplay_fan = nonplay_fan_cache && !index_build;
           exch_feat = nonplay_fan;
-          const int fcap = pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX;
+          static _Thread_local int feat_legacy_cap = -1;
+          if (feat_legacy_cap < 0) {
+            const char *e = getenv("MAGPIE_PP_FEAT_LEGACY_CAP");
+            feat_legacy_cap = (e && e[0] == '1') ? 1 : 0;
+          }
+          const int capped = nm < PP_FEAT_MAX ? nm : PP_FEAT_MAX;
+          // Feature fan-out: every move is eligible. Stratum-only: plays stop at
+          // PP_FANOUT_MAX by design, pass/exchange at PP_FEAT_MAX.
+          const int feat_win = feat_legacy_cap ? capped : nm;
+          const int fcap = pp_feat_fan ? feat_win : PP_FANOUT_MAX;
           const int nlim = nm < fcap ? nm : fcap;
-          const int nscan = nm < PP_FEAT_MAX ? nm : PP_FEAT_MAX;
+          const int nscan = pp_feat_fan ? feat_win : capped;
+          if (nscan > pp_keep_cap) {
+            pp_keep = realloc_or_die(pp_keep, sizeof(bool) * (size_t)nscan);
+            pp_keep_cap = nscan;
+          }
           for (int mm = 0; mm < nscan; mm++) pp_keep[mm] = false;
+          pp_keep_n = nscan;
+          if (pp_feat_fan) {
+            int nb = rack_get_letter(
+                player_get_rack(game_get_player(gr->game, on_idx)),
+                BLANK_MACHINE_LETTER);
+            if (nb > 2) nb = 2;
+            g_pp_feat_pos[nb]++;
+            g_pp_feat_nm[nb] += (uint64_t)nm;
+            if (nm > PP_FEAT_MAX) g_pp_feat_over[nb]++;
+            if (nscan < nm) g_pp_feat_trunc[nb]++;
+          }
           int rc_ord[PP_FEAT_MAX];
           uint64_t rc_h[PP_FEAT_MAX];
           int rc_m[PP_FEAT_MAX];
@@ -7394,10 +7457,10 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
                          (all_plays || nseen < PP_FANOUT_MAX); oi++) {
           const int m = all_plays ? oi : rr_order[oi];
           // Mirror the registration exemption: the play cap must not discard a
-          // pass/exchange that pp_keep marked from beyond it. pp_keep is sized
-          // PP_FEAT_MAX, so that is the real bound either way.
+          // pass/exchange that pp_keep marked from beyond it. pp_keep_n (the
+          // scanned window) is the real bound either way.
           if (pp_fan1) {
-            const int kcap = pp_feat_fan ? PP_FEAT_MAX : PP_FANOUT_MAX;
+            const int kcap = pp_feat_fan ? pp_keep_n : PP_FANOUT_MAX;
             const game_event_t mty = move_get_type(move_list_get_move(fan_ml, m));
             const bool m_pass = mty == GAME_EVENT_PASS;
             const bool m_exch = mty == GAME_EVENT_EXCHANGE;
@@ -7415,7 +7478,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
               if (!picked) continue;
             } else {
               const bool m_np = m_pass || m_exch;
-              if (m >= PP_FEAT_MAX) continue;
+              if (m >= pp_keep_n) continue;
               if (!m_np && m >= kcap) continue;
               if (!pp_keep[m]) continue;
             }
