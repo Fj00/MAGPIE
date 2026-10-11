@@ -516,6 +516,26 @@ void vmodel_turn_cache_begin(VModelTurnCache *c, const VModel *m,
     if (unseen_vec) memcpy(c->unseen, unseen_vec, sizeof(c->unseen));
 }
 
+// Bucket for `diff` by binary search, falling back to the reference linear scan
+// whenever the search does not land inside a bucket. vmodel_bucket_index scans
+// all ~60-95 buckets per call; buckets are contiguous diff ranges in ascending
+// order, so ~7 comparisons suffice. If the search misses (unsorted buckets, or a
+// gap) the fallback returns exactly what the linear scan would. Overlapping
+// buckets are the one case where the two could differ -- the scan takes the
+// FIRST match, the search any match -- and the layout never produces them;
+// MAGPIE_VMODEL_CACHE_VERIFY compares against the untouched reference scan.
+static int vmtc_bucket_index(const VStratum *s, int diff) {
+    int lo = 0, hi = s->n_buckets - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        const VBucket *b = &s->buckets[mid];
+        if (diff < b->diff_lo) hi = mid - 1;
+        else if (diff > b->diff_hi) lo = mid + 1;
+        else return mid;
+    }
+    return vmodel_bucket_index(s, diff);
+}
+
 static uint64_t vmtc_mix(uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -575,7 +595,7 @@ float vmodel_turn_cache_predict(VModelTurnCache *c,
         return vmodel_predict(m, c->rack, c->rack_len, leave_indices, leave_len,
                               kind, diff, m->turn, uv, c->sl);
     }
-    int bi = vmodel_bucket_index(s, diff);
+    int bi = vmtc_bucket_index(s, diff);
     if (bi < 0) {
         return vmodel_predict(m, c->rack, c->rack_len, leave_indices, leave_len,
                               kind, diff, m->turn, uv, c->sl);
