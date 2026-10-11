@@ -2566,6 +2566,14 @@ void vmodel_log_stats(void) {
               (unsigned long long)sc, (unsigned long long)sp,
               100.0 * (double)sp / (double)sc);
     }
+    const uint64_t zc = atomic_load_explicit(&g_vmtc_sparse_checks, memory_order_relaxed);
+    if (zc) {
+      fprintf(stderr,
+              "vmodel: SPARSE VERIFY: cache misses %llu, z0 not bit-identical %llu\n",
+              (unsigned long long)zc,
+              (unsigned long long)atomic_load_explicit(&g_vmtc_sparse_mismatch,
+                                                       memory_order_relaxed));
+    }
   }
   {
     const uint64_t ts = atomic_load_explicit(&g_term_standard, memory_order_relaxed);

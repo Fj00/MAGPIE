@@ -1,6 +1,7 @@
 #include "vmodel_features.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -465,10 +466,23 @@ float vmodel_predict(const VModel *m,
 // more than this falls back to vmodel_predict rather than overflowing.
 #define VMTC_MAXB 128
 
+// Nonzero leave-block features per leave: the static leave value, at most 7
+// tile counts and 21 pair counts for a 7-tile leave. Room to spare; a leave
+// that somehow needs more takes the dense path.
+#define VMTC_MAXSP 40
+
 typedef struct {
     uint64_t key;              // packed (kind, len, sorted leave); 0 = empty
     uint32_t gen;              // valid iff == cache->gen
     int16_t  si;               // stratum index, or -1 if none
+    // Sparse leave block, filled when the slot is claimed: the NONZERO features
+    // among [static leave value, tile counts, pair counts] as (offset into the
+    // block, value), in ascending offset order. sp_n < 0: use the dense path.
+    int16_t  sp_n;
+    uint16_t sp_len;                // full (dense) length of the leave block
+    uint16_t sp_off[VMTC_MAXSP];
+    float    sp_val[VMTC_MAXSP];
+    uint8_t  leave_counts[27];
     uint32_t bgen[VMTC_MAXB];  // bucket entry valid iff == cache->gen
     double   z0[VMTC_MAXB];    // intercept + sum over all features but diff
 } VMTCSlot;
@@ -481,10 +495,15 @@ struct VModelTurnCache {
     int rack_len;
     int unseen[27];
     bool has_unseen;
+    uint8_t rack_counts[27];
+    int unseen_total;
     VMTCSlot *slots;
 };
 
 static _Thread_local VModelTurnCache *tl_vmtc = NULL;
+
+_Atomic uint64_t g_vmtc_sparse_checks = 0;
+_Atomic uint64_t g_vmtc_sparse_mismatch = 0;
 
 VModelTurnCache *vmodel_turn_cache_get(void) {
     if (!tl_vmtc) {
@@ -514,6 +533,58 @@ void vmodel_turn_cache_begin(VModelTurnCache *c, const VModel *m,
     c->rack_len = rack_len;
     c->has_unseen = unseen_vec != NULL;
     if (unseen_vec) memcpy(c->unseen, unseen_vec, sizeof(c->unseen));
+    count_tiles(c->rack, c->rack_len, c->rack_counts);
+    c->unseen_total = 0;
+    if (unseen_vec) {
+        for (int t = 0; t < 27; t++) c->unseen_total += c->unseen[t];
+    }
+}
+
+// Fill the slot's sparse leave block (see VMTCSlot). Mirrors the leave part of
+// vmodel_extract_features feature for feature, keeping only the nonzero ones;
+// a zero feature contributes exactly 0 to the dot product, so skipping it
+// leaves the sum bit-identical as long as the remaining terms are added in the
+// same order.
+static void vmtc_fill_sparse(VMTCSlot *slot, const VStratum *s,
+                             const uint8_t *leave_indices, int leave_len,
+                             const StaticLeaves *sl) {
+    count_tiles(leave_indices, leave_len, slot->leave_counts);
+    const uint8_t *lc = slot->leave_counts;
+    int n = 0, off = 0;
+    bool ok = true;
+#define VMTC_PUSH(v)                                                  \
+    do {                                                              \
+        float v_ = (v);                                               \
+        if (v_ != 0.0f) {                                             \
+            if (n >= VMTC_MAXSP) ok = false;                          \
+            else { slot->sp_off[n] = (uint16_t)off; slot->sp_val[n] = v_; n++; } \
+        }                                                             \
+        off++;                                                        \
+    } while (0)
+    if (s->leave_length > 0) {
+        uint8_t canon[STATIC_LEAVES_MAX_LEN];
+        static_leaves_canonicalize(leave_indices, leave_len, canon);
+        VMTC_PUSH(static_leaves_lookup(sl, canon, leave_len));
+    }
+    if (s->leave_length == 1) {
+        for (int i = 0; i < s->n_tiles; i++)
+            VMTC_PUSH((lc[s->tiles[i]] > 0) ? 1.0f : 0.0f);
+    } else if (s->leave_length >= 2) {
+        if (s->leave_length >= 3) {
+            for (int i = 0; i < s->n_tiles; i++)
+                VMTC_PUSH((float)lc[s->tiles[i]]);
+        }
+        for (int i = 0; i < s->n_pairs; i++) {
+            uint8_t a = s->pairs[i][0];
+            uint8_t bb = s->pairs[i][1];
+            int na = lc[a];
+            int v = (a == bb) ? na * (na - 1) / 2 : na * (int)lc[bb];
+            VMTC_PUSH((float)v);
+        }
+    }
+#undef VMTC_PUSH
+    slot->sp_n = ok ? (int16_t)n : -1;
+    slot->sp_len = (uint16_t)off;
 }
 
 // Bucket for `diff` by binary search, falling back to the reference linear scan
@@ -541,6 +612,62 @@ static uint64_t vmtc_mix(uint64_t x) {
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
     x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
     return x ^ (x >> 31);
+}
+
+// z0 for a (leave, bucket) miss without building the dense feature vector. The
+// leave block is ~400 features (tiles + 373 pairs) of which at most ~29 are
+// nonzero, and the dense path multiplied every one. Same terms in the same
+// order as the dense path, zeros skipped, so the result is bit-identical.
+// Returns false where it does not apply (unseen-pair blocks, no unseen vector,
+// pass strata, a leave block too dense, a shape mismatch); the caller then takes
+// the dense path.
+static bool vmtc_z0_sparse(VModelTurnCache *c, const VStratum *s,
+                           const VBucket *b, VMTCSlot *slot,
+                           const uint8_t *leave_indices, int leave_len,
+                           double *out) {
+    if (c->m->play_unseen != 0 || !c->has_unseen || s->kind == 0) return false;
+    if (slot->sp_n == -2) vmtc_fill_sparse(slot, s, leave_indices, leave_len, c->sl);
+    if (slot->sp_n < 0) return false;
+    const int off = b->has_diff ? 1 : 0;
+    bool ind_mask[27] = {0};
+    int n_masked = 0;
+    for (int i = 0; i < b->n_bag; i++) {
+        uint8_t t = b->bag_tiles[i];
+        if (t >= 27) return false;
+        if (!ind_mask[t]) { ind_mask[t] = true; n_masked++; }
+    }
+    const int n_expect = off + slot->sp_len + (27 - n_masked) + b->n_bag +
+                         (s->kind == 1 ? 27 : 0);
+    if (n_expect != b->n_coefs) return false;
+
+    const float *cf = b->coefs;
+    double z0 = b->intercept;
+    for (int k = 0; k < slot->sp_n; k++) {
+        z0 += (double)slot->sp_val[k] * (double)cf[off + slot->sp_off[k]];
+    }
+    int wi = off + slot->sp_len;
+    const int ut = c->unseen_total;
+    const int tp = (ut > 0) ? tiles_played_count(ut, s->leave_length) : 0;
+    for (int t = 0; t < 27; t++) {
+        if (ind_mask[t]) continue;
+        float bv = 0.0f;
+        if (ut > 0 && tp > 0) {
+            bv = (float)((double)tp * (double)c->unseen[t] / (double)ut);
+        }
+        z0 += (double)bv * (double)cf[wi++];
+    }
+    for (int i = 0; i < b->n_bag; i++) {
+        float v = (c->unseen[b->bag_tiles[i]] == (int)b->bag_counts[i]) ? 1.0f : 0.0f;
+        z0 += (double)v * (double)cf[wi++];
+    }
+    if (s->kind == 1) {
+        for (int t = 0; t < 27; t++) {
+            int exch = (int)c->rack_counts[t] - (int)slot->leave_counts[t];
+            z0 += (double)(float)exch * (double)cf[wi++];
+        }
+    }
+    *out = z0;
+    return true;
 }
 
 float vmodel_turn_cache_predict(VModelTurnCache *c,
@@ -579,6 +706,7 @@ float vmodel_turn_cache_predict(VModelTurnCache *c,
             VModelLeaveType lt = vmodel_classify_leave(leave_indices, leave_len);
             cand->si = (int16_t)vmodel_stratum_index(m, kind, leave_len, lt,
                                                      m->turn);
+            cand->sp_n = -2;  // sparse leave block not built yet
             slot = cand;
             break;
         }
@@ -602,16 +730,39 @@ float vmodel_turn_cache_predict(VModelTurnCache *c,
     }
     const VBucket *b = &s->buckets[bi];
     if (slot->bgen[bi] != c->gen) {
-        float feats[1024];
-        int n = vmodel_extract_features(feats, (int)(sizeof(feats) / sizeof(feats[0])),
-                                        s, b, c->rack, c->rack_len,
-                                        leave_indices, leave_len,
-                                        0, m->bag, m->turn, uv,
-                                        m->play_unseen, m->pass_unseen, c->sl);
-        if (n < 0) return -1.0f;
-        double z0 = b->intercept;
-        for (int i = b->has_diff ? 1 : 0; i < n; i++) {
-            z0 += (double)feats[i] * (double)b->coefs[i];
+        // MAGPIE_VMODEL_SPARSE=0 forces the dense path for A/B;
+        // MAGPIE_VMODEL_CACHE_VERIFY=1 computes both and counts any z0 that is
+        // not bit-identical.
+        static _Thread_local int sp_on = -1, sp_verify = 0;
+        if (sp_on < 0) {
+            const char *e = getenv("MAGPIE_VMODEL_SPARSE");
+            sp_on = (e && e[0] == '0') ? 0 : 1;
+            const char *v = getenv("MAGPIE_VMODEL_CACHE_VERIFY");
+            sp_verify = (v && v[0] == '1') ? 1 : 0;
+        }
+        double z0 = 0.0;
+        bool have = sp_on && vmtc_z0_sparse(c, s, b, slot, leave_indices,
+                                            leave_len, &z0);
+        if (!have || sp_verify) {
+            float feats[1024];
+            int n = vmodel_extract_features(feats, (int)(sizeof(feats) / sizeof(feats[0])),
+                                            s, b, c->rack, c->rack_len,
+                                            leave_indices, leave_len,
+                                            0, m->bag, m->turn, uv,
+                                            m->play_unseen, m->pass_unseen, c->sl);
+            if (n < 0) return -1.0f;
+            double zd = b->intercept;
+            for (int i = b->has_diff ? 1 : 0; i < n; i++) {
+                zd += (double)feats[i] * (double)b->coefs[i];
+            }
+            if (have) {
+                atomic_fetch_add_explicit(&g_vmtc_sparse_checks, 1,
+                                          memory_order_relaxed);
+                if (memcmp(&zd, &z0, sizeof(zd)) != 0)
+                    atomic_fetch_add_explicit(&g_vmtc_sparse_mismatch, 1,
+                                              memory_order_relaxed);
+            }
+            z0 = zd;
         }
         slot->z0[bi] = z0;
         slot->bgen[bi] = c->gen;

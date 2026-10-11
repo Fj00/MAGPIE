@@ -78,4 +78,9 @@ float vmodel_turn_cache_predict(VModelTurnCache *c,
                                 const uint8_t *leave_indices, int leave_len,
                                 int kind, int diff);
 
+// Under MAGPIE_VMODEL_CACHE_VERIFY=1: cache misses scored by both the sparse
+// and the dense path, and how many of those z0 values were not bit-identical.
+extern _Atomic uint64_t g_vmtc_sparse_checks;
+extern _Atomic uint64_t g_vmtc_sparse_mismatch;
+
 #endif
