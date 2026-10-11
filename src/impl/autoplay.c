@@ -3153,6 +3153,10 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   Rack leave_rack;
   rack_set_dist_size(&leave_rack, rack_get_dist_size(player_rack));
 
+  // Counted locally and published once per call. These were atomic increments
+  // on a single shared counter, once per scored move from all 256 threads --
+  // billions per rung, each bouncing the cache line between cores and sockets.
+  uint64_t n_scored = 0, n_unscored = 0;
   for (int i = 0; i < n_moves; i++) {
     Move *m = move_list_get_move(ml, i);
     int kind;
@@ -3171,10 +3175,9 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     if (kind == 2) diff += equity_to_int(move_get_score(m));
     float p = vmodel_predict(model, rack_idx, rack_len, leave_idx, leave_len,
                              kind, diff, model->turn, unseen, sl);
-    atomic_fetch_add_explicit(&g_vmodel_eg_mv_total, 1, memory_order_relaxed);
+    n_scored++;
     if (p < 0.0f) {  // unscored (stratum/bucket missing)
-      atomic_fetch_add_explicit(&g_vmodel_eg_mv_unscored, 1,
-                                memory_order_relaxed);
+      n_unscored++;
       continue;
     }
     const float p_round = roundf(p * 10000.0f) / 10000.0f;
@@ -3184,6 +3187,10 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     }
     if (kind != 0 && p_round > best_nonpass) best_nonpass = p_round;
   }
+  atomic_fetch_add_explicit(&g_vmodel_eg_mv_total, n_scored, memory_order_relaxed);
+  if (n_unscored)
+    atomic_fetch_add_explicit(&g_vmodel_eg_mv_unscored, n_unscored,
+                              memory_order_relaxed);
   if (best_move != NULL && move_get_type(best_move) == GAME_EVENT_PASS) {
     atomic_fetch_add_explicit(&g_pass_pick_n, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_pass_p_sum, (uint64_t)(best_win * 1e6f),
