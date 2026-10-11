@@ -3171,12 +3171,13 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   // score, type, row, col, dir, tiles), so the same move can be found in one
   // pass -- keep the best win%, and on a tie the move compare_moves ranks first
   // -- without sorting thousands of moves every playout turn.
-  // MAGPIE_VMODEL_PICK_NOSORT=1 takes that path; verify mode checks it against
-  // the sorted pick.
+  // That path is the default (bag 40: 0 of 6.65M picks differ, 70.0s -> 62.2s);
+  // MAGPIE_VMODEL_PICK_NOSORT=0 restores the sort. Verify mode checks the
+  // single-pass pick against the sorted one.
   static _Thread_local int pick_nosort = -1;
   if (pick_nosort < 0) {
     const char *e = getenv("MAGPIE_VMODEL_PICK_NOSORT");
-    pick_nosort = (e && e[0] == '1') ? 1 : 0;
+    pick_nosort = (e && e[0] == '0') ? 0 : 1;
   }
   if (!pick_nosort) move_list_sort_moves(ml);
   const int n_moves = move_list_get_count(ml);
