@@ -40,4 +40,42 @@ float vmodel_predict(const VModel *m,
                       const int *unseen_vec,
                       const StaticLeaves *sl);
 
+// Per-turn prediction cache: same answer as vmodel_predict, far less work.
+//
+// Within one turn (one rack, one unseen pool), a play's prediction depends on
+// only two things: its LEAVE and its SCORE DIFF. Everything else in the feature
+// vector -- the static leave value, leave counts and pairs, the unseen/bag
+// block, exchange counts -- is a function of the leave or of the turn alone.
+// And diff enters the model linearly, as feature 0 of a has_diff bucket, ahead
+// of the sigmoid. So for each (kind, leave, bucket) the dot product over every
+// feature but diff is computed ONCE and reused:
+//
+//     z = [intercept + sum_{i>=1} f_i c_i]   (cached)   +   diff * c_0
+//
+// A rack yields at most 127 leaves but can yield 20,000 moves; vmodel_predict
+// rebuilt the full ~285-feature vector (incl. a binary search into the static
+// leave table and an snprintf+strcmp stratum lookup) for every one of them.
+// Profiling bag-40 LABEL put 86.5% of all CPU in the playout picker on 2026-10-11.
+//
+// Not bit-identical: the cached sum adds the diff term last instead of first,
+// so double-precision rounding can differ at the ~1e-16 level. That moves a
+// 4-decimal-rounded win% only when it sits on a rounding knife-edge.
+// MAGPIE_VMODEL_CACHE_VERIFY=1 computes both and counts every disagreement.
+//
+// Falls back to vmodel_predict for passes (six-pass diff transform), terminal
+// zero-score models (turn 6), and strata with more buckets than the cache holds.
+typedef struct VModelTurnCache VModelTurnCache;
+
+// Thread-local cache, allocated on first use.
+VModelTurnCache *vmodel_turn_cache_get(void);
+
+// Start a turn: invalidates every cached entry in O(1).
+void vmodel_turn_cache_begin(VModelTurnCache *c, const VModel *m,
+                             const uint8_t *rack_indices, int rack_len,
+                             const int *unseen_vec, const StaticLeaves *sl);
+
+float vmodel_turn_cache_predict(VModelTurnCache *c,
+                                const uint8_t *leave_indices, int leave_len,
+                                int kind, int diff);
+
 #endif

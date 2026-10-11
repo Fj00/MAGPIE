@@ -138,6 +138,14 @@ static _Atomic uint64_t g_eb_l3p_gate_iter_by_prio[4] = {0};
 // trunc must read 0 -- a nonzero value means rare-leave cells can come up
 // short while every position was visited, which the fill script's
 // positions-scanned check cannot see.
+// Turn-cache verification (MAGPIE_VMODEL_CACHE_VERIFY=1): moves checked, moves
+// whose cached win% differs from vmodel_predict by >1e-6, moves whose 4-decimal
+// win% differs, playout picks made, and picks that came out different.
+static _Atomic uint64_t g_vmtc_v_moves = 0;
+static _Atomic uint64_t g_vmtc_v_pdiff = 0;
+static _Atomic uint64_t g_vmtc_v_round = 0;
+static _Atomic uint64_t g_vmtc_v_picks = 0;
+static _Atomic uint64_t g_vmtc_v_pick = 0;
 static _Atomic uint64_t g_pp_feat_pos[3] = {0};
 static _Atomic uint64_t g_pp_feat_nm[3] = {0};
 static _Atomic uint64_t g_pp_feat_over[3] = {0};
@@ -2524,6 +2532,21 @@ static int vmodel_indices_to_pts(const uint8_t *idx, int n) {
 
 void vmodel_log_stats(void) {
   {
+    const uint64_t vm = atomic_load_explicit(&g_vmtc_v_moves, memory_order_relaxed);
+    if (vm) {
+      const uint64_t vp = atomic_load_explicit(&g_vmtc_v_picks, memory_order_relaxed);
+      const uint64_t vk = atomic_load_explicit(&g_vmtc_v_pick, memory_order_relaxed);
+      fprintf(stderr,
+              "vmodel: TURN-CACHE VERIFY: moves %llu, win%% off by >1e-6 %llu, "
+              "rounded win%% differs %llu; picks %llu, different pick %llu (%.6f%%)\n",
+              (unsigned long long)vm,
+              (unsigned long long)atomic_load_explicit(&g_vmtc_v_pdiff, memory_order_relaxed),
+              (unsigned long long)atomic_load_explicit(&g_vmtc_v_round, memory_order_relaxed),
+              (unsigned long long)vp, (unsigned long long)vk,
+              vp ? 100.0 * (double)vk / (double)vp : 0.0);
+    }
+  }
+  {
     const uint64_t ts = atomic_load_explicit(&g_term_standard, memory_order_relaxed);
     const uint64_t tz = atomic_load_explicit(&g_term_sixpass, memory_order_relaxed);
     if (ts + tz)
@@ -3153,6 +3176,23 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   Rack leave_rack;
   rack_set_dist_size(&leave_rack, rack_get_dist_size(player_rack));
 
+  // Per-turn prediction cache (vmodel_features.h). MAGPIE_VMODEL_TURN_CACHE=0
+  // disables it for A/B; MAGPIE_VMODEL_CACHE_VERIFY=1 runs the reference
+  // vmodel_predict alongside and counts every disagreement -- per move, per
+  // rounded win%, and per chosen move.
+  static _Thread_local int tc_on = -1, tc_verify = -1;
+  if (tc_on < 0) {
+    const char *e = getenv("MAGPIE_VMODEL_TURN_CACHE");
+    tc_on = (e && e[0] == '0') ? 0 : 1;
+    const char *v = getenv("MAGPIE_VMODEL_CACHE_VERIFY");
+    tc_verify = (v && v[0] == '1') ? 1 : 0;
+  }
+  VModelTurnCache *tc = tc_on ? vmodel_turn_cache_get() : NULL;
+  if (tc) vmodel_turn_cache_begin(tc, model, rack_idx, rack_len, unseen, sl);
+  Move *ref_best = NULL;
+  float ref_best_win = -1.0f;
+  uint64_t v_pdiff = 0, v_round = 0;
+
   // Counted locally and published once per call. These were atomic increments
   // on a single shared counter, once per scored move from all 256 threads --
   // billions per rung, each bouncing the cache line between cores and sockets.
@@ -3173,8 +3213,20 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     int leave_len = vmodel_extract_rack_indices(&leave_rack, leave_idx, 16);
     int diff = pre_diff;
     if (kind == 2) diff += equity_to_int(move_get_score(m));
-    float p = vmodel_predict(model, rack_idx, rack_len, leave_idx, leave_len,
-                             kind, diff, model->turn, unseen, sl);
+    float p = tc ? vmodel_turn_cache_predict(tc, leave_idx, leave_len, kind, diff)
+                 : vmodel_predict(model, rack_idx, rack_len, leave_idx, leave_len,
+                                  kind, diff, model->turn, unseen, sl);
+    if (tc && tc_verify) {
+      const float pr = vmodel_predict(model, rack_idx, rack_len, leave_idx,
+                                      leave_len, kind, diff, model->turn,
+                                      unseen, sl);
+      if (fabsf(p - pr) > 1e-6f) v_pdiff++;
+      if (pr >= 0.0f) {
+        const float prr = roundf(pr * 10000.0f) / 10000.0f;
+        if (p < 0.0f || prr != roundf(p * 10000.0f) / 10000.0f) v_round++;
+        if (prr > ref_best_win) { ref_best_win = prr; ref_best = m; }
+      }
+    }
     n_scored++;
     if (p < 0.0f) {  // unscored (stratum/bucket missing)
       n_unscored++;
@@ -3191,6 +3243,14 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   if (n_unscored)
     atomic_fetch_add_explicit(&g_vmodel_eg_mv_unscored, n_unscored,
                               memory_order_relaxed);
+  if (tc && tc_verify) {
+    atomic_fetch_add_explicit(&g_vmtc_v_moves, n_scored, memory_order_relaxed);
+    if (v_pdiff) atomic_fetch_add_explicit(&g_vmtc_v_pdiff, v_pdiff, memory_order_relaxed);
+    if (v_round) atomic_fetch_add_explicit(&g_vmtc_v_round, v_round, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_vmtc_v_picks, 1, memory_order_relaxed);
+    if (ref_best != best_move)
+      atomic_fetch_add_explicit(&g_vmtc_v_pick, 1, memory_order_relaxed);
+  }
   if (best_move != NULL && move_get_type(best_move) == GAME_EVENT_PASS) {
     atomic_fetch_add_explicit(&g_pass_pick_n, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_pass_p_sum, (uint64_t)(best_win * 1e6f),

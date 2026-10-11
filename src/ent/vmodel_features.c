@@ -452,3 +452,151 @@ float vmodel_predict(const VModel *m,
     }
     return sigmoid((float)z);
 }
+
+// ---------------------------------------------------------------------------
+// Per-turn prediction cache. See vmodel_features.h for the derivation.
+// ---------------------------------------------------------------------------
+
+// Slots per thread. Distinct (kind, leave) pairs in one turn are bounded by
+// 2 x 127 (plays and exchanges over the 7-tile subsets), so 512 keeps the
+// load factor under 0.5.
+#define VMTC_SLOTS 512
+// Buckets cached per slot. Strata carry ~60-95 diff buckets; a stratum with
+// more than this falls back to vmodel_predict rather than overflowing.
+#define VMTC_MAXB 128
+
+typedef struct {
+    uint64_t key;              // packed (kind, len, sorted leave); 0 = empty
+    uint32_t gen;              // valid iff == cache->gen
+    int16_t  si;               // stratum index, or -1 if none
+    uint32_t bgen[VMTC_MAXB];  // bucket entry valid iff == cache->gen
+    double   z0[VMTC_MAXB];    // intercept + sum over all features but diff
+} VMTCSlot;
+
+struct VModelTurnCache {
+    uint32_t gen;
+    const VModel *m;
+    const StaticLeaves *sl;
+    uint8_t rack[16];
+    int rack_len;
+    int unseen[27];
+    bool has_unseen;
+    VMTCSlot *slots;
+};
+
+static _Thread_local VModelTurnCache *tl_vmtc = NULL;
+
+VModelTurnCache *vmodel_turn_cache_get(void) {
+    if (!tl_vmtc) {
+        tl_vmtc = calloc(1, sizeof(VModelTurnCache));
+        if (!tl_vmtc) return NULL;
+        tl_vmtc->slots = calloc(VMTC_SLOTS, sizeof(VMTCSlot));
+        if (!tl_vmtc->slots) { free(tl_vmtc); tl_vmtc = NULL; return NULL; }
+    }
+    return tl_vmtc;
+}
+
+void vmodel_turn_cache_begin(VModelTurnCache *c, const VModel *m,
+                             const uint8_t *rack_indices, int rack_len,
+                             const int *unseen_vec, const StaticLeaves *sl) {
+    // Advance the generation: every slot and bucket stamped with an older value
+    // is stale, so nothing needs clearing. On wrap, clear once so a stamp left
+    // from 2^32 turns ago can never be mistaken for current.
+    c->gen++;
+    if (c->gen == 0) {
+        memset(c->slots, 0, VMTC_SLOTS * sizeof(VMTCSlot));
+        c->gen = 1;
+    }
+    c->m = m;
+    c->sl = sl;
+    if (rack_len > 16) rack_len = 16;
+    memcpy(c->rack, rack_indices, (size_t)rack_len);
+    c->rack_len = rack_len;
+    c->has_unseen = unseen_vec != NULL;
+    if (unseen_vec) memcpy(c->unseen, unseen_vec, sizeof(c->unseen));
+}
+
+static uint64_t vmtc_mix(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+float vmodel_turn_cache_predict(VModelTurnCache *c,
+                                const uint8_t *leave_indices, int leave_len,
+                                int kind, int diff) {
+    const VModel *m = c->m;
+    const int *uv = c->has_unseen ? c->unseen : NULL;
+    // Paths whose features are not "leave part + linear diff term":
+    //  - passes rewrite diff into sixpass_diff before bucketing;
+    //  - terminal-zero-score (turn 6) uses a different, pts-indicator schema.
+    if (kind == 0 || m->turn == 6 || leave_len > VMODEL_RACK_SIZE) {
+        return vmodel_predict(m, c->rack, c->rack_len, leave_indices, leave_len,
+                              kind, diff, m->turn, uv, c->sl);
+    }
+
+    // Canonical key: kind (2 bits), length (3 bits), sorted tiles (5 bits each).
+    uint8_t srt[VMODEL_RACK_SIZE];
+    for (int i = 0; i < leave_len; i++) srt[i] = leave_indices[i];
+    for (int i = 1; i < leave_len; i++) {
+        uint8_t v = srt[i];
+        int j = i - 1;
+        while (j >= 0 && srt[j] > v) { srt[j + 1] = srt[j]; j--; }
+        srt[j + 1] = v;
+    }
+    uint64_t key = ((uint64_t)(kind & 3) << 38) | ((uint64_t)leave_len << 35);
+    for (int i = 0; i < leave_len; i++) key |= (uint64_t)(srt[i] & 31) << (5 * i);
+    key |= 1ULL << 40;  // never 0, so 0 can mark an empty slot
+
+    uint32_t h = (uint32_t)(vmtc_mix(key) & (VMTC_SLOTS - 1));
+    VMTCSlot *slot = NULL;
+    for (int probe = 0; probe < VMTC_SLOTS; probe++) {
+        VMTCSlot *cand = &c->slots[(h + probe) & (VMTC_SLOTS - 1)];
+        if (cand->gen != c->gen) {      // empty for this turn: claim it
+            cand->gen = c->gen;
+            cand->key = key;
+            VModelLeaveType lt = vmodel_classify_leave(leave_indices, leave_len);
+            cand->si = (int16_t)vmodel_stratum_index(m, kind, leave_len, lt,
+                                                     m->turn);
+            slot = cand;
+            break;
+        }
+        if (cand->key == key) { slot = cand; break; }
+    }
+    if (!slot || slot->si < 0) {
+        // Table full (cannot happen at the bound above) or no stratum: let the
+        // reference path decide, including its warning on a missing stratum.
+        return vmodel_predict(m, c->rack, c->rack_len, leave_indices, leave_len,
+                              kind, diff, m->turn, uv, c->sl);
+    }
+    const VStratum *s = &m->strata[slot->si];
+    if (s->n_buckets > VMTC_MAXB) {
+        return vmodel_predict(m, c->rack, c->rack_len, leave_indices, leave_len,
+                              kind, diff, m->turn, uv, c->sl);
+    }
+    int bi = vmodel_bucket_index(s, diff);
+    if (bi < 0) {
+        return vmodel_predict(m, c->rack, c->rack_len, leave_indices, leave_len,
+                              kind, diff, m->turn, uv, c->sl);
+    }
+    const VBucket *b = &s->buckets[bi];
+    if (slot->bgen[bi] != c->gen) {
+        float feats[1024];
+        int n = vmodel_extract_features(feats, (int)(sizeof(feats) / sizeof(feats[0])),
+                                        s, b, c->rack, c->rack_len,
+                                        leave_indices, leave_len,
+                                        0, m->bag, m->turn, uv,
+                                        m->play_unseen, m->pass_unseen, c->sl);
+        if (n < 0) return -1.0f;
+        double z0 = b->intercept;
+        for (int i = b->has_diff ? 1 : 0; i < n; i++) {
+            z0 += (double)feats[i] * (double)b->coefs[i];
+        }
+        slot->z0[bi] = z0;
+        slot->bgen[bi] = c->gen;
+    }
+    double z = slot->z0[bi];
+    if (b->has_diff) z += (double)(float)diff * (double)b->coefs[0];
+    return sigmoid((float)z);
+}
