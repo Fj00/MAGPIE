@@ -146,6 +146,19 @@ static _Atomic uint64_t g_vmtc_v_pdiff = 0;
 static _Atomic uint64_t g_vmtc_v_round = 0;
 static _Atomic uint64_t g_vmtc_v_picks = 0;
 static _Atomic uint64_t g_vmtc_v_pick = 0;
+// No-sort verification: picks checked, and picks where the single-pass
+// tie-break disagreed with the first best-win% move of a qsorted copy.
+static _Atomic uint64_t g_vmtc_v_sortchecks = 0;
+static _Atomic uint64_t g_vmtc_v_sortpick = 0;
+// qsort comparator: descending in compare_moves order (the order
+// move_list_sort_moves produces), used only by the no-sort verification.
+static int vmodel_cmp_moves_desc(const void *a, const void *b) {
+  const Move *ma = *(Move *const *)a;
+  const Move *mb = *(Move *const *)b;
+  if (compare_moves(ma, mb, false)) return -1;
+  if (compare_moves(mb, ma, false)) return 1;
+  return 0;
+}
 static _Atomic uint64_t g_pp_feat_pos[3] = {0};
 static _Atomic uint64_t g_pp_feat_nm[3] = {0};
 static _Atomic uint64_t g_pp_feat_over[3] = {0};
@@ -2545,6 +2558,14 @@ void vmodel_log_stats(void) {
               (unsigned long long)vp, (unsigned long long)vk,
               vp ? 100.0 * (double)vk / (double)vp : 0.0);
     }
+    const uint64_t sc = atomic_load_explicit(&g_vmtc_v_sortchecks, memory_order_relaxed);
+    if (sc) {
+      const uint64_t sp = atomic_load_explicit(&g_vmtc_v_sortpick, memory_order_relaxed);
+      fprintf(stderr,
+              "vmodel: NO-SORT VERIFY: picks %llu, differ from sorted pick %llu (%.6f%%)\n",
+              (unsigned long long)sc, (unsigned long long)sp,
+              100.0 * (double)sp / (double)sc);
+    }
   }
   {
     const uint64_t ts = atomic_load_explicit(&g_term_standard, memory_order_relaxed);
@@ -3145,7 +3166,19 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
       .tiles_played_bv = NULL, .initial_tiles_bv = 0};
   generate_moves(&gen_args);
-  move_list_sort_moves(ml);
+  // The sort only fixes which of several equal-win% moves is picked: the first
+  // in equity order. compare_moves is a TOTAL order on move content (equity,
+  // score, type, row, col, dir, tiles), so the same move can be found in one
+  // pass -- keep the best win%, and on a tie the move compare_moves ranks first
+  // -- without sorting thousands of moves every playout turn.
+  // MAGPIE_VMODEL_PICK_NOSORT=1 takes that path; verify mode checks it against
+  // the sorted pick.
+  static _Thread_local int pick_nosort = -1;
+  if (pick_nosort < 0) {
+    const char *e = getenv("MAGPIE_VMODEL_PICK_NOSORT");
+    pick_nosort = (e && e[0] == '1') ? 1 : 0;
+  }
+  if (!pick_nosort) move_list_sort_moves(ml);
   const int n_moves = move_list_get_count(ml);
   if (n_moves == 0) {
     atomic_fetch_add_explicit(&g_vmodel_eg_null_nomoves, 1, memory_order_relaxed);
@@ -3233,7 +3266,11 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       continue;
     }
     const float p_round = roundf(p * 10000.0f) / 10000.0f;
-    if (p_round > best_win) {  // strict > keeps equity-sorted tie order
+    // Sorted list: strict > keeps the equity-first tie order. Unsorted: break
+    // the tie explicitly with the same comparator the sort uses.
+    if (p_round > best_win ||
+        (pick_nosort && p_round == best_win && best_move &&
+         compare_moves(m, best_move, false))) {
       best_win = p_round;
       best_move = m;
     }
@@ -3250,6 +3287,47 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     atomic_fetch_add_explicit(&g_vmtc_v_picks, 1, memory_order_relaxed);
     if (ref_best != best_move)
       atomic_fetch_add_explicit(&g_vmtc_v_pick, 1, memory_order_relaxed);
+  }
+  // No-sort check, independent of the single-pass tie-break above: sort a copy
+  // of the move pointers with qsort on the same comparator, take the FIRST
+  // best-win% move the original way, and compare. The move list is untouched.
+  if (tc_verify && pick_nosort && n_moves > 0) {
+    static _Thread_local Move **vs = NULL;
+    static _Thread_local int vs_cap = 0;
+    if (n_moves > vs_cap) {
+      vs = realloc_or_die(vs, sizeof(*vs) * (size_t)n_moves);
+      vs_cap = n_moves;
+    }
+    for (int i = 0; i < n_moves; i++) vs[i] = move_list_get_move(ml, i);
+    qsort(vs, (size_t)n_moves, sizeof(*vs), vmodel_cmp_moves_desc);
+    Move *sref = NULL;
+    float sref_win = -1.0f;
+    for (int i = 0; i < n_moves; i++) {
+      Move *m = vs[i];
+      int kind;
+      switch (move_get_type(m)) {
+        case GAME_EVENT_PASS:                kind = 0; break;
+        case GAME_EVENT_EXCHANGE:            kind = 1; break;
+        case GAME_EVENT_TILE_PLACEMENT_MOVE: kind = 2; break;
+        default: continue;
+      }
+      if (kind == 0 && no_pass) continue;
+      rack_reset(&leave_rack);
+      get_leave_for_move(m, game, &leave_rack);
+      uint8_t leave_idx[16];
+      int leave_len = vmodel_extract_rack_indices(&leave_rack, leave_idx, 16);
+      int diff = pre_diff;
+      if (kind == 2) diff += equity_to_int(move_get_score(m));
+      float p = tc ? vmodel_turn_cache_predict(tc, leave_idx, leave_len, kind, diff)
+                   : vmodel_predict(model, rack_idx, rack_len, leave_idx,
+                                    leave_len, kind, diff, model->turn, unseen, sl);
+      if (p < 0.0f) continue;
+      const float pr = roundf(p * 10000.0f) / 10000.0f;
+      if (pr > sref_win) { sref_win = pr; sref = m; }
+    }
+    atomic_fetch_add_explicit(&g_vmtc_v_sortchecks, 1, memory_order_relaxed);
+    if (sref != best_move)
+      atomic_fetch_add_explicit(&g_vmtc_v_sortpick, 1, memory_order_relaxed);
   }
   if (best_move != NULL && move_get_type(best_move) == GAME_EVENT_PASS) {
     atomic_fetch_add_explicit(&g_pass_pick_n, 1, memory_order_relaxed);
