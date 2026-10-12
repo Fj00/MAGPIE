@@ -574,12 +574,52 @@ static void vmtc_fill_sparse(VMTCSlot *slot, const VStratum *s,
             for (int i = 0; i < s->n_tiles; i++)
                 VMTC_PUSH((float)lc[s->tiles[i]]);
         }
-        for (int i = 0; i < s->n_pairs; i++) {
-            uint8_t a = s->pairs[i][0];
-            uint8_t bb = s->pairs[i][1];
-            int na = lc[a];
-            int v = (a == bb) ? na * (na - 1) / 2 : na * (int)lc[bb];
-            VMTC_PUSH((float)v);
+        if (s->pair_map_ok) {
+            // Only pairs of tiles present in the leave can be nonzero: look
+            // them up instead of scanning all n_pairs, then emit them in pair
+            // index order, the order the scan would have produced.
+            uint8_t d[27];
+            int nd = 0;
+            for (int t = 0; t < 27; t++) {
+                if (lc[t]) d[nd++] = (uint8_t)t;
+            }
+            int16_t pi[VMTC_MAXSP];
+            float pv[VMTC_MAXSP];
+            int np = 0;
+            for (int x = 0; x < nd && ok; x++) {
+                for (int y = x; y < nd; y++) {
+                    int a = d[x], bb = d[y];
+                    int na = lc[a];
+                    int v = (a == bb) ? na * (na - 1) / 2 : na * (int)lc[bb];
+                    if (v == 0) continue;
+                    int idx = s->pair_at[a][bb];
+                    if (idx < 0) continue;
+                    if (np >= VMTC_MAXSP) { ok = false; break; }
+                    int j = np++;
+                    while (j > 0 && pi[j - 1] > idx) {
+                        pi[j] = pi[j - 1];
+                        pv[j] = pv[j - 1];
+                        j--;
+                    }
+                    pi[j] = (int16_t)idx;
+                    pv[j] = (float)v;
+                }
+            }
+            for (int k = 0; k < np && ok; k++) {
+                if (n >= VMTC_MAXSP) { ok = false; break; }
+                slot->sp_off[n] = (uint16_t)(off + pi[k]);
+                slot->sp_val[n] = pv[k];
+                n++;
+            }
+            off += s->n_pairs;
+        } else {
+            for (int i = 0; i < s->n_pairs; i++) {
+                uint8_t a = s->pairs[i][0];
+                uint8_t bb = s->pairs[i][1];
+                int na = lc[a];
+                int v = (a == bb) ? na * (na - 1) / 2 : na * (int)lc[bb];
+                VMTC_PUSH((float)v);
+            }
         }
     }
 #undef VMTC_PUSH

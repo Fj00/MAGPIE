@@ -54,6 +54,12 @@ typedef struct VStratum {
     uint8_t tiles[VMODEL_MAX_TILES];  // python-canonical indices (0='?'..26='Z')
     int     n_pairs;
     uint8_t (*pairs)[2];           // [n_pairs] each is two python-canonical indices
+    // pair_at[a][b] = index into pairs of the pair {a,b} (both orders), or -1.
+    // Lets the turn cache find a leave's nonzero pair features without scanning
+    // all n_pairs. pair_map_ok is false if a pair is listed twice, in which
+    // case the scan is the only correct path.
+    int16_t pair_at[27][27];
+    bool    pair_map_ok;
     int     n_buckets;
     VBucket *buckets;              // [n_buckets]
 } VStratum;

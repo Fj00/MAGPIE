@@ -259,6 +259,17 @@ static bool parse_stratum(FILE *f, VStratum *s) {
             s->pairs[i][1] = (uint8_t)b;
         }
     }
+    memset(s->pair_at, 0xff, sizeof(s->pair_at));  // all -1
+    s->pair_map_ok = true;
+    for (int i = 0; i < s->n_pairs; i++) {
+        int a = s->pairs[i][0], b = s->pairs[i][1];
+        if (a >= 27 || b >= 27 || s->pair_at[a][b] >= 0) {
+            s->pair_map_ok = false;
+            break;
+        }
+        s->pair_at[a][b] = (int16_t)i;
+        s->pair_at[b][a] = (int16_t)i;
+    }
 
     if (!read_line(buf, sizeof(buf), f)) {
         log_warn("vmodel: unexpected EOF before NBUCKETS"); return false;
