@@ -150,6 +150,9 @@ static _Atomic uint64_t g_vmtc_v_pick = 0;
 // tie-break disagreed with the first best-win% move of a qsorted copy.
 static _Atomic uint64_t g_vmtc_v_sortchecks = 0;
 static _Atomic uint64_t g_vmtc_v_sortpick = 0;
+// Fast-leave verification: moves whose leave (rack minus played tiles, built
+// from the sorted rack) differs from get_leave_for_move + rack-index extraction.
+static _Atomic uint64_t g_vmtc_v_leave = 0;
 // qsort comparator: descending in compare_moves order (the order
 // move_list_sort_moves produces), used only by the no-sort verification.
 static int vmodel_cmp_moves_desc(const void *a, const void *b) {
@@ -2574,6 +2577,12 @@ void vmodel_log_stats(void) {
               (unsigned long long)atomic_load_explicit(&g_vmtc_sparse_mismatch,
                                                        memory_order_relaxed));
     }
+    if (vm) {
+      fprintf(stderr, "vmodel: FAST-LEAVE VERIFY: moves %llu, leave differs %llu\n",
+              (unsigned long long)vm,
+              (unsigned long long)atomic_load_explicit(&g_vmtc_v_leave,
+                                                       memory_order_relaxed));
+    }
   }
   {
     const uint64_t ts = atomic_load_explicit(&g_term_standard, memory_order_relaxed);
@@ -3249,10 +3258,34 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       default: continue;
     }
     if (kind == 0 && no_pass) continue;  // play-only playout (pass relabel)
-    rack_reset(&leave_rack);
-    get_leave_for_move(m, game, &leave_rack);
+    // Leave = rack minus the tiles the move takes from it (get_leave_for_move's
+    // rules: 0 is played-through in a placement, a thrown blank in an exchange),
+    // walked off the sorted rack indices so it comes out sorted exactly as the
+    // Rack-based path produced it -- without copying, resetting and re-scanning
+    // a whole Rack for every move.
+    uint8_t played[32] = {0};
+    const int ntl = move_get_tiles_length(m);
+    for (int k = 0; k < ntl; k++) {
+      MachineLetter L = move_get_tile(m, k);
+      if (kind != 1 && L == PLAYED_THROUGH_MARKER) continue;
+      if (get_is_blanked(L)) L = BLANK_MACHINE_LETTER;
+      played[L & 31]++;
+    }
     uint8_t leave_idx[16];
-    int leave_len = vmodel_extract_rack_indices(&leave_rack, leave_idx, 16);
+    int leave_len = 0;
+    for (int k = 0; k < rack_len; k++) {
+      const uint8_t t = rack_idx[k];
+      if (played[t & 31]) played[t & 31]--;
+      else leave_idx[leave_len++] = t;
+    }
+    if (tc_verify) {
+      rack_reset(&leave_rack);
+      get_leave_for_move(m, game, &leave_rack);
+      uint8_t ref_idx[16];
+      int ref_len = vmodel_extract_rack_indices(&leave_rack, ref_idx, 16);
+      if (ref_len != leave_len || memcmp(ref_idx, leave_idx, (size_t)leave_len) != 0)
+        atomic_fetch_add_explicit(&g_vmtc_v_leave, 1, memory_order_relaxed);
+    }
     int diff = pre_diff;
     if (kind == 2) diff += equity_to_int(move_get_score(m));
     float p = tc ? vmodel_turn_cache_predict(tc, leave_idx, leave_len, kind, diff)
