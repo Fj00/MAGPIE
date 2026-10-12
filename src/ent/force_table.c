@@ -85,6 +85,21 @@ typedef struct StratumTally {
 #define FORCE_LEAVE_LEN_MAX 8 // valid leave_length values 0..7
 #define FORCE_EXCHANGE_MAX 2  // exchange flag is 0 or 1
 
+// Per-shape diff index (force_table_lookup_slots_by_diff). The shape's cell
+// boundaries cut the diff axis into n_bp-1 intervals [bp[j], bp[j+1]); every
+// cell in interval j's list covers the whole interval. CSR layout: interval
+// j's entries are slots[off[j] .. off[j+1]), bitmaps parallel. A shape bucket
+// holds every cell of every diff bucket (73K at bag 40 L5/L6 plays), and the
+// matcher walked all of them per move to keep the ~1% whose range held the
+// move's diff -- 97% of the catalog stage's CPU.
+typedef struct {
+  int n_bp;
+  int *bp;                // [n_bp] ascending breakpoints
+  int *off;               // [n_bp] (last interval ends at off[n_bp-1])
+  ForceTargetSlot *slots; // static copies; deficit field NOT maintained
+  uint32_t *bitmaps;
+} ShapeDiffIndex;
+
 struct ForceTable {
   ForceTarget *targets; // heap-allocated array
   int num_targets;
@@ -115,6 +130,8 @@ struct ForceTable {
   // per slot — fits in L1 cache for fast pre-filter.
   uint32_t *by_shape_bitmaps[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX]
                             [FORCE_EXCHANGE_MAX];
+  ShapeDiffIndex by_shape_diff[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX]
+                              [FORCE_EXCHANGE_MAX];
   // B5: serializes the swap-to-back operation when a target hits deficit==0.
   // Only acquired on the rare deficit-hits-zero transition; readers iterate
   // active prefix without locking (they may briefly see torn order on
@@ -631,6 +648,110 @@ uint32_t *force_table_lookup_bitmaps_by_shape(ForceTable *table, int bag,
   return table->by_shape_bitmaps[bag][leave_length][ex];
 }
 
+static int sdi_cmp_int(const void *a, const void *b) {
+  const int x = *(const int *)a, y = *(const int *)b;
+  return (x > y) - (x < y);
+}
+
+// Index of the last breakpoint <= v (bp ascending, v >= bp[0]).
+static int sdi_floor(const int *bp, int n, int v) {
+  int lo = 0, hi = n;  // first index with bp > v
+  while (lo < hi) {
+    const int mid = (lo + hi) >> 1;
+    if (bp[mid] > v) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo - 1;
+}
+
+// Build a shape's diff index from its cells in load order (see ShapeDiffIndex).
+// A cell [diff_min, diff_max] is the half-open [diff_min, diff_max+1), which is
+// exactly the run of intervals between those two breakpoints.
+static void build_shape_diff_index(ShapeDiffIndex *dx, ForceTarget *const *arr,
+                                   int n) {
+  memset(dx, 0, sizeof(*dx));
+  if (n <= 0) return;
+  int *bp = (int *)malloc_or_die(sizeof(int) * 2 * (size_t)n);
+  int m = 0;
+  for (int i = 0; i < n; i++) {
+    bp[m++] = arr[i]->diff_min;
+    bp[m++] = arr[i]->diff_max < INT_MAX ? arr[i]->diff_max + 1 : INT_MAX;
+  }
+  qsort(bp, (size_t)m, sizeof(int), sdi_cmp_int);
+  int nb = 0;
+  for (int i = 0; i < m; i++) {
+    if (nb == 0 || bp[i] != bp[nb - 1]) bp[nb++] = bp[i];
+  }
+  int *off = (int *)calloc((size_t)nb + 1, sizeof(int));
+  if (!off) log_fatal("force_table: diff index alloc failed");
+  // Per-interval counts via a difference array, then prefix sums.
+  for (int i = 0; i < n; i++) {
+    const int hi1 = arr[i]->diff_max < INT_MAX ? arr[i]->diff_max + 1 : INT_MAX;
+    if (hi1 <= arr[i]->diff_min) continue;  // empty range: matches nothing
+    off[sdi_floor(bp, nb, arr[i]->diff_min)] += 1;
+    off[sdi_floor(bp, nb, hi1)] -= 1;
+  }
+  int run = 0;
+  size_t total = 0;
+  for (int j = 0; j < nb; j++) {
+    run += off[j];
+    off[j] = run;  // now: number of cells covering interval j
+    total += (size_t)run;
+  }
+  int *start = (int *)malloc_or_die(sizeof(int) * ((size_t)nb + 1));
+  int acc = 0;
+  for (int j = 0; j < nb; j++) {
+    start[j] = acc;
+    acc += off[j];
+  }
+  start[nb] = acc;
+  dx->slots = (ForceTargetSlot *)malloc_or_die(sizeof(ForceTargetSlot) *
+                                               (total ? total : 1));
+  dx->bitmaps = (uint32_t *)malloc_or_die(sizeof(uint32_t) * (total ? total : 1));
+  int *fill = off;  // reuse: write cursor per interval
+  for (int j = 0; j < nb; j++) fill[j] = start[j];
+  for (int i = 0; i < n; i++) {
+    const int hi1 = arr[i]->diff_max < INT_MAX ? arr[i]->diff_max + 1 : INT_MAX;
+    if (hi1 <= arr[i]->diff_min) continue;
+    const int j0 = sdi_floor(bp, nb, arr[i]->diff_min);
+    const int j1 = sdi_floor(bp, nb, hi1);
+    ForceTargetSlot s;
+    slot_init_from_target(&s, arr[i]);
+    const uint32_t bm = required_bitmap_for_target(arr[i]);
+    for (int j = j0; j < j1; j++) {
+      const int k = fill[j]++;
+      dx->slots[k] = s;
+      dx->bitmaps[k] = bm;
+    }
+  }
+  free(fill);
+  dx->n_bp = nb;
+  dx->bp = bp;
+  dx->off = start;
+}
+
+int force_table_lookup_slots_by_diff(ForceTable *table, int bag,
+                                     int leave_length, int exchange, int diff,
+                                     ForceTargetSlot **slots,
+                                     uint32_t **bitmaps) {
+  *slots = NULL;
+  *bitmaps = NULL;
+  if (bag < 0 || bag >= FORCE_BAG_MAX || leave_length < 0 ||
+      leave_length >= FORCE_LEAVE_LEN_MAX) {
+    return 0;
+  }
+  const ShapeDiffIndex *dx =
+      &table->by_shape_diff[bag][leave_length][exchange ? 1 : 0];
+  if (dx->n_bp < 2 || diff < dx->bp[0] || diff >= dx->bp[dx->n_bp - 1]) {
+    return 0;
+  }
+  const int j = sdi_floor(dx->bp, dx->n_bp, diff);
+  const int a = dx->off[j];
+  *slots = dx->slots + a;
+  *bitmaps = dx->bitmaps + a;
+  return dx->off[j + 1] - a;
+}
+
 ForceTarget *force_table_lookup_target_by_key(
     ForceTable *table, int bag, int leave_length, LeaveType type,
     ForceTargetKind kind, int exchange, const MachineLetter *sub_mls,
@@ -1064,6 +1185,18 @@ ForceTable *force_table_create(const char *csv_path,
     }
   }
 
+  // Diff index per shape, from the sorted order above (load time, before any
+  // worker runs, so no swap-to-back has reordered anything yet).
+  for (int b = 0; b < FORCE_BAG_MAX; b++) {
+    for (int L = 0; L < FORCE_LEAVE_LEN_MAX; L++) {
+      for (int ex = 0; ex < FORCE_EXCHANGE_MAX; ex++) {
+        build_shape_diff_index(&table->by_shape_diff[b][L][ex],
+                               table->by_shape_ptrs[b][L][ex],
+                               table->by_shape_count[b][L][ex]);
+      }
+    }
+  }
+
   // B5: initialize by_shape_active to full bucket size.
   for (int b = 0; b < FORCE_BAG_MAX; b++) {
     for (int L = 0; L < FORCE_LEAVE_LEN_MAX; L++) {
@@ -1392,6 +1525,11 @@ void force_table_destroy(ForceTable *table) {
         free(table->by_shape_ptrs[b][L][ex]);
         free(table->by_shape_slots[b][L][ex]);
         free(table->by_shape_bitmaps[b][L][ex]);
+        ShapeDiffIndex *dx = &table->by_shape_diff[b][L][ex];
+        free(dx->bp);
+        free(dx->off);
+        free(dx->slots);
+        free(dx->bitmaps);
       }
     }
   }

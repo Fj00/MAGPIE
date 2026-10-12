@@ -153,6 +153,14 @@ static _Atomic uint64_t g_vmtc_v_sortpick = 0;
 // Fast-leave verification: moves whose leave (rack minus played tiles, built
 // from the sorted rack) differs from get_leave_for_move + rack-index extraction.
 static _Atomic uint64_t g_vmtc_v_leave = 0;
+// Force-cell matcher diff index (MAGPIE_PP_MATCH_VERIFY=1): calls checked,
+// calls whose matched cell SET differs from the full shape scan (uncapped on
+// both sides; a cell drained by another thread between the two passes also
+// counts), and calls that matched more than the caller's cap -- the only case
+// where the two paths' different iteration order can change what is returned.
+static _Atomic uint64_t g_ppm_v_calls = 0;
+static _Atomic uint64_t g_ppm_v_differ = 0;
+static _Atomic uint64_t g_ppm_v_overcap = 0;
 // qsort comparator: descending in compare_moves order (the order
 // move_list_sort_moves produces), used only by the no-sort verification.
 static int vmodel_cmp_moves_desc(const void *a, const void *b) {
@@ -1477,6 +1485,14 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
               (unsigned long long)g_pp_feat_over[b],
               (unsigned long long)g_pp_feat_trunc[b]);
     }
+  }
+  if (atomic_load(&g_ppm_v_calls)) {
+    fprintf(stderr,
+            "MATCH-INDEX VERIFY: calls %llu, matched set differs %llu, "
+            "over cap %llu\n",
+            (unsigned long long)atomic_load(&g_ppm_v_calls),
+            (unsigned long long)atomic_load(&g_ppm_v_differ),
+            (unsigned long long)atomic_load(&g_ppm_v_overcap));
   }
   if (shared_data->force_table) {
     fprintf(stderr, "force_table: remaining deficit = %lld across %d targets\n",
@@ -6262,36 +6278,28 @@ static int pp_sixpass_diff(const Game *game, int mover, int pre_diff) {
   return pre_diff - mover_pts + opp_min;
 }
 
-static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
-                                int on_idx, int eff_diff, bool is_exch,
-                                ForceTarget **out, int cap) {
+// The match predicate over one run of slots. Checks are pure filters, so their
+// order only affects cost: the slot-local diff and bitmap tests run before the
+// deficit read. `cold_deficit`: the slots are diff-index copies whose deficit
+// field is never maintained, so read the target's own (authoritative) value.
+static int pp_match_slots(const ForceTargetSlot *slots, const uint32_t *bitmaps,
+                          int count, bool cold_deficit, Game *game, int on_idx,
+                          const Rack *leave, uint32_t leave_bm, int leave_len,
+                          int eff_diff, bool is_exch, ForceTarget **out,
+                          int cap) {
   const LetterDistribution *ld = game_get_ld(game);
-  const Rack *pre_rack = player_get_rack(game_get_player(game, on_idx));
-  Rack leave;
-  rack_set_dist_size(&leave, rack_get_dist_size(pre_rack));
-  get_leave_for_move(mv, game, &leave);
-  uint32_t leave_bm = 0;
-  for (uint16_t i = 0; i < leave.dist_size && i < 32; i++) {
-    if (leave.array[i] > 0) leave_bm |= ((uint32_t)1) << i;
-  }
-  const int leave_len = (int)leave.number_of_letters;
-  if (leave_len < 0 || leave_len >= 8) return 0;
-  const int bag_count = bag_get_letters(game_get_bag(game)) + (RACK_SIZE);
-  int count = 0;
-  ForceTargetSlot *slots = force_table_lookup_slots_by_shape(
-      ft, bag_count, leave_len, is_exch ? 1 : 0, &count);
-  if (count == 0 || slots == NULL) return 0;
-  uint32_t *bitmaps = force_table_lookup_bitmaps_by_shape(
-      ft, bag_count, leave_len, is_exch ? 1 : 0);
   int ltype = -1;
   int n = 0;
   for (int t = 0; t < count && n < cap; t++) {
-    ForceTargetSlot *fs = &slots[t];
-    if (fs->deficit <= 0) continue;
+    const ForceTargetSlot *fs = &slots[t];
     if (eff_diff < fs->diff_min || eff_diff > fs->diff_max) continue;
     const int k = (int)fs->kind;
     if (k == FORCE_TARGET_BAG_TILE) {
-      if (ltype < 0) ltype = (int)force_classify_leave(&leave, ld);
+      if (cold_deficit ? atomic_load_explicit(&fs->cold->deficit,
+                                              memory_order_relaxed) <= 0
+                       : fs->deficit <= 0)
+        continue;
+      if (ltype < 0) ltype = (int)force_classify_leave(leave, ld);
       // Unseen count of the target's tile (physical bag + opp rack), matching
       // the V-model bag_eq feature — NOT the mover's rack count.
       const MachineLetter bt = fs->cold->subleave_mls[0];
@@ -6312,6 +6320,10 @@ static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
       const uint32_t req = bitmaps[t];
       if ((leave_bm & req) != req) continue;
     }
+    if (cold_deficit ? atomic_load_explicit(&fs->cold->deficit,
+                                            memory_order_relaxed) <= 0
+                     : fs->deficit <= 0)
+      continue;
     if (k == FORCE_TARGET_LEAVE) {
       // Enumerated full-leave cell (L3/L4): the bitmap pre-filter only proves
       // the tiles are PRESENT; require an exact multiset match so "AAB" is not
@@ -6319,12 +6331,12 @@ static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
       // tiles) lives on the cold struct — the hot slot only carries the <=2 MLs
       // the tile/pair same-tile check needs.
       if (!force_subleave_exact_match(fs->cold->subleave_mls,
-                                      fs->cold->subleave_count, &leave)) {
+                                      fs->cold->subleave_count, leave)) {
         continue;
       }
     } else if (fs->subleave_count == 2 &&
                fs->subleave_mls[0] == fs->subleave_mls[1] &&
-               leave.array[fs->subleave_mls[0]] < 2) {
+               leave->array[fs->subleave_mls[0]] < 2) {
       continue;
     }
     // Type check only for genuinely type-split cells (L5/L6 plays here). Gate
@@ -6333,10 +6345,90 @@ static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
     // on length wrongly type-checked L3/L4/L7 "all" cells against a classified
     // leave, which never matched -> those plays were silently never recorded.
     if (fs->leave_type != LEAVE_TYPE_ALL) {
-      if (ltype < 0) ltype = (int)force_classify_leave(&leave, ld);
+      if (ltype < 0) ltype = (int)force_classify_leave(leave, ld);
       if ((LeaveType)ltype != (LeaveType)fs->leave_type) continue;
     }
     out[n++] = fs->cold;
+  }
+  return n;
+}
+
+static int ppm_cmp_ptr(const void *a, const void *b) {
+  const uintptr_t x = (uintptr_t)*(ForceTarget *const *)a;
+  const uintptr_t y = (uintptr_t)*(ForceTarget *const *)b;
+  return (x > y) - (x < y);
+}
+
+static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
+                                int on_idx, int eff_diff, bool is_exch,
+                                ForceTarget **out, int cap) {
+  const Rack *pre_rack = player_get_rack(game_get_player(game, on_idx));
+  Rack leave;
+  rack_set_dist_size(&leave, rack_get_dist_size(pre_rack));
+  get_leave_for_move(mv, game, &leave);
+  uint32_t leave_bm = 0;
+  for (uint16_t i = 0; i < leave.dist_size && i < 32; i++) {
+    if (leave.array[i] > 0) leave_bm |= ((uint32_t)1) << i;
+  }
+  const int leave_len = (int)leave.number_of_letters;
+  if (leave_len < 0 || leave_len >= 8) return 0;
+  const int bag_count = bag_get_letters(game_get_bag(game)) + (RACK_SIZE);
+  // Default: the per-shape diff index (force_table_lookup_slots_by_diff), which
+  // visits only the cells whose diff range holds eff_diff. The full shape scan
+  // walked every diff bucket's cells -- up to 73K per move at bag 40 -- and was
+  // 97% of the catalog stage. MAGPIE_PP_MATCH_INDEX=0 restores the scan;
+  // MAGPIE_PP_MATCH_VERIFY=1 runs both and compares the matched cell sets.
+  static _Thread_local int use_idx = -1, verify = 0;
+  if (use_idx < 0) {
+    const char *e = getenv("MAGPIE_PP_MATCH_INDEX");
+    use_idx = (e && e[0] == '0') ? 0 : 1;
+    const char *v = getenv("MAGPIE_PP_MATCH_VERIFY");
+    verify = (v && v[0] == '1') ? 1 : 0;
+  }
+  ForceTargetSlot *scan_slots = NULL;
+  uint32_t *scan_bm = NULL;
+  int scan_count = 0;
+  if (!use_idx || verify) {
+    scan_slots = force_table_lookup_slots_by_shape(ft, bag_count, leave_len,
+                                                   is_exch ? 1 : 0, &scan_count);
+    scan_bm = force_table_lookup_bitmaps_by_shape(ft, bag_count, leave_len,
+                                                  is_exch ? 1 : 0);
+  }
+  if (!use_idx) {
+    if (scan_count == 0 || scan_slots == NULL) return 0;
+    return pp_match_slots(scan_slots, scan_bm, scan_count, false, game, on_idx,
+                          &leave, leave_bm, leave_len, eff_diff, is_exch, out,
+                          cap);
+  }
+  ForceTargetSlot *idx_slots = NULL;
+  uint32_t *idx_bm = NULL;
+  const int idx_count = force_table_lookup_slots_by_diff(
+      ft, bag_count, leave_len, is_exch ? 1 : 0, eff_diff, &idx_slots, &idx_bm);
+  int n = 0;
+  if (idx_count > 0) {
+    n = pp_match_slots(idx_slots, idx_bm, idx_count, true, game, on_idx, &leave,
+                       leave_bm, leave_len, eff_diff, is_exch, out, cap);
+  }
+  if (verify) {
+    enum { VMAX = 4096 };
+    static _Thread_local ForceTarget *va[VMAX], *vb[VMAX];
+    const int na = idx_count > 0
+                       ? pp_match_slots(idx_slots, idx_bm, idx_count, true, game,
+                                        on_idx, &leave, leave_bm, leave_len,
+                                        eff_diff, is_exch, va, VMAX)
+                       : 0;
+    const int nb = (scan_count > 0 && scan_slots)
+                       ? pp_match_slots(scan_slots, scan_bm, scan_count, false,
+                                        game, on_idx, &leave, leave_bm,
+                                        leave_len, eff_diff, is_exch, vb, VMAX)
+                       : 0;
+    qsort(va, (size_t)na, sizeof(va[0]), ppm_cmp_ptr);
+    qsort(vb, (size_t)nb, sizeof(vb[0]), ppm_cmp_ptr);
+    atomic_fetch_add_explicit(&g_ppm_v_calls, 1, memory_order_relaxed);
+    if (na != nb || memcmp(va, vb, sizeof(va[0]) * (size_t)na) != 0)
+      atomic_fetch_add_explicit(&g_ppm_v_differ, 1, memory_order_relaxed);
+    if (na > cap)
+      atomic_fetch_add_explicit(&g_ppm_v_overcap, 1, memory_order_relaxed);
   }
   return n;
 }

@@ -173,6 +173,16 @@ ForceTargetSlot *force_table_lookup_slots_by_shape(ForceTable *table, int bag,
 uint32_t *force_table_lookup_bitmaps_by_shape(ForceTable *table, int bag,
                                               int leave_length, int exchange);
 
+// Diff-indexed view of a shape bucket: the cells whose [diff_min, diff_max]
+// contains `diff`, as slots + parallel bitmaps, in load (sorted) order. Built
+// once at load and never reordered, so it includes satisfied cells and its
+// slot `deficit` fields are stale -- callers must test cold->deficit. Returns
+// the count (0 with NULL outputs if the shape or diff has no cells).
+int force_table_lookup_slots_by_diff(ForceTable *table, int bag,
+                                     int leave_length, int exchange, int diff,
+                                     ForceTargetSlot **slots,
+                                     uint32_t **bitmaps);
+
 // Exact multiset match for an enumerated LEAVE cell: true iff `leave` equals
 // the cell's `sub` multiset (of `count` tiles). The caller has already
 // confirmed leave->number_of_letters == count (the shape bucket guarantees
