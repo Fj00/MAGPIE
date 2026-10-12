@@ -6242,7 +6242,11 @@ static void pp_render_leave(const Move *move, const Game *game, char *out,
 // supply-limited. Under feature fan-out the window is now the full list
 // (MAGPIE_PP_FEAT_LEGACY_CAP=1 restores the old window, for A/B only).
 // PP_FEAT_MAX (defined near the globals) still bounds the non-feature path.
-#define PP_FT_MAX 32       // max force cells credited per fan-out branch
+// Max force cells credited per fan-out branch. Was 32, which a move can exceed:
+// 1 stratum + 7 tile + 21 pair + up to 27 bag_tile + 1 leave = 57. The overflow
+// was always bag_tile cells (they sort last) -- bag 40 catalogue sample: 2.5% of
+// bag_tile matches silently dropped, so those cells undercounted their supply.
+#define PP_FT_MAX 64
 // Distinct force cells one position's exchange set can register against: a
 // 6-tile leave alone gives 1 stratum + 6 leave_count + 15 leave_pair, and a
 // full rack offers up to 127 exchanges. 4096 is slack over the observed union.
