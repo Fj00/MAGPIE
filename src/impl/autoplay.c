@@ -161,6 +161,10 @@ static _Atomic uint64_t g_vmtc_v_leave = 0;
 static _Atomic uint64_t g_ppm_v_calls = 0;
 static _Atomic uint64_t g_ppm_v_differ = 0;
 static _Atomic uint64_t g_ppm_v_overcap = 0;
+// Under the same verify: matched cells by kind (stratum, tile, pair, bag_tile,
+// leave), and how many of those fell past the caller's cap and were dropped.
+static _Atomic uint64_t g_ppm_v_kind_all[5];
+static _Atomic uint64_t g_ppm_v_kind_drop[5];
 // qsort comparator: descending in compare_moves order (the order
 // move_list_sort_moves produces), used only by the no-sort verification.
 static int vmodel_cmp_moves_desc(const void *a, const void *b) {
@@ -1493,6 +1497,15 @@ void autoplay_shared_data_destroy(AutoplaySharedData *shared_data) {
             (unsigned long long)atomic_load(&g_ppm_v_calls),
             (unsigned long long)atomic_load(&g_ppm_v_differ),
             (unsigned long long)atomic_load(&g_ppm_v_overcap));
+    static const char *kn[5] = {"stratum", "tile", "pair", "bag_tile", "leave"};
+    for (int k = 0; k < 5; k++) {
+      const uint64_t a = atomic_load(&g_ppm_v_kind_all[k]);
+      const uint64_t d = atomic_load(&g_ppm_v_kind_drop[k]);
+      if (a)
+        fprintf(stderr, "MATCH-INDEX VERIFY: %-8s matched %llu, dropped past "
+                "cap %llu (%.3f%%)\n", kn[k], (unsigned long long)a,
+                (unsigned long long)d, 100.0 * (double)d / (double)a);
+    }
   }
   if (shared_data->force_table) {
     fprintf(stderr, "force_table: remaining deficit = %lld across %d targets\n",
@@ -6422,6 +6435,15 @@ static int pp_match_force_cells(ForceTable *ft, Game *game, const Move *mv,
                                         game, on_idx, &leave, leave_bm,
                                         leave_len, eff_diff, is_exch, vb, VMAX)
                        : 0;
+    // va is in return order here: entries past `cap` are the ones dropped.
+    for (int q = 0; q < na; q++) {
+      const int kk = (int)va[q]->kind;
+      if (kk < 0 || kk >= 5) continue;
+      atomic_fetch_add_explicit(&g_ppm_v_kind_all[kk], 1, memory_order_relaxed);
+      if (q >= cap)
+        atomic_fetch_add_explicit(&g_ppm_v_kind_drop[kk], 1,
+                                  memory_order_relaxed);
+    }
     qsort(va, (size_t)na, sizeof(va[0]), ppm_cmp_ptr);
     qsort(vb, (size_t)nb, sizeof(vb[0]), ppm_cmp_ptr);
     atomic_fetch_add_explicit(&g_ppm_v_calls, 1, memory_order_relaxed);
