@@ -7341,6 +7341,31 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         error_stack_destroy(es);
       }
       gr->game_number = pos_id;
+      // MAGPIE_VMODEL_PICK_TEST=1 (test hook, 2026-10-20): print what the per-bag
+      // V-model picker (the one fill playouts use) chooses for this exact pool
+      // position -- CGP carries the scoreless-turn count -- then skip it. Lets
+      // the six-pass guard / winning pass-out be checked position by position.
+      static int pick_test = -1;
+      if (pick_test < 0) pick_test = getenv("MAGPIE_VMODEL_PICK_TEST") ? 1 : 0;
+      if (pick_test) {
+        const Move *pm = vmodel_endgame_pick_move(
+            gr->game, sd->vmodels_by_bag, sd->vmodel_static_leaves,
+            worker->worker_index, post_ml);
+        StringBuilder *psb = string_builder_create();
+        if (pm) string_builder_add_move(psb, game_get_board(gr->game), pm,
+                                        game_get_ld(gr->game), false);
+        const char *pkind = !pm ? "none"
+                            : move_get_type(pm) == GAME_EVENT_PASS ? "PASS"
+                            : move_get_type(pm) == GAME_EVENT_EXCHANGE ? "EXCH" : "PLAY";
+        printf("[picktest] pos %llu zeros %d bag %d -> %s %s\n",
+               (unsigned long long)pos_id,
+               game_get_consecutive_scoreless_turns(gr->game),
+               bag_get_letters(game_get_bag(gr->game)) + RACK_SIZE, pkind,
+               pm ? string_builder_peek(psb) : "-");
+        fflush(stdout);
+        string_builder_destroy(psb);
+        break;  // no playout: next position
+      }
 
       const int on_idx = game_get_player_on_turn_index(gr->game);
       const int opp_idx = 1 - on_idx;
