@@ -3286,7 +3286,11 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       case GAME_EVENT_TILE_PLACEMENT_MOVE: kind = 2; break;
       default: continue;
     }
-    if (kind == 0 && no_pass) continue;  // play-only playout (pass relabel)
+    // Passing is considered ONLY in the guarded pass block below. movegen DOES
+    // emit a pass here (MAGPIE_VMODEL_PICK_TEST, 2026-10-20: a bag-8 position at
+    // 5 scoreless turns, 100 behind, picked this unguarded pass -- passing into a
+    // lost six-pass ending), so scoring it here bypassed the standoff guard.
+    if (kind == 0) continue;
     // Leave = rack minus the tiles the move takes from it (get_leave_for_move's
     // rules: 0 is played-through in a placement, a thrown blank in an exchange),
     // walked off the sorted rack indices so it comes out sorted exactly as the
@@ -3467,7 +3471,9 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       const float p_round = roundf(p * 10000.0f) / 10000.0f;
       // Strict > so a tie keeps the play: in a decided position the spread head
       // decides, and its MAE (20-25 pts) exceeds the gaps it would adjudicate.
-      if (p_round > best_win) {
+      // Except a winning pass-out: that win is CERTAIN, a play's 1.0 is a model
+      // estimate, so the pass-out also wins ties.
+      if (p_round > best_win || pass_wins_outright) {
         const float margin = p_round - best_win;   // best_win = best PLAY here
         best_win = p_round;
         best_move = spare;
