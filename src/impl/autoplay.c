@@ -3440,12 +3440,18 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   // picker, so whoever LOSES the tally breaks the standoff on what would be
   // their third pass.
   bool pass_allowed = !no_pass;
+  // WINNING PASS-OUT (2026-10-20): if this pass is the LAST scoreless turn it
+  // ends the game, and s6 > 0 means we win that ending even if the opponent
+  // holds the cheapest possible rack -- a certain win, so score it 1.0 instead
+  // of asking the pass model, which does not know the game is ending.
+  bool pass_wins_outright = false;
   if (pass_allowed) {
     const int zeros = game_get_consecutive_scoreless_turns(game);
     const int maxz = game_get_max_scoreless_turns(game);
     if (zeros + 1 >= maxz - 1) {   // this pass reaches the end, or lets opp end it
       const int s6 = pp_sixpass_diff(game, on, pre_diff);
       if (s6 <= 0) pass_allowed = false;   // we would lose the six-pass ending
+      else if (zeros + 1 >= maxz) pass_wins_outright = true;
     }
   }
   if (pass_allowed) {
@@ -3453,8 +3459,10 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     move_set_as_pass(spare);
     // A pass keeps the whole rack, so leave == rack, and the score diff is
     // unchanged (kind 0 scores nothing).
-    float p = vmodel_predict(model, rack_idx, rack_len, rack_idx, rack_len,
-                             0, pre_diff, model->turn, unseen, sl);
+    float p = pass_wins_outright
+                  ? 1.0f
+                  : vmodel_predict(model, rack_idx, rack_len, rack_idx, rack_len,
+                                   0, pre_diff, model->turn, unseen, sl);
     if (p >= 0.0f) {
       const float p_round = roundf(p * 10000.0f) / 10000.0f;
       // Strict > so a tie keeps the play: in a decided position the spread head
