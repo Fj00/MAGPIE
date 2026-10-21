@@ -7568,7 +7568,10 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           // positions yielded a pass row, 85.7% an exchange -- the design calls
           // for both from EVERY position.
           //
-          // MAGPIE_PP_NONPLAY_FANOUT (default ON) goes further, and PASS and
+          // MAGPIE_PP_NONPLAY_FANOUT (default OFF since 2026-10-21; the main
+          // fill's LABEL sets =1 explicitly -- an ON default made every other
+          // caller remember =0, and two that did not each played out millions
+          // of surplus pass rows) goes further, and PASS and
           // EXCHANGE are handled differently under it because they are
           // different problems.
           //
@@ -7616,7 +7619,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           static _Thread_local int nonplay_fan_cache = -1;
           if (nonplay_fan_cache < 0) {
             const char *e = getenv("MAGPIE_PP_NONPLAY_FANOUT");
-            nonplay_fan_cache = (e && e[0] == '0') ? 0 : 1;
+            nonplay_fan_cache = (e && e[0] == '1') ? 1 : 0;   // default OFF
           }
           nonplay_fan = nonplay_fan_cache && !index_build;
           exch_feat = nonplay_fan;
