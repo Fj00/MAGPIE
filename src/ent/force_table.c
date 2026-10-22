@@ -100,6 +100,13 @@ typedef struct {
   uint32_t *bitmaps;
 } ShapeDiffIndex;
 
+// Sorted lookup index for force_table_lookup_target_by_key (2026-10-22).
+typedef struct FtKeyEntry {
+  uint64_t key;     // ft_pack_key: shape + subleave letters
+  int diff_min;
+  ForceTarget *t;   // into targets[] (stable; by_bag_ptrs gets reordered)
+} FtKeyEntry;
+
 struct ForceTable {
   ForceTarget *targets; // heap-allocated array
   int num_targets;
@@ -113,6 +120,11 @@ struct ForceTable {
   ForceTarget **by_bag_ptrs[FORCE_BAG_MAX];
   int by_bag_count[FORCE_BAG_MAX]; // total entries (active + dead)
   _Atomic(int) by_bag_active[FORCE_BAG_MAX]; // active prefix size
+  // Per-bag sorted (key, diff_min) index, built on first
+  // force_table_lookup_target_by_key call for that bag (startup only).
+  FtKeyEntry *key_index[FORCE_BAG_MAX];
+  int key_index_n[FORCE_BAG_MAX];
+  bool key_index_built[FORCE_BAG_MAX];
   // A2: finer-grained index — per (bag, leave_length, exchange) shape. Same
   // active-prefix invariant as by_bag_ptrs.
   ForceTarget **by_shape_ptrs[FORCE_BAG_MAX][FORCE_LEAVE_LEN_MAX]
@@ -752,41 +764,71 @@ int force_table_lookup_slots_by_diff(ForceTable *table, int bag,
   return dx->off[j + 1] - a;
 }
 
+// Everything force_table_lookup_target_by_key matches on except the diff:
+// leave_length:4 type:3 kind:3 exchange:1 subleave_count:3 | MLs, 8 bits each,
+// the first subleave_count of them (BAG_TILE: also mls[1], its count marker).
+static uint64_t ft_pack_key(int leave_length, int type, int kind, int exchange,
+                            int subleave_count, const MachineLetter *mls) {
+  uint64_t k = ((uint64_t)(leave_length & 0xF) << 60) |
+               ((uint64_t)(type & 0x7) << 57) | ((uint64_t)(kind & 0x7) << 54) |
+               ((uint64_t)(exchange & 0x1) << 53) |
+               ((uint64_t)(subleave_count & 0x7) << 50);
+  int n = (kind == FORCE_TARGET_BAG_TILE) ? 2 : subleave_count;
+  if (n > FORCE_MAX_SUBLEAVE) n = FORCE_MAX_SUBLEAVE;
+  for (int i = 0; i < n; i++) {
+    k |= (uint64_t)mls[i] << (8 * (FORCE_MAX_SUBLEAVE - 1 - i));
+  }
+  return k;
+}
+
+static int ft_key_entry_cmp(const void *a, const void *b) {
+  const FtKeyEntry *x = (const FtKeyEntry *)a;
+  const FtKeyEntry *y = (const FtKeyEntry *)b;
+  if (x->key != y->key) return x->key < y->key ? -1 : 1;
+  return (x->diff_min > y->diff_min) - (x->diff_min < y->diff_min);
+}
+
 ForceTarget *force_table_lookup_target_by_key(
     ForceTable *table, int bag, int leave_length, LeaveType type,
     ForceTargetKind kind, int exchange, const MachineLetter *sub_mls,
     int subleave_count, int diff) {
   if (!table || bag < 0 || bag >= FORCE_BAG_MAX) return NULL;
-  // Use the by_bag bucket — small enough that a linear scan is fine
-  // (called only at rare-pool load / resume time, not per game).
-  const int ex = exchange ? 1 : 0;
-  const int n = table->by_bag_count[bag];
-  ForceTarget **arr = table->by_bag_ptrs[bag];
-  for (int i = 0; i < n; i++) {
-    ForceTarget *t = arr[i];
-    if (t->leave_length != leave_length) continue;
-    if ((int)t->leave_type != (int)type) continue;
-    if ((int)t->kind != (int)kind) continue;
-    if (t->exchange != ex) continue;
-    if (t->subleave_count != subleave_count) continue;
-    // Compare every subleave ML in order. For BAG_TILE, sub_mls[1] is the
-    // count-marker (compared here too). For LEAVE, all up to
-    // subleave_count (== leave_length) are compared — the canonical order
-    // makes the comparison position-stable.
-    bool sub_ok = true;
-    for (int k = 0; k < subleave_count; k++) {
-      if (t->subleave_mls[k] != sub_mls[k]) {
-        sub_ok = false;
-        break;
-      }
+  // Sorted-index lookup (2026-10-22). This was a linear scan of the bag's
+  // targets "small enough" for occasional calls, but rare-pool load makes
+  // ~5M calls against bag 93's ~45K targets (every unresolved row scanned
+  // them all): minutes of single-threaded startup. Same match rules: shape +
+  // every subleave ML (BAG_TILE also its count marker in mls[1]), then diff
+  // inside [diff_min, diff_max]. Called only at startup (rare-pool load,
+  // play-index resolve, resume), so the lazy build needs no locking.
+  if (!table->key_index_built[bag]) {
+    const int n = table->by_bag_count[bag];
+    FtKeyEntry *ix =
+        n > 0 ? (FtKeyEntry *)malloc_or_die(sizeof(FtKeyEntry) * (size_t)n)
+              : NULL;
+    for (int i = 0; i < n; i++) {
+      ForceTarget *t = table->by_bag_ptrs[bag][i];
+      ix[i].key = ft_pack_key(t->leave_length, (int)t->leave_type,
+                              (int)t->kind, t->exchange, t->subleave_count,
+                              t->subleave_mls);
+      ix[i].diff_min = t->diff_min;
+      ix[i].t = t;
     }
-    if (!sub_ok) continue;
-    // BAG_TILE carries its count-marker in subleave_mls[1] but reports
-    // subleave_count == 1, so the loop above skips it — check explicitly.
-    if (kind == FORCE_TARGET_BAG_TILE &&
-        t->subleave_mls[1] != sub_mls[1]) continue;
-    if (diff < t->diff_min || diff > t->diff_max) continue;
-    return t;
+    if (n > 1) qsort(ix, (size_t)n, sizeof(FtKeyEntry), ft_key_entry_cmp);
+    table->key_index[bag] = ix;
+    table->key_index_n[bag] = n;
+    table->key_index_built[bag] = true;
+  }
+  const uint64_t key = ft_pack_key(leave_length, (int)type, (int)kind,
+                                   exchange ? 1 : 0, subleave_count, sub_mls);
+  const FtKeyEntry *ix = table->key_index[bag];
+  int lo = 0, hi = table->key_index_n[bag];
+  while (lo < hi) {               // first entry with key >= query
+    const int mid = lo + (hi - lo) / 2;
+    if (ix[mid].key < key) lo = mid + 1; else hi = mid;
+  }
+  for (int i = lo; i < table->key_index_n[bag] && ix[i].key == key; i++) {
+    ForceTarget *t = ix[i].t;
+    if (diff >= t->diff_min && diff <= t->diff_max) return t;
   }
   return NULL;
 }
@@ -1520,6 +1562,7 @@ void force_table_destroy(ForceTable *table) {
   }
   for (int b = 0; b < FORCE_BAG_MAX; b++) {
     free(table->by_bag_ptrs[b]);
+    free(table->key_index[b]);
     for (int L = 0; L < FORCE_LEAVE_LEN_MAX; L++) {
       for (int ex = 0; ex < FORCE_EXCHANGE_MAX; ex++) {
         free(table->by_shape_ptrs[b][L][ex]);

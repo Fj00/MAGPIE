@@ -25,7 +25,33 @@ struct RarePool {
   RareRack *racks;
   int num_racks;
   int cap_racks;
+  // Open-addressing rack -> index table (2026-10-22). find_or_add_rack fell
+  // back to a linear strcmp scan whenever a row's rack wasn't the last one
+  // added -- every row of a second file loaded into the same pool.
+  int *hash;        // racks[] index, -1 = empty
+  int hash_cap;     // power of two, kept > 2 * num_racks
 };
+
+static uint32_t rack_hash(const char *s) {
+  uint32_t h = 2166136261u;                 // FNV-1a
+  for (; *s; s++) h = (h ^ (uint8_t)*s) * 16777619u;
+  return h;
+}
+
+static void rack_hash_insert(RarePool *rp, int idx) {
+  uint32_t m = (uint32_t)rp->hash_cap - 1;
+  uint32_t i = rack_hash(rp->racks[idx].rack) & m;
+  while (rp->hash[i] >= 0) i = (i + 1) & m;
+  rp->hash[i] = idx;
+}
+
+static void rack_hash_grow(RarePool *rp) {
+  free(rp->hash);
+  rp->hash_cap = rp->hash_cap ? rp->hash_cap * 2 : 1024;
+  rp->hash = (int *)malloc_or_die(sizeof(int) * (size_t)rp->hash_cap);
+  for (int i = 0; i < rp->hash_cap; i++) rp->hash[i] = -1;
+  for (int r = 0; r < rp->num_racks; r++) rack_hash_insert(rp, r);
+}
 
 static MachineLetter char_to_ml(const LetterDistribution *ld, char c) {
   if (c == '?') {
@@ -63,9 +89,14 @@ static int find_or_add_rack(RarePool *rp, const char *rack_str) {
       strcmp(rp->racks[rp->num_racks - 1].rack, rack_str) == 0) {
     return rp->num_racks - 1;
   }
-  // General scan as fallback (shouldn't happen for sorted input).
-  for (int i = 0; i < rp->num_racks; i++) {
-    if (strcmp(rp->racks[i].rack, rack_str) == 0) return i;
+  // Hash lookup (was a linear scan of every rack).
+  if (rp->hash_cap > 0) {
+    uint32_t m = (uint32_t)rp->hash_cap - 1;
+    for (uint32_t i = rack_hash(rack_str) & m; rp->hash[i] >= 0;
+         i = (i + 1) & m) {
+      if (strcmp(rp->racks[rp->hash[i]].rack, rack_str) == 0)
+        return rp->hash[i];
+    }
   }
   // Not found — append.
   if (rp->num_racks == rp->cap_racks) {
@@ -83,6 +114,11 @@ static int find_or_add_rack(RarePool *rp, const char *rack_str) {
   r->weights = NULL;
   r->num_targets = 0;
   r->cap_targets = 0;
+  if (2 * rp->num_racks >= rp->hash_cap) {
+    rack_hash_grow(rp);              // rehashes every rack, incl. this one
+  } else {
+    rack_hash_insert(rp, rp->num_racks - 1);
+  }
   return rp->num_racks - 1;
 }
 
@@ -251,6 +287,8 @@ RarePool *rare_pool_create(const char *csv_path, ForceTable *force_table,
   rp->racks = NULL;
   rp->num_racks = 0;
   rp->cap_racks = 0;
+  rp->hash = NULL;
+  rp->hash_cap = 0;
   rare_pool_load_file(rp, csv_path, force_table, ld);
   if (rp->num_racks == 0) {
     rare_pool_destroy(rp);
@@ -276,6 +314,7 @@ void rare_pool_destroy(RarePool *rp) {
     free(rp->racks[i].weights);
   }
   free(rp->racks);
+  free(rp->hash);
   free(rp);
 }
 
