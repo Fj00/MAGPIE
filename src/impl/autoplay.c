@@ -103,6 +103,8 @@ static _Atomic uint64_t g_eb_exch_gen = 0;
 static _Atomic uint64_t g_eb_exch_genbk = 0;
 static _Atomic uint64_t g_eb_exch_slot = 0;
 static _Atomic uint64_t g_eb_exch_slotbk = 0;
+// Exchange slots dropped by the force-table gate (MAGPIE_EB_EXCH_GATE).
+static _Atomic uint64_t g_eb_exch_gated = 0;
 // Multi-credit pipeline cell-count diagnostics. Each is incremented at a
 // distinct stage so we can see whether cells are lost between annotate
 // (slot population), dfs (per-fork-iter propagation into snap arrays),
@@ -4322,6 +4324,8 @@ void print_current_status(AutoplayWorker *autoplay_worker,
         &g_eb_exch_slot, 0, memory_order_relaxed);
     const uint64_t exch_slotbk = atomic_exchange_explicit(
         &g_eb_exch_slotbk, 0, memory_order_relaxed);
+    const uint64_t exch_gated = atomic_exchange_explicit(
+        &g_eb_exch_gated, 0, memory_order_relaxed);
     string_builder_add_formatted_string(
         status_sb,
         " counters: leaves=%llu annot=%llu prop=%llu emitc=%llu "
@@ -4335,7 +4339,7 @@ void print_current_status(AutoplayWorker *autoplay_worker,
         "l3p_match[STRAT,TILE,PAIR]=%llu,%llu,%llu "
         "perfcnt: post_turns=%llu movegens=%llu copies=%llu "
         "tgt_fanout=%llu/%llu force_decs=%llu "
-        "exch[gen=%llu genbk=%llu slot=%llu slotbk=%llu].\n",
+        "exch[gen=%llu genbk=%llu slot=%llu slotbk=%llu gated=%llu].\n",
         (unsigned long long)leaves,
         (unsigned long long)annot,
         (unsigned long long)prop,
@@ -4384,7 +4388,8 @@ void print_current_status(AutoplayWorker *autoplay_worker,
         (unsigned long long)exch_gen,
         (unsigned long long)exch_genbk,
         (unsigned long long)exch_slot,
-        (unsigned long long)exch_slotbk);
+        (unsigned long long)exch_slotbk,
+        (unsigned long long)exch_gated);
   } else {
     string_builder_add_string(status_sb, "\n");
   }
@@ -5249,6 +5254,39 @@ static int eb_enumerate_actions(AutoplayWorker *w, GameRunner *gr) {
   // implicitly at the target turn whenever a force_table is loaded.
   if (role == EB_ROLE_TARGET && w->shared_data->force_table != NULL) {
     eb_annotate_force_targets_to_slots(w, gr, max_slot);
+  }
+
+  // Exchange gate (2026-10-22, MAGPIE_EB_EXCH_GATE, default ON; "0" = off):
+  // like plays, an exchange is branched only while it still feeds a cell the
+  // force table needs (its stratum, or a kept tile / pair at that keep length,
+  // any of them with deficit). The best-equity exchange (first exchange slot:
+  // ml is equity-sorted and exchanges fill first) and the natural move always
+  // stay. Before this every distinct exchange of every rack was played out
+  // (~590 of ~650 branches a game), long after the exchange cells were full:
+  // bag 93 T6 v3 wrote 166 GB of exchange rows vs 1.7 GB of plays.
+  if (role == EB_ROLE_TARGET && w->shared_data->force_table != NULL) {
+    static int exch_gate = -1;   // benign race: every thread reads the same env
+    if (exch_gate < 0) {
+      const char *e = getenv("MAGPIE_EB_EXCH_GATE");
+      exch_gate = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (exch_gate) {
+      bool best_exch_seen = false;
+      for (int s = 1; s <= max_slot; s++) {
+        if (!gr->eb_action_present[s] ||
+            move_get_type(gr->eb_action_buf[s]) != GAME_EVENT_EXCHANGE)
+          continue;
+        if (!best_exch_seen) {
+          best_exch_seen = true;
+          continue;
+        }
+        if (s == gr->eb_natural_slot ||
+            gr->eb_force_target_count_for_slot[s] > 0)
+          continue;
+        gr->eb_action_present[s] = false;
+        atomic_fetch_add_explicit(&g_eb_exch_gated, 1, memory_order_relaxed);
+      }
+    }
   }
 
   // Need at least 2 populated slots for the fork to be meaningful.
