@@ -783,6 +783,11 @@ typedef struct AutoplayWorker {
   // there would prune to top-1. This list is sized to fit all moves at any
   // empty-board position (~127 exchanges + ~500 plays).
   MoveList *eb_move_list;
+  // EB post-target picks by the bag models once tiles are down (2026-10-22).
+  // Sized like the fill's post_ml (250000, MAGPIE_VMODEL_MOVE_CAP): a
+  // mid-game position can have far more moves than eb_move_list's 2000, and a
+  // truncated list drops exactly the buried moves the model exists to find.
+  MoveList *eb_post_move_list;
   // Pre-computed leaves per move in force_move_list, populated once per turn
   // before the target-matching loop. Avoids 46M get_leave_for_move calls/turn
   // in the worst case (B1 optimization).
@@ -849,6 +854,19 @@ AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
         autoplay_worker->force_leaves_capacity > 0 ? autoplay_worker->force_leaves_capacity : 2000;
     autoplay_worker->eb_move_list = move_list_create(eb_cap);
   }
+  autoplay_worker->eb_post_move_list = NULL;
+  // Same recorder condition as game_runner->eb_active.
+  if ((shared_data->empty_board_recorder != NULL ||
+       shared_data->empty_board_strata_recorder != NULL) &&
+      shared_data->vmodel_bags_any_loaded) {
+    int post_cap = 250000;
+    const char *e = getenv("MAGPIE_VMODEL_MOVE_CAP");
+    if (e != NULL) {
+      int v = atoi(e);
+      if (v >= 1000 && v <= 1000000) post_cap = v;
+    }
+    autoplay_worker->eb_post_move_list = move_list_create(post_cap);
+  }
 
   autoplay_worker->sim_results = NULL;
   autoplay_worker->inference_results = NULL;
@@ -885,6 +903,7 @@ void autoplay_worker_destroy(AutoplayWorker *autoplay_worker) {
   move_list_destroy(autoplay_worker->move_lists[1]);
   move_list_destroy(autoplay_worker->force_move_list);
   move_list_destroy(autoplay_worker->eb_move_list);
+  move_list_destroy(autoplay_worker->eb_post_move_list);
   free(autoplay_worker->force_leaves);
   free(autoplay_worker->force_leave_bitmaps);
   free(autoplay_worker);
@@ -3848,6 +3867,19 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
   }
   if (!move) {
     move = vmodel_pick_top_move(autoplay_worker, game_runner);
+  }
+  // EB post-target turns once tiles are down (2026-10-22): the bag 8-91 models
+  // (MAGPIE_VMODEL_BAGS) pick, with the same picker as the endgame chain's
+  // playouts (incl. its exact six-pass pass-out rule). Before this every such
+  // move was HastyBot. No model below 8 unseen -> NULL -> HastyBot endgame,
+  // as in the fill. Own full-size list (eb_post_move_list), see its comment.
+  if (!move && game_runner->eb_active &&
+      autoplay_worker->eb_post_move_list &&
+      board_get_tiles_played(game_get_board(game)) != 0) {
+    move = vmodel_endgame_pick_move(
+        game, game_runner->shared_data->vmodels_by_bag,
+        game_runner->shared_data->vmodel_static_leaves,
+        autoplay_worker->worker_index, autoplay_worker->eb_post_move_list);
   }
   if (!move && game_runner->pass_cycle_active &&
       game_runner->pass_cycle_branch == 0 &&
