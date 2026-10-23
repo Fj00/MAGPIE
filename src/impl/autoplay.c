@@ -1894,6 +1894,14 @@ void game_runner_start(AutoplayWorker *autoplay_worker, GameRunner *game_runner,
         // at T6 (the recording turn), not here — see
         // inject_rare_rack_at_recording_turn.
         bool p2_drawn = false;
+        // Target T1 (2026-10-22): P2 has made no choice yet at T1, so its rack
+        // is a plain bag draw, not a pass-cycle pool sample (the pool is
+        // conditioned on having passed/exchanged, half of it pass-favorable).
+        // Recorded as p2_rack_source 1. T2+ keep the pool rack: there the
+        // opponent has already passed or exchanged.
+        if (game_runner->shared_data->eb_target_turn == 1) {
+          game_runner->eb_p2_rack_source = 1;
+        }
         if (game_runner->eb_p2_rack_source == 0) {
           const int p2_target_is_pass =
               (game_runner->eb_p2_force_kind == 0) ? 1 : 0;
