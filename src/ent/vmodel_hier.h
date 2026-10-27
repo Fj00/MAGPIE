@@ -38,6 +38,7 @@ typedef struct VModelHier {
   bool l2_counts, blank_types, blank_mixed;
   bool count_steps;                 // kept-tile counts as 1/2/3+ steps (cstep_)
   bool count_cum;                   // cumulative >=1..>=4 steps (cge_), no XX pairs
+  bool play_unseen_pairs;           // plays / exchanges get unseen pair counts too
   bool pass_sixpass;                // pass rows were fit on sixpass_diff
   int pass_unseen;
   // stratum index by (kind, keep length, type); -1 = no curve (shared one only)

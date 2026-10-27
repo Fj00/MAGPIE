@@ -194,6 +194,7 @@ VModelHier *vmodel_hier_create(const char *path) {
         else if (!strcmp(t, "pass_sixpass")) m->pass_sixpass = v;
         else if (!strcmp(t, "count_steps")) m->count_steps = v;
         else if (!strcmp(t, "count_cum")) m->count_cum = v;
+        else if (!strcmp(t, "play_unseen_pairs")) m->play_unseen_pairs = v;
         else { fprintf(stderr, "vmodel_hier: unknown opt %s\n", t); goto done; }
       }
     } else if (strcmp(key, "type_lengths") == 0 || strcmp(key, "type_kinds") == 0) {
@@ -402,6 +403,15 @@ static void block_unseen(const VModelHier *m, const int unseen[VMH_NT], double *
       axpy(m, m->beq_row[t][0], 1.0, vec);
     } else if (u == 1) {
       axpy(m, m->beq_row[t][1], 1.0, vec);
+    }
+  }
+  if (m->play_unseen_pairs) {          // bags 8-9: unseen pair counts (upair_ rows)
+    for (int i = 0; i < VMH_NT; i++) {
+      for (int j = i; j < VMH_NT; j++) {
+        if (i == j && TILE_BAG[i] < 2) continue;
+        int v = (i == j) ? unseen[i] * (unseen[i] - 1) / 2 : unseen[i] * unseen[j];
+        if (v) axpy(m, m->upair_row[i][j], v, vec);
+      }
     }
   }
 }
