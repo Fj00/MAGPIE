@@ -32,6 +32,7 @@
 
 typedef struct VModelHier {
   int bag;
+  int turn;                         // bag-93 turn model (1..6); 0 = a bag model
   int feat_k, int_k, J;
   bool g_len, g_kind, g_type, g_blank, g_xlen;
   bool l2_counts, blank_types, blank_mixed;

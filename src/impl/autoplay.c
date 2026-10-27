@@ -94,6 +94,9 @@ static _Atomic uint64_t g_eb_post_turns_total = 0;
 // otherwise). MAGPIE_VMODEL_HIER=0 ignores them (A/B). Read-only after load.
 #define VMH_MAX_BAG 94   // == VMODEL_MAX_BAG (defined further down this file)
 static VModelHier *g_vmh_by_bag[VMH_MAX_BAG];
+// bag-93 turn models (T1..T6) from .vmh entries in MAGPIE_VMODEL_PATHS; used by
+// vmodel_pick_top_move instead of the .vmt for that turn
+static VModelHier *g_vmh_turn[7];
 static int g_vmh_use = 1;
 static _Atomic uint64_t g_vmh_scored = 0;     // moves scored by a .vmh model
 static _Thread_local VmhTurnCache *tl_vmh_tc = NULL;
@@ -1339,10 +1342,28 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
                   "(leaves_6=%s leaves_7=%s)",
                   l6 ? l6 : "(null)", l7 ? l7 : "(null)");
       }
+      {
+        const char *e = getenv("MAGPIE_VMODEL_HIER");
+        g_vmh_use = (e && e[0] == '0') ? 0 : 1;
+      }
       char *saveptr = NULL;
       for (char *p = strtok_r(combined, ":", &saveptr); p;
            p = strtok_r(NULL, ":", &saveptr)) {
         if (p[0] == '\0') continue;
+        const size_t pl = strlen(p);
+        if (pl >= 4 && strcmp(p + pl - 4, ".vmh") == 0) {
+          if (!g_vmh_use) continue;
+          VModelHier *hm = vmodel_hier_create(p);
+          if (!hm) log_fatal("vmodel: failed to load %s", p);
+          if (hm->turn < 1 || hm->turn > 6)
+            log_fatal("vmodel: %s has turn %d (export with --turn 1..6)", p, hm->turn);
+          if (g_vmh_turn[hm->turn])
+            log_fatal("vmodel: duplicate .vmh for turn %d (%s)", hm->turn, p);
+          g_vmh_turn[hm->turn] = hm;
+          shared_data->vmodel_any_loaded = 1;
+          fprintf(stderr, "vmodel: loaded %s for T%d (hierarchical)\n", p, hm->turn);
+          continue;
+        }
         VModel *m = vmodel_create(p);
         if (!m) log_fatal("vmodel: failed to load %s", p);
         if (m->turn < 1 || m->turn > 6) {
@@ -2963,7 +2984,8 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
   const int game_turn = game_runner->turn_number + 1;
   if (game_turn < 1 || game_turn > 6) return NULL;
   const VModel *model = shared->vmodels[game_turn];
-  if (!model) return NULL;
+  const VModelHier *hmod = g_vmh_use ? g_vmh_turn[game_turn] : NULL;
+  if (!model && !hmod) return NULL;
   Game *game = game_runner->game;
   // V model assumes bag=93 / board empty / both scores 0 (its training
   // distribution). Skip if the game state doesn't match those
@@ -3018,6 +3040,19 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
   const int pre_diff =
       equity_to_int(player_get_score(me)) - equity_to_int(player_get_score(opp));
 
+  if (hmod) {
+    // empty board: the unseen pool is the full bag minus the rack, as the bag-93
+    // training rows were built (hier_model.row_unseen)
+    static const uint8_t full_bag[VMH_NT] = {2, 9, 2, 2, 4, 12, 2, 3, 2, 9, 1, 1, 4, 2,
+                                             6, 8, 2, 1, 6, 4, 6, 4, 2, 2, 1, 2, 1};
+    int unseen93[VMH_NT];
+    for (int t = 0; t < VMH_NT; t++) unseen93[t] = full_bag[t];
+    for (int k = 0; k < rack_len; k++) unseen93[rack_idx[k]]--;
+    if (!tl_vmh_tc) tl_vmh_tc = vmh_turn_cache_create();
+    vmh_turn_begin(tl_vmh_tc, hmod, rack_idx, rack_len, unseen93, vmh_static_cb,
+                   (void *)shared->vmodel_static_leaves);
+  }
+
   Move *best_move = NULL;
   float best_win  = -1.0f;
   int   best_idx  = -1;  // equity-sorted index of best_move (for rank stats)
@@ -3062,8 +3097,9 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
     int cleave_len = leave_len < STATIC_LEAVES_MAX_LEN ? leave_len
                                                        : STATIC_LEAVES_MAX_LEN;
     static_leaves_canonicalize(leave_idx, cleave_len, cleave);
-    float p = vmcache_get(cache, (uint8_t)kind, cleave, cleave_len, diff);
-    if (p < -1.5f) {
+    float p = hmod ? (float)vmh_turn_predict(tl_vmh_tc, leave_idx, leave_len, kind, diff)
+                   : vmcache_get(cache, (uint8_t)kind, cleave, cleave_len, diff);
+    if (!hmod && p < -1.5f) {
       // miss
       p = vmodel_predict(
           model,
@@ -3098,8 +3134,23 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
     int pass_clen = rack_len < STATIC_LEAVES_MAX_LEN ? rack_len
                                                       : STATIC_LEAVES_MAX_LEN;
     static_leaves_canonicalize(rack_idx, pass_clen, pass_cleave);
-    float p_pass = vmcache_get(cache, 0, pass_cleave, pass_clen, pre_diff);
-    if (p_pass < -1.5f) {
+    float p_pass;
+    if (hmod) {
+      int pd = pre_diff;
+      if (hmod->pass_sixpass) {
+        uint8_t rc[VMH_NT] = {0};
+        int u93[VMH_NT];
+        static const uint8_t fb[VMH_NT] = {2, 9, 2, 2, 4, 12, 2, 3, 2, 9, 1, 1, 4, 2,
+                                           6, 8, 2, 1, 6, 4, 6, 4, 2, 2, 1, 2, 1};
+        for (int k = 0; k < rack_len; k++) rc[rack_idx[k]]++;
+        for (int t = 0; t < VMH_NT; t++) u93[t] = fb[t] - rc[t];
+        pd = vmodel_hier_sixpass_diff(rc, u93, pre_diff);
+      }
+      p_pass = (float)vmh_turn_predict(tl_vmh_tc, rack_idx, rack_len, 0, pd);
+    } else {
+      p_pass = vmcache_get(cache, 0, pass_cleave, pass_clen, pre_diff);
+    }
+    if (!hmod && p_pass < -1.5f) {
       p_pass = vmodel_predict(
           model, rack_idx, rack_len,
           rack_idx, rack_len,  // pass: leave == rack
@@ -3148,6 +3199,27 @@ static const Move *vmodel_pick_top_move(AutoplayWorker *autoplay_worker,
     get_leave_for_move(best_move, game, &leave_rack);
     uint8_t bm_leave_idx[16];
     int bm_leave_len = vmodel_extract_rack_indices(&leave_rack, bm_leave_idx, 16);
+    // MAGPIE_VMODEL_TURN_PICK_LOG=1: one line per pick (check against the Python
+    // book: picktest_turn_compare.py)
+    static int turn_pick_log = -1;
+    if (turn_pick_log < 0) turn_pick_log = getenv("MAGPIE_VMODEL_TURN_PICK_LOG") ? 1 : 0;
+    if (turn_pick_log) {
+      char rs[16], ls[16];
+      int n = 0;
+      for (int k = 0; k < rack_len && n < 15; k++)
+        rs[n++] = rack_idx[k] ? (char)('A' + rack_idx[k] - 1) : '?';
+      rs[n] = '\0';
+      n = 0;
+      for (int k = 0; k < bm_leave_len && n < 15; k++)
+        ls[n++] = bm_leave_idx[k] ? (char)('A' + bm_leave_idx[k] - 1) : '?';
+      ls[n] = '\0';
+      const int bk = move_get_type(best_move) == GAME_EVENT_PASS       ? 0
+                     : move_get_type(best_move) == GAME_EVENT_EXCHANGE ? 1 : 2;
+      printf("[turnpick] T%d %s rack %s -> %d:%d:%s %.4f\n", game_turn,
+             hmod ? "vmh" : "vmt", rs, bk,
+             bk == 2 ? equity_to_int(move_get_score(best_move)) : 0, ls, best_win);
+      fflush(stdout);
+    }
     int leave_pts = vmodel_indices_to_pts(bm_leave_idx, bm_leave_len);
     if (leave_pts < 0) leave_pts = 0;
     if (leave_pts >= VMDBG_PTS_BUCKETS) leave_pts = VMDBG_PTS_BUCKETS - 1;

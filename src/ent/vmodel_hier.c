@@ -145,6 +145,8 @@ VModelHier *vmodel_hier_create(const char *path) {
       break;
     } else if (strcmp(key, "bag") == 0) {
       if (!tok_int(&rest, &m->bag)) goto done;
+    } else if (strcmp(key, "turn") == 0) {
+      if (!tok_int(&rest, &m->turn)) goto done;
     } else if (strcmp(key, "degree") == 0) {
       int d;
       if (!tok_int(&rest, &d) || d != 3) goto done;
