@@ -79,6 +79,14 @@ static void map_feature(VModelHier *m, const char *name, int row) {
     m->static_row = row;
   } else if (strncmp(name, "cnt_", 4) == 0 && n == 5) {
     if ((a = tile_index(name[4])) >= 0) m->cnt_row[a] = row;
+  } else if (strncmp(name, "cstep_", 6) == 0 && n == 9 && name[7] == '_') {
+    a = tile_index(name[6]);
+    b = name[8] - '0';
+    if (a >= 0 && b >= 1 && b <= 3) m->cstep_row[a][b] = row;
+  } else if (strncmp(name, "cge_", 4) == 0 && n == 7 && name[5] == '_') {
+    a = tile_index(name[4]);
+    b = name[6] - '0';
+    if (a >= 0 && b >= 1 && b <= 4) m->cge_row[a][b] = row;
   } else if (strncmp(name, "pairp_", 6) == 0 && n == 8) {
     a = tile_index(name[6]), b = tile_index(name[7]);
     if (a >= 0 && b >= 0) m->pairp_row[a][b] = row;
@@ -126,6 +134,8 @@ VModelHier *vmodel_hier_create(const char *path) {
   int strata_read = 0, rows_read = 0, n_rows = -1;
   m->static_row = -1;
   memset(m->cnt_row, -1, sizeof(m->cnt_row));
+  memset(m->cstep_row, -1, sizeof(m->cstep_row));
+  memset(m->cge_row, -1, sizeof(m->cge_row));
   memset(m->pair_row, -1, sizeof(m->pair_row));
   memset(m->pairp_row, -1, sizeof(m->pairp_row));
   memset(m->ucnt_row, -1, sizeof(m->ucnt_row));
@@ -182,6 +192,8 @@ VModelHier *vmodel_hier_create(const char *path) {
         else if (!strcmp(t, "blank_mixed")) m->blank_mixed = v;
         else if (!strcmp(t, "pass_unseen")) m->pass_unseen = v;
         else if (!strcmp(t, "pass_sixpass")) m->pass_sixpass = v;
+        else if (!strcmp(t, "count_steps")) m->count_steps = v;
+        else if (!strcmp(t, "count_cum")) m->count_cum = v;
         else { fprintf(stderr, "vmodel_hier: unknown opt %s\n", t); goto done; }
       }
     } else if (strcmp(key, "type_lengths") == 0 || strcmp(key, "type_kinds") == 0) {
@@ -346,15 +358,28 @@ static inline void axpy(const VModelHier *m, int row, double x, double *vec) {
 // kept-tile counts (L1, L3+, L2 with l2_counts) and pair counts + presence
 static void block_leave(const VModelHier *m, const uint8_t leave[VMH_NT], int len,
                         double *vec) {
-  if (len == 1 || len >= 3 || (len == 2 && m->l2_counts)) {
-    for (int t = 0; t < VMH_NT; t++)
-      if (leave[t]) axpy(m, m->cnt_row[t], leave[t], vec);
+  const bool counts_on = len == 1 || len >= 3 || (len == 2 && m->l2_counts);
+  if (counts_on) {
+    for (int t = 0; t < VMH_NT; t++) {
+      const int n = leave[t];
+      if (!n) continue;
+      if (m->count_cum) {                    // EEEE: >=1, >=2, >=3, >=4 all on
+        for (int k = 1; k <= (n < 4 ? n : 4); k++) axpy(m, m->cge_row[t][k], 1.0, vec);
+      } else if (m->count_steps) {
+        axpy(m, m->cstep_row[t][n < 3 ? n : 3], 1.0, vec);
+      } else {
+        axpy(m, m->cnt_row[t], n, vec);
+      }
+    }
   }
+  // Pairs. With count_steps / count_cum the product columns of repeatable pairs
+  // were never trained (zero weight, not exported), and the others equal presence,
+  // so emitting product + presence reproduces Python without its pair lists.
   if (len >= 2) {
     for (int a = 0; a < VMH_NT; a++) {
       if (!leave[a]) continue;
       int na = leave[a];
-      if (na >= 2) {
+      if (na >= 2 && !(m->count_cum && counts_on)) {
         axpy(m, m->pair_row[a][a], na * (na - 1) / 2.0, vec);
         axpy(m, m->pairp_row[a][a], 1.0, vec);
       }

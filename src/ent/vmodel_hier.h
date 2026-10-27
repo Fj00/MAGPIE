@@ -36,6 +36,8 @@ typedef struct VModelHier {
   int feat_k, int_k, J;
   bool g_len, g_kind, g_type, g_blank, g_xlen;
   bool l2_counts, blank_types, blank_mixed;
+  bool count_steps;                 // kept-tile counts as 1/2/3+ steps (cstep_)
+  bool count_cum;                   // cumulative >=1..>=4 steps (cge_), no XX pairs
   bool pass_sixpass;                // pass rows were fit on sixpass_diff
   int pass_unseen;
   // stratum index by (kind, keep length, type); -1 = no curve (shared one only)
@@ -53,6 +55,8 @@ typedef struct VModelHier {
   // feature -> row index (-1 = absent / zero weight)
   int static_row;
   int cnt_row[VMH_NT];
+  int cstep_row[VMH_NT][4];         // [t][1..3]
+  int cge_row[VMH_NT][5];           // [t][1..4]
   int pair_row[VMH_NT][VMH_NT];     // [i][j], i <= j
   int pairp_row[VMH_NT][VMH_NT];
   int ucnt_row[VMH_NT];
