@@ -35,7 +35,10 @@ typedef struct VModelHier {
   int feat_k, int_k, J;
   bool g_len, g_kind, g_type, g_blank, g_xlen;
   bool l2_counts, blank_types, blank_mixed;
+  bool pass_sixpass;                // pass rows were fit on sixpass_diff
   int pass_unseen;
+  // stratum index by (kind, keep length, type); -1 = no curve (shared one only)
+  int16_t sidx[VMH_N_KIND][VMH_N_LEN][VMH_N_TYPE];
   bool type_len[VMH_N_LEN];
   bool type_kind[VMH_N_KIND];
   int n_kf, n_ki;
@@ -80,5 +83,31 @@ double vmodel_hier_predict(const VModelHier *m, const uint8_t rack[VMH_NT],
 // The type index (0..6) hier_model.leave_type would give this leave.
 int vmodel_hier_leave_type(const VModelHier *m, const uint8_t leave[VMH_NT],
                            int kind);
+
+// sixpass_diff (v_model_features.sixpass_diff): lead - (mover's rack points) +
+// (points of the RACK_SIZE cheapest unseen tiles). The pass's diff axis when the
+// model was fit on it (m->pass_sixpass); otherwise the pass uses the plain lead.
+int vmodel_hier_sixpass_diff(const uint8_t rack[VMH_NT], const int unseen[VMH_NT],
+                             int lead);
+
+// ---------------------------------------------------------------- turn cache
+// Same answer as vmodel_hier_predict, much less work in a picker: the unseen
+// block (and the pass's block) is summed once per turn, each distinct leave's
+// features once per turn (a rack has at most 127 leaves), and every move then
+// costs one dot product of <= 9 selector entries.
+typedef float (*VmhStaticFn)(const uint8_t *leave_idx, int leave_len, void *ctx);
+
+typedef struct VmhTurnCache VmhTurnCache;
+VmhTurnCache *vmh_turn_cache_create(void);
+void vmh_turn_cache_destroy(VmhTurnCache *c);
+// rack_idx: the mover's rack as sorted tile indices; unseen: the mover's pool.
+// static_fn(ctx) gives a leave's static value (called once per distinct leave).
+void vmh_turn_begin(VmhTurnCache *c, const VModelHier *m, const uint8_t *rack_idx,
+                    int rack_len, const int unseen[VMH_NT], VmhStaticFn static_fn,
+                    void *static_ctx);
+// leave_idx: sorted tile indices of the kept tiles; diff as vmodel_hier_predict
+// (the caller converts a pass to sixpass_diff when m->pass_sixpass).
+double vmh_turn_predict(VmhTurnCache *c, const uint8_t *leave_idx, int leave_len,
+                        int kind, int diff);
 
 #endif

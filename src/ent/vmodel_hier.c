@@ -9,8 +9,13 @@
 // line there; keep them in step. tools/vmh_check.c compares the two on real
 // moves.
 
+#define VMH_J_MAX 64
+
 static const uint8_t TILE_BAG[VMH_NT] = {2, 9, 2, 2, 4, 12, 2, 3, 2, 9, 1, 1, 4, 2,
                                          6, 8, 2, 1, 6, 4, 6, 4, 2, 2, 1, 2, 1};
+// tile points, same alphabet (blank 0) -- for sixpass_diff
+static const uint8_t TILE_VALUE[VMH_NT] = {0, 1, 3, 3, 2, 1, 4, 2, 4, 1, 8, 5, 1, 3,
+                                           1, 1, 3, 10, 1, 1, 1, 1, 4, 4, 8, 4, 10};
 // AEIOUY (python VOWELS); blank is neither
 static const bool IS_VOWEL[VMH_NT] = {
     false, true,  false, false, false, true,  false, false, false, true,
@@ -20,6 +25,10 @@ static const bool IS_VOWEL[VMH_NT] = {
 enum { T_ALL = 0, T_CONS, T_MIXED, T_VOWEL, T_CONSB, T_MIXEDB, T_VOWELB };
 static const char *TYPE_NAME[VMH_N_TYPE] = {"all",   "cons",   "mixed", "vowel",
                                            "cons?", "mixed?", "vowel?"};
+
+static void stratum_key(char *out, int kind, int len, int typ, bool use_type) {
+  snprintf(out, 24, "K%d_L%d_%s", kind, len, use_type ? TYPE_NAME[typ] : "all");
+}
 
 static int tile_index(char c) {
   if (c == '?') return 0;
@@ -146,7 +155,7 @@ VModelHier *vmodel_hier_create(const char *path) {
         goto done;
       if (!(t = tok(&rest)) || strcmp(t, "J") || !tok_int(&rest, &m->J)) goto done;
       if (m->J != m->feat_k + VMH_N_LEN + VMH_N_KIND + VMH_N_TYPE + VMH_N_BLANK +
-                      VMH_N_XLEN) {
+                      VMH_N_XLEN || m->J > VMH_J_MAX) {
         fprintf(stderr, "vmodel_hier: J %d does not match this build's layout\n", m->J);
         goto done;
       }
@@ -170,6 +179,7 @@ VModelHier *vmodel_hier_create(const char *path) {
         else if (!strcmp(t, "blank_types")) m->blank_types = v;
         else if (!strcmp(t, "blank_mixed")) m->blank_mixed = v;
         else if (!strcmp(t, "pass_unseen")) m->pass_unseen = v;
+        else if (!strcmp(t, "pass_sixpass")) m->pass_sixpass = v;
         else { fprintf(stderr, "vmodel_hier: unknown opt %s\n", t); goto done; }
       }
     } else if (strcmp(key, "type_lengths") == 0 || strcmp(key, "type_kinds") == 0) {
@@ -220,6 +230,17 @@ VModelHier *vmodel_hier_create(const char *path) {
             strata_read, m->n_strata, rows_read, n_rows);
     ok = false;
   }
+  if (ok) {   // stratum curve per (kind, len, type): no string compares per move
+    char key[24];
+    for (int k = 0; k < VMH_N_KIND; k++)
+      for (int l = 0; l < VMH_N_LEN; l++)
+        for (int t = 0; t < VMH_N_TYPE; t++) {
+          stratum_key(key, k, l, t, m->g_type);
+          m->sidx[k][l][t] = -1;
+          for (int s = 0; s < m->n_strata; s++)
+            if (strcmp(m->strata_key[s], key) == 0) { m->sidx[k][l][t] = (int16_t)s; break; }
+        }
+  }
 done:
   free(line);
   fclose(f);
@@ -235,8 +256,8 @@ done:
 // Clamped cubic B-spline basis at x (hier_model.basis): x clamped to
 // [t[3], t[n-4] - 1e-9 * max(1, |t[n-4]|)], span = largest i in [3, nb-1] with
 // t[i] <= x, Cox-de Boor; values rounded to float32 as Python stores them.
-// out[nb] zeroed except the 4 active entries; returns the first active index.
-static int bspline_basis(const double *t, int n_knots, double x, double *out) {
+// Writes the 4 active values to out4; returns the first active basis index.
+static int bspline_basis4(const double *t, int n_knots, double x, double out4[4]) {
   const int p = 3, nb = n_knots - p - 1;
   double lo = t[p], hi = t[n_knots - p - 1];
   double cap = hi - 1e-9 * (fabs(hi) > 1.0 ? fabs(hi) : 1.0);
@@ -257,8 +278,7 @@ static int bspline_basis(const double *t, int n_knots, double x, double *out) {
     }
     N[j] = saved;
   }
-  for (int k = 0; k < nb; k++) out[k] = 0.0;
-  for (int k = 0; k <= p; k++) out[i - p + k] = (double)(float)N[k];
+  for (int k = 0; k <= p; k++) out4[k] = (double)(float)N[k];
   return i - p;
 }
 
@@ -293,17 +313,120 @@ int vmodel_hier_leave_type(const VModelHier *m, const uint8_t leave[VMH_NT],
   return classify(leave, len);
 }
 
-// ------------------------------------------------------------------ predict
-static void stratum_key(char *out, int kind, int len, int typ, bool use_type) {
-  snprintf(out, 24, "K%d_L%d_%s", kind, len, use_type ? TYPE_NAME[typ] : "all");
+int vmodel_hier_sixpass_diff(const uint8_t rack[VMH_NT], const int unseen[VMH_NT],
+                             int lead) {
+  int mover = 0;
+  for (int t = 0; t < VMH_NT; t++) mover += rack[t] * TILE_VALUE[t];
+  int need = 7, add = 0;
+  for (int v = 0; v <= 10 && need > 0; v++) {
+    for (int t = 0; t < VMH_NT && need > 0; t++) {
+      if (TILE_VALUE[t] != v) continue;
+      int c = unseen[t];
+      if (c <= 0) continue;
+      int take = c < need ? c : need;
+      add += take * v;
+      need -= take;
+    }
+  }
+  return lead - mover + add;
 }
 
-static inline double feat_coef(const VModelHier *m, int row, const int *sel_idx,
-                               const double *sel_val, int n_sel) {
+// ------------------------------------------------------------------ feature blocks
+// Each block adds sum_f x_f * W[f] (all J columns) into vec. The prediction is
+// then (sum of the move's blocks) . Sel + intercept curve; the turn cache keeps
+// the per-turn and per-leave blocks.
+static inline void axpy(const VModelHier *m, int row, double x, double *vec) {
+  if (row < 0 || x == 0.0) return;
   const double *w = m->w + (size_t)row * m->J;
-  double c = 0.0;
-  for (int k = 0; k < n_sel; k++) c += w[sel_idx[k]] * sel_val[k];
-  return c;
+  for (int j = 0; j < m->J; j++) vec[j] += x * w[j];
+}
+
+// kept-tile counts (L1, L3+, L2 with l2_counts) and pair counts + presence
+static void block_leave(const VModelHier *m, const uint8_t leave[VMH_NT], int len,
+                        double *vec) {
+  if (len == 1 || len >= 3 || (len == 2 && m->l2_counts)) {
+    for (int t = 0; t < VMH_NT; t++)
+      if (leave[t]) axpy(m, m->cnt_row[t], leave[t], vec);
+  }
+  if (len >= 2) {
+    for (int a = 0; a < VMH_NT; a++) {
+      if (!leave[a]) continue;
+      int na = leave[a];
+      if (na >= 2) {
+        axpy(m, m->pair_row[a][a], na * (na - 1) / 2.0, vec);
+        axpy(m, m->pairp_row[a][a], 1.0, vec);
+      }
+      for (int b = a + 1; b < VMH_NT; b++) {
+        if (!leave[b]) continue;
+        axpy(m, m->pair_row[a][b], (double)(na * leave[b]), vec);
+        axpy(m, m->pairp_row[a][b], 1.0, vec);
+      }
+    }
+  }
+}
+
+// draw block (plays / exchanges): unseen counts and bag_eq indicators
+static void block_unseen(const VModelHier *m, const int unseen[VMH_NT], double *vec) {
+  for (int t = 0; t < VMH_NT; t++) {
+    int u = unseen[t];
+    if (TILE_BAG[t] != 2) {
+      if (u) axpy(m, m->ucnt_row[t], u, vec);
+    } else if (u == 0) {
+      axpy(m, m->beq_row[t][0], 1.0, vec);
+    } else if (u == 1) {
+      axpy(m, m->beq_row[t][1], 1.0, vec);
+    }
+  }
+}
+
+// the pass's own unseen block (pass_unseen 1: counts, 2: + pair counts)
+static void block_pass(const VModelHier *m, const int unseen[VMH_NT], double *vec) {
+  if (m->pass_unseen < 1) return;
+  for (int t = 0; t < VMH_NT; t++)
+    if (unseen[t]) axpy(m, m->pcnt_row[t], unseen[t], vec);
+  if (m->pass_unseen < 2) return;
+  for (int i = 0; i < VMH_NT; i++) {
+    for (int j = i; j < VMH_NT; j++) {
+      if (i == j && TILE_BAG[i] < 2) continue;
+      int v = (i == j) ? unseen[i] * (unseen[i] - 1) / 2 : unseen[i] * unseen[j];
+      if (v) axpy(m, m->upair_row[i][j], v, vec);
+    }
+  }
+}
+
+// exchanged tiles (rack - leave)
+static void block_exch(const VModelHier *m, const uint8_t rack[VMH_NT],
+                       const uint8_t leave[VMH_NT], double *vec) {
+  for (int t = 0; t < VMH_NT; t++) {
+    int d = (int)rack[t] - (int)leave[t];
+    if (d) axpy(m, m->exch_row[t], d, vec);
+  }
+}
+
+// Sel . vec + intercept curve -> win probability
+static double finish(const VModelHier *m, const double *vec, int len, int kind,
+                     int typ, int hb, int diff) {
+  double bf[4], bi[4];
+  int b0 = bspline_basis4(m->knots_f, m->n_kf, (double)diff, bf);
+  double z = 0.0;
+  for (int k = 0; k < 4; k++) z += bf[k] * vec[b0 + k];
+  const int K = m->feat_k, o_kind = K + VMH_N_LEN, o_type = o_kind + VMH_N_KIND,
+            o_blank = o_type + VMH_N_TYPE, o_xlen = o_blank + VMH_N_BLANK;
+  if (m->g_len) z += vec[K + len];
+  if (m->g_kind) z += vec[o_kind + kind];
+  if (m->g_type) z += vec[o_type + typ];
+  if (m->g_blank) z += vec[o_blank + hb];
+  if (m->g_xlen && kind == 1) z += vec[o_xlen + len];
+  int c0 = bspline_basis4(m->knots_i, m->n_ki, (double)diff, bi);
+  const int si = (len < VMH_N_LEN) ? m->sidx[kind][len][typ] : -1;
+  const double *as = si >= 0 ? m->a_s + (size_t)si * m->int_k : NULL;
+  for (int k = 0; k < 4; k++) {
+    z += bi[k] * m->a0[c0 + k];
+    if (as) z += bi[k] * as[c0 + k];
+  }
+  if (z > 40.0) z = 40.0;
+  if (z < -40.0) z = -40.0;
+  return 1.0 / (1.0 + exp(-z));
 }
 
 double vmodel_hier_predict(const VModelHier *m, const uint8_t rack[VMH_NT],
@@ -311,106 +434,119 @@ double vmodel_hier_predict(const VModelHier *m, const uint8_t rack[VMH_NT],
                            const int unseen[VMH_NT], float static_leave) {
   int len = 0;
   for (int t = 0; t < VMH_NT; t++) len += leave[t];
-  int typ = vmodel_hier_leave_type(m, leave, kind);
-  int hb = leave[0] > 0 ? 1 : 0;
+  double vec[VMH_J_MAX] = {0};
+  if (len > 0) axpy(m, m->static_row, (double)(float)static_leave, vec);
+  block_leave(m, leave, len, vec);
+  if (!(kind == 0 && len == 7)) block_unseen(m, unseen, vec);
+  else block_pass(m, unseen, vec);
+  if (kind == 1) block_exch(m, rack, leave, vec);
+  return finish(m, vec, len, kind, vmodel_hier_leave_type(m, leave, kind),
+                leave[0] > 0 ? 1 : 0, diff);
+}
 
-  // selector: nonzero entries only (<= 4 + 5)
-  double bf[VMH_MAX_KNOTS], bi[VMH_MAX_KNOTS];
-  int b0 = bspline_basis(m->knots_f, m->n_kf, (double)diff, bf);
-  int sel_idx[16];
-  double sel_val[16];
-  int n_sel = 0;
-  for (int k = b0; k < b0 + 4; k++) {
-    if (bf[k] != 0.0) { sel_idx[n_sel] = k; sel_val[n_sel++] = bf[k]; }
-  }
-  const int K = m->feat_k, o_kind = K + VMH_N_LEN, o_type = o_kind + VMH_N_KIND,
-            o_blank = o_type + VMH_N_TYPE, o_xlen = o_blank + VMH_N_BLANK;
-  if (m->g_len) { sel_idx[n_sel] = K + len; sel_val[n_sel++] = 1.0; }
-  if (m->g_kind) { sel_idx[n_sel] = o_kind + kind; sel_val[n_sel++] = 1.0; }
-  if (m->g_type) { sel_idx[n_sel] = o_type + typ; sel_val[n_sel++] = 1.0; }
-  if (m->g_blank) { sel_idx[n_sel] = o_blank + hb; sel_val[n_sel++] = 1.0; }
-  if (m->g_xlen && kind == 1) { sel_idx[n_sel] = o_xlen + len; sel_val[n_sel++] = 1.0; }
+// ------------------------------------------------------------------ turn cache
+#define VMH_SLOTS 512   // power of two; a rack has <= 127 leaves
 
-  double z = 0.0;
-#define ADD(row, x)                                                       \
-  do {                                                                    \
-    int r_ = (row);                                                       \
-    if (r_ >= 0) z += (double)(x) * feat_coef(m, r_, sel_idx, sel_val, n_sel); \
-  } while (0)
+typedef struct {
+  uint64_t key;          // 0 = empty
+  uint8_t len, hb, typ_play, typ_exch, typ_pass;
+  bool has_exch;
+  double leave_vec[VMH_J_MAX];   // static + counts + pairs
+  double exch_vec[VMH_J_MAX];    // exchanged tiles (filled on first exchange use)
+} VmhSlot;
 
-  // static leave value (float32, as the design stores it)
-  if (len > 0) ADD(m->static_row, (double)(float)static_leave);
-  // kept-tile counts: L1, L3+, and L2 with l2_counts
-  if (len == 1 || len >= 3 || (len == 2 && m->l2_counts)) {
-    for (int t = 0; t < VMH_NT; t++)
-      if (leave[t]) ADD(m->cnt_row[t], leave[t]);
-  }
-  // pair counts + presence
-  if (len >= 2) {
-    for (int a = 0; a < VMH_NT; a++) {
-      if (!leave[a]) continue;
-      int na = leave[a];
-      if (na >= 2) {
-        ADD(m->pair_row[a][a], na * (na - 1) / 2.0);
-        ADD(m->pairp_row[a][a], 1.0);
+struct VmhTurnCache {
+  const VModelHier *m;
+  uint8_t rack[VMH_NT];
+  int unseen[VMH_NT];
+  VmhStaticFn static_fn;
+  void *static_ctx;
+  double unseen_vec[VMH_J_MAX];  // draw block, plays / exchanges
+  double pass_vec[VMH_J_MAX];    // pass block
+  VmhSlot *slots;
+};
+
+VmhTurnCache *vmh_turn_cache_create(void) {
+  VmhTurnCache *c = calloc(1, sizeof(VmhTurnCache));
+  c->slots = calloc(VMH_SLOTS, sizeof(VmhSlot));
+  return c;
+}
+
+void vmh_turn_cache_destroy(VmhTurnCache *c) {
+  if (!c) return;
+  free(c->slots);
+  free(c);
+}
+
+void vmh_turn_begin(VmhTurnCache *c, const VModelHier *m, const uint8_t *rack_idx,
+                    int rack_len, const int unseen[VMH_NT], VmhStaticFn static_fn,
+                    void *static_ctx) {
+  c->m = m;
+  memset(c->rack, 0, sizeof(c->rack));
+  for (int i = 0; i < rack_len; i++) c->rack[rack_idx[i]]++;
+  memcpy(c->unseen, unseen, sizeof(c->unseen));
+  c->static_fn = static_fn;
+  c->static_ctx = static_ctx;
+  memset(c->unseen_vec, 0, sizeof(c->unseen_vec));
+  memset(c->pass_vec, 0, sizeof(c->pass_vec));
+  block_unseen(m, c->unseen, c->unseen_vec);
+  block_pass(m, c->unseen, c->pass_vec);
+  for (int s = 0; s < VMH_SLOTS; s++) c->slots[s].key = 0;
+}
+
+static uint64_t leave_key(const uint8_t *idx, int len) {
+  uint64_t k = (uint64_t)len + 1;          // never 0
+  for (int i = 0; i < len; i++) k = (k << 5) | idx[i];
+  return k;
+}
+
+static VmhSlot *leave_slot(VmhTurnCache *c, const uint8_t *idx, int len) {
+  const uint64_t key = leave_key(idx, len);
+  uint64_t h = key * 0x9E3779B97F4A7C15ULL;
+  for (int probe = 0; probe < VMH_SLOTS; probe++) {
+    VmhSlot *s = &c->slots[((h >> 55) + probe) & (VMH_SLOTS - 1)];
+    if (s->key == key) return s;
+    if (s->key == 0) {
+      const VModelHier *m = c->m;
+      uint8_t leave[VMH_NT] = {0};
+      for (int i = 0; i < len; i++) leave[idx[i]]++;
+      s->key = key;
+      s->len = (uint8_t)len;
+      s->hb = leave[0] > 0;
+      s->typ_play = (uint8_t)vmodel_hier_leave_type(m, leave, 2);
+      s->typ_exch = (uint8_t)vmodel_hier_leave_type(m, leave, 1);
+      s->typ_pass = (uint8_t)vmodel_hier_leave_type(m, leave, 0);
+      s->has_exch = false;
+      memset(s->leave_vec, 0, sizeof(s->leave_vec));
+      if (len > 0) {
+        const float st = c->static_fn ? c->static_fn(idx, len, c->static_ctx) : 0.0f;
+        axpy(m, m->static_row, (double)(float)st, s->leave_vec);
       }
-      for (int b = a + 1; b < VMH_NT; b++) {
-        if (!leave[b]) continue;
-        ADD(m->pair_row[a][b], (double)(na * leave[b]));
-        ADD(m->pairp_row[a][b], 1.0);
-      }
+      block_leave(m, leave, len, s->leave_vec);
+      return s;
     }
   }
-  // unseen block: draw block for plays / exchanges, pass block for the pass
-  if (!(kind == 0 && len == 7)) {
-    for (int t = 0; t < VMH_NT; t++) {
-      int u = unseen[t];
-      if (TILE_BAG[t] != 2) {
-        if (u) ADD(m->ucnt_row[t], u);
-      } else if (u == 0) {
-        ADD(m->beq_row[t][0], 1.0);
-      } else if (u == 1) {
-        ADD(m->beq_row[t][1], 1.0);
-      }
-    }
-  } else if (m->pass_unseen >= 1) {
-    for (int t = 0; t < VMH_NT; t++)
-      if (unseen[t]) ADD(m->pcnt_row[t], unseen[t]);
-    if (m->pass_unseen >= 2) {
-      for (int i = 0; i < VMH_NT; i++) {
-        for (int j = i; j < VMH_NT; j++) {
-          if (i == j && TILE_BAG[i] < 2) continue;
-          int v = (i == j) ? unseen[i] * (unseen[i] - 1) / 2 : unseen[i] * unseen[j];
-          if (v) ADD(m->upair_row[i][j], v);
-        }
-      }
-    }
-  }
-  // exchanged tiles
+  return NULL;   // table full: cannot happen for a 7-tile rack
+}
+
+double vmh_turn_predict(VmhTurnCache *c, const uint8_t *leave_idx, int leave_len,
+                        int kind, int diff) {
+  const VModelHier *m = c->m;
+  VmhSlot *s = leave_slot(c, leave_idx, leave_len);
+  if (!s) return -1.0;
+  double vec[VMH_J_MAX];
+  const double *blk = (kind == 0 && leave_len == 7) ? c->pass_vec : c->unseen_vec;
+  for (int j = 0; j < m->J; j++) vec[j] = s->leave_vec[j] + blk[j];
   if (kind == 1) {
-    for (int t = 0; t < VMH_NT; t++) {
-      int d = (int)rack[t] - (int)leave[t];
-      if (d) ADD(m->exch_row[t], d);
+    if (!s->has_exch) {
+      uint8_t leave[VMH_NT] = {0};
+      for (int i = 0; i < leave_len; i++) leave[leave_idx[i]]++;
+      memset(s->exch_vec, 0, sizeof(s->exch_vec));
+      block_exch(m, c->rack, leave, s->exch_vec);
+      s->has_exch = true;
     }
+    for (int j = 0; j < m->J; j++) vec[j] += s->exch_vec[j];
   }
-#undef ADD
-
-  // intercept curve: shared + this stratum's deviation
-  int c0 = bspline_basis(m->knots_i, m->n_ki, (double)diff, bi);
-  char key[24];
-  stratum_key(key, kind, len, typ, m->g_type);
-  const double *as = NULL;
-  for (int s = 0; s < m->n_strata; s++) {
-    if (strcmp(m->strata_key[s], key) == 0) {
-      as = m->a_s + (size_t)s * m->int_k;
-      break;
-    }
-  }
-  for (int k = c0; k < c0 + 4; k++) {
-    z += bi[k] * m->a0[k];
-    if (as) z += bi[k] * as[k];
-  }
-  if (z > 40.0) z = 40.0;
-  if (z < -40.0) z = -40.0;
-  return 1.0 / (1.0 + exp(-z));
+  const int typ = kind == 2 ? s->typ_play : kind == 1 ? s->typ_exch : s->typ_pass;
+  return finish(m, vec, leave_len, kind, typ, s->hb, diff);
 }

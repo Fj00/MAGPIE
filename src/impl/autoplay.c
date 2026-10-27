@@ -23,6 +23,7 @@
 #include "endgame.h"
 #include "../ent/vmodel.h"
 #include "../ent/vmodel_features.h"
+#include "../ent/vmodel_hier.h"
 #include "../ent/vmodel_picks.h"
 #include "../ent/game.h"
 #include "../ent/empty_board.h"
@@ -86,6 +87,24 @@ static _Atomic uint64_t g_eb_leaves_emitted = 0;
 //                                  enumeration.
 //   force_decrements: force_table_decrement_target calls from eb_emit_leaf.
 static _Atomic uint64_t g_eb_post_turns_total = 0;
+
+// Hierarchical per-bag win% models (ent/vmodel_hier.h; B repo hier_export_vmh.py).
+// MAGPIE_VMODEL_BAGS also loads every v_model_bag<NN>.vmh in its dir; the bag
+// picker uses the hierarchical model for a bag when one is loaded (bucketed .vmt
+// otherwise). MAGPIE_VMODEL_HIER=0 ignores them (A/B). Read-only after load.
+#define VMH_MAX_BAG 94   // == VMODEL_MAX_BAG (defined further down this file)
+static VModelHier *g_vmh_by_bag[VMH_MAX_BAG];
+static int g_vmh_use = 1;
+static _Atomic uint64_t g_vmh_scored = 0;     // moves scored by a .vmh model
+static _Thread_local VmhTurnCache *tl_vmh_tc = NULL;
+
+// static leave value for vmh_turn_begin, from the same table and canonical form
+// the training features used (static.get(canonicalize_leave(leave), 0.0))
+static float vmh_static_cb(const uint8_t *idx, int len, void *ctx) {
+  uint8_t canon[16];
+  static_leaves_canonicalize(idx, len, canon);
+  return static_leaves_lookup((const StaticLeaves *)ctx, canon, len);
+}
 static _Atomic uint64_t g_eb_dfs_movegen_calls = 0;
 static _Atomic uint64_t g_eb_dfs_game_copies = 0;
 static _Atomic uint64_t g_eb_target_fanout_total = 0;
@@ -340,6 +359,7 @@ typedef struct LeavegenSharedData {
 // Bag-keyed V-model registry size: index by bag (== unseen count, physical bag
 // + RACK_SIZE). Endgame chain uses 8..91; slot 93 is the opener. 94 covers all.
 #define VMODEL_MAX_BAG 94
+_Static_assert(VMH_MAX_BAG == VMODEL_MAX_BAG, "g_vmh_by_bag size");
 
 typedef struct AutoplaySharedData {
   int num_threads;
@@ -1364,9 +1384,28 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
       if (!d) log_fatal("vmodel: cannot open MAGPIE_VMODEL_BAGS dir %s", bags_dir);
       struct dirent *de;
       int loaded = 0;
+      {
+        const char *e = getenv("MAGPIE_VMODEL_HIER");
+        g_vmh_use = (e && e[0] == '0') ? 0 : 1;
+      }
+      int loaded_vmh = 0;
       while ((de = readdir(d)) != NULL) {
         const char *nm = de->d_name;
         size_t nl = strlen(nm);
+        if (g_vmh_use && nl >= 5 && strcmp(nm + nl - 4, ".vmh") == 0) {
+          char hpath[4096];
+          snprintf(hpath, sizeof(hpath), "%s/%s", bags_dir, nm);
+          VModelHier *hm = vmodel_hier_create(hpath);
+          if (!hm) log_fatal("vmodel: failed to load %s", hpath);
+          if (hm->bag < 0 || hm->bag >= VMODEL_MAX_BAG)
+            log_fatal("vmodel: %s has bag %d out of range", hpath, hm->bag);
+          if (g_vmh_by_bag[hm->bag])
+            log_fatal("vmodel: duplicate .vmh for bag %d (%s)", hm->bag, hpath);
+          g_vmh_by_bag[hm->bag] = hm;
+          shared_data->vmodel_bags_any_loaded = 1;
+          loaded_vmh++;
+          continue;
+        }
         if (nl < 5 || strcmp(nm + nl - 4, ".vmt") != 0) continue;
         char path[4096];
         snprintf(path, sizeof(path), "%s/%s", bags_dir, nm);
@@ -1395,6 +1434,13 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
         }
       }
       fprintf(stderr, "%s\n", banner);
+      if (loaded_vmh) {
+        bi = snprintf(banner, sizeof(banner), "vmodel: hierarchical .vmh loaded %d, "
+                      "bags (used instead of .vmt):", loaded_vmh);
+        for (int b = 0; b < VMODEL_MAX_BAG && bi < (int)sizeof(banner) - 8; b++)
+          if (g_vmh_by_bag[b]) bi += snprintf(banner + bi, sizeof(banner) - bi, " %d", b);
+        fprintf(stderr, "%s\n", banner);
+      }
     }
   }
 
@@ -2704,6 +2750,11 @@ for (int src = 0; src < 2; src++) {
         100.0 * (double)atomic_load_explicit(&g_pp_pick_blank[src], memory_order_relaxed) / (double)tot,
         100.0 * (double)atomic_load_explicit(&g_pp_pick_s[src], memory_order_relaxed) / (double)tot);
   }
+  {
+    const uint64_t hs = atomic_load_explicit(&g_vmh_scored, memory_order_relaxed);
+    if (hs) fprintf(stderr, "vmodel: hierarchical (.vmh) models scored %llu moves\n",
+                    (unsigned long long)hs);
+  }
   // Endgame chain: pre-endgame model picks (MAGPIE_VMODEL_BAGS). "found" =
   // a model existed for the current unseen bag; "picked" = it returned a move.
   {
@@ -3203,7 +3254,9 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   const int bag_key = bag_get_letters(bag) + (RACK_SIZE);
   if (bag_key < 0 || bag_key >= VMODEL_MAX_BAG) return NULL;
   const VModel *model = vmodels_by_bag[bag_key];
-  if (!model) {
+  // A hierarchical model for this bag takes precedence over the bucketed one.
+  const VModelHier *hmod = g_vmh_use ? g_vmh_by_bag[bag_key] : NULL;
+  if (!model && !hmod) {
     atomic_fetch_add_explicit(&g_vmodel_eg_null_nomodel, 1, memory_order_relaxed);
     if (bag_key < VM_NOMODEL_HIST)
       atomic_fetch_add_explicit(&g_vmodel_eg_nomodel_hist[bag_key], 1,
@@ -3296,8 +3349,13 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     const char *v = getenv("MAGPIE_VMODEL_CACHE_VERIFY");
     tc_verify = (v && v[0] == '1') ? 1 : 0;
   }
-  VModelTurnCache *tc = tc_on ? vmodel_turn_cache_get() : NULL;
+  VModelTurnCache *tc = (tc_on && !hmod) ? vmodel_turn_cache_get() : NULL;
   if (tc) vmodel_turn_cache_begin(tc, model, rack_idx, rack_len, unseen, sl);
+  if (hmod) {
+    if (!tl_vmh_tc) tl_vmh_tc = vmh_turn_cache_create();
+    vmh_turn_begin(tl_vmh_tc, hmod, rack_idx, rack_len, unseen, vmh_static_cb,
+                   (void *)sl);
+  }
   Move *ref_best = NULL;
   float ref_best_win = -1.0f;
   uint64_t v_pdiff = 0, v_round = 0;
@@ -3350,9 +3408,10 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     }
     int diff = pre_diff;
     if (kind == 2) diff += equity_to_int(move_get_score(m));
-    float p = tc ? vmodel_turn_cache_predict(tc, leave_idx, leave_len, kind, diff)
-                 : vmodel_predict(model, rack_idx, rack_len, leave_idx, leave_len,
-                                  kind, diff, model->turn, unseen, sl);
+    float p = hmod ? (float)vmh_turn_predict(tl_vmh_tc, leave_idx, leave_len, kind, diff)
+              : tc ? vmodel_turn_cache_predict(tc, leave_idx, leave_len, kind, diff)
+                   : vmodel_predict(model, rack_idx, rack_len, leave_idx, leave_len,
+                                    kind, diff, model->turn, unseen, sl);
     if (tc && tc_verify) {
       const float pr = vmodel_predict(model, rack_idx, rack_len, leave_idx,
                                       leave_len, kind, diff, model->turn,
@@ -3381,6 +3440,7 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     if (kind != 0 && p_round > best_nonpass) best_nonpass = p_round;
   }
   atomic_fetch_add_explicit(&g_vmodel_eg_mv_total, n_scored, memory_order_relaxed);
+  if (hmod) atomic_fetch_add_explicit(&g_vmh_scored, n_scored, memory_order_relaxed);
   if (n_unscored)
     atomic_fetch_add_explicit(&g_vmodel_eg_mv_unscored, n_unscored,
                               memory_order_relaxed);
@@ -3395,7 +3455,7 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   // No-sort check, independent of the single-pass tie-break above: sort a copy
   // of the move pointers with qsort on the same comparator, take the FIRST
   // best-win% move the original way, and compare. The move list is untouched.
-  if (tc_verify && pick_nosort && n_moves > 0) {
+  if (tc_verify && pick_nosort && n_moves > 0 && !hmod) {
     static _Thread_local Move **vs = NULL;
     static _Thread_local int vs_cap = 0;
     if (n_moves > vs_cap) {
@@ -3492,10 +3552,22 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     move_set_as_pass(spare);
     // A pass keeps the whole rack, so leave == rack, and the score diff is
     // unchanged (kind 0 scores nothing).
-    float p = pass_wins_outright
-                  ? 1.0f
-                  : vmodel_predict(model, rack_idx, rack_len, rack_idx, rack_len,
-                                   0, pre_diff, model->turn, unseen, sl);
+    float p;
+    if (pass_wins_outright) {
+      p = 1.0f;
+    } else if (hmod) {
+      // the pass rows were fit on sixpass_diff where the model says so
+      int pd = pre_diff;
+      if (hmod->pass_sixpass) {
+        uint8_t rc[VMH_NT] = {0};
+        for (int k = 0; k < rack_len; k++) rc[rack_idx[k]]++;
+        pd = vmodel_hier_sixpass_diff(rc, unseen, pre_diff);
+      }
+      p = (float)vmh_turn_predict(tl_vmh_tc, rack_idx, rack_len, 0, pd);
+    } else {
+      p = vmodel_predict(model, rack_idx, rack_len, rack_idx, rack_len, 0, pre_diff,
+                         model->turn, unseen, sl);
+    }
     if (p >= 0.0f) {
       const float p_round = roundf(p * 10000.0f) / 10000.0f;
       // Strict > so a tie keeps the play: in a decided position the spread head
