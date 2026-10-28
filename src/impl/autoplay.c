@@ -515,6 +515,16 @@ typedef struct AutoplaySharedData {
   // every game turn (before the move plays) writes a row to
   // <dir>/positions/bag_<NN>.csv. Used by the 91-8 V-model pipeline.
   TrajectoryRecorder *trajectory_recorder;
+  // MAGPIE_SELFPLAY_VMODEL=1 (2026-10-27, iteration 2): regular self-play games are
+  // played by the bag 8-91 models (MAGPIE_VMODEL_BAGS) once tiles are down -- the
+  // fill playouts' picker -- instead of HastyBot. The empty board already uses the
+  // turn models (MAGPIE_VMODEL_PATHS); no model below 8 unseen -> HastyBot endgame.
+  int selfplay_vmodel;
+  // MAGPIE_TRAJECTORY_MIN_BAG=N (2026-10-27): record only rows at bag >= N and END
+  // the game as soon as the bag drops below N. Its rows are committed with
+  // eventual_outcome -1 / final_spread 0: these runs only feed position pools
+  // (the fill relabels every position), so the rest of the game is not played.
+  int traj_min_bag;
   // Position-pool mode (91-8 rack injection): when MAGPIE_POSITION_POOL=<file>
   // is set, the worker loop loads mid-game CGPs from the pool instead of
   // starting fresh games, plays the on-turn move + POST, and records via the
@@ -881,8 +891,10 @@ AutoplayWorker *autoplay_worker_create(const AutoplayArgs *args,
   }
   autoplay_worker->eb_post_move_list = NULL;
   // Same recorder condition as game_runner->eb_active.
+  // Also for MAGPIE_SELFPLAY_VMODEL: regular games' model picks use this list.
   if ((shared_data->empty_board_recorder != NULL ||
-       shared_data->empty_board_strata_recorder != NULL) &&
+       shared_data->empty_board_strata_recorder != NULL ||
+       shared_data->selfplay_vmodel) &&
       shared_data->vmodel_bags_any_loaded) {
     int post_cap = 250000;
     const char *e = getenv("MAGPIE_VMODEL_MOVE_CAP");
@@ -1505,6 +1517,18 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
   const char *traj_dir = getenv("MAGPIE_TRAJECTORY_RECORDER");
   if (traj_dir && traj_dir[0] != '\0') {
     shared_data->trajectory_recorder = trajectory_recorder_create(traj_dir);
+  }
+  {
+    const char *e = getenv("MAGPIE_SELFPLAY_VMODEL");
+    shared_data->selfplay_vmodel = (e && e[0] == '1') ? 1 : 0;
+    e = getenv("MAGPIE_TRAJECTORY_MIN_BAG");
+    shared_data->traj_min_bag = (e && e[0]) ? atoi(e) : 0;
+    if (shared_data->selfplay_vmodel || shared_data->traj_min_bag > 0) {
+      fprintf(stderr, "selfplay: models play regular games %s; record bag >= %d%s\n",
+              shared_data->selfplay_vmodel ? "ON (MAGPIE_SELFPLAY_VMODEL=1)" : "off",
+              shared_data->traj_min_bag,
+              shared_data->traj_min_bag > 0 ? ", game ends below it (outcome -1)" : "");
+    }
   }
   shared_data->position_pool = NULL;
   atomic_store(&shared_data->position_pool_next, 0);
@@ -3669,6 +3693,19 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   return best_move;  // NULL -> nothing scoreable -> caller keeps HastyBot
 }
 
+// MAGPIE_TRAJECTORY_MIN_BAG: true once the on-turn position's unseen count (the
+// recorder's convention: physical bag + the opponent's rack) is below the floor --
+// the game loop then ends the game, since nothing below the floor is recorded.
+static bool traj_below_floor(GameRunner *gr) {
+  const int floor = gr->shared_data->traj_min_bag;
+  if (floor <= 0) return false;
+  Game *g = gr->game;
+  const int opp = 1 - game_get_player_on_turn_index(g);
+  const int unseen = bag_get_letters(game_get_bag(g)) +
+                     rack_get_total_letters(player_get_rack(game_get_player(g, opp)));
+  return unseen < floor;
+}
+
 // Returns the played move
 // Stage one trajectory row for `move` at the current (pre-move) position into
 // the game runner's per-game buffer, when the trajectory recorder is active.
@@ -3689,6 +3726,8 @@ static void eb_stage_trajectory_row(GameRunner *game_runner, Game *game,
       player_get_rack(game_get_player(game, traj_opp_idx)));
   const int traj_bag =
       bag_get_letters(game_get_bag(game)) + traj_opp_rack_size;
+  // MAGPIE_TRAJECTORY_MIN_BAG: rows below the floor are not recorded.
+  if (traj_bag < game_runner->shared_data->traj_min_bag) return;
   char p1_rack_str[RACK_SIZE + 2] = {0};
   char p2_rack_str[RACK_SIZE + 2] = {0};
   for (int pp = 0; pp < 2; pp++) {
@@ -4027,7 +4066,9 @@ const Move *game_runner_play_move(AutoplayWorker *autoplay_worker,
   // playouts (incl. its exact six-pass pass-out rule). Before this every such
   // move was HastyBot. No model below 8 unseen -> NULL -> HastyBot endgame,
   // as in the fill. Own full-size list (eb_post_move_list), see its comment.
-  if (!move && game_runner->eb_active &&
+  // MAGPIE_SELFPLAY_VMODEL=1: the same hook drives regular self-play games.
+  if (!move &&
+      (game_runner->eb_active || game_runner->shared_data->selfplay_vmodel) &&
       autoplay_worker->eb_post_move_list &&
       board_get_tiles_played(game_get_board(game)) != 0) {
     move = vmodel_endgame_pick_move(
@@ -6014,9 +6055,15 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
                       runner2_starter, 2);
   }
   bool games_are_divergent = false;
+  // MAGPIE_TRAJECTORY_MIN_BAG: a game below the recording floor ends here.
+  bool truncated[2] = {false, false};
   while (true) {
     const Move *move1 = NULL;
     bool game1_is_over = game_runner_is_game_over(game_runner1);
+    if (!game1_is_over && traj_below_floor(game_runner1)) {
+      game1_is_over = true;
+      truncated[0] = true;
+    }
     if (!game1_is_over) {
       move1 = game_runner_play_move(autoplay_worker, game_runner1);
     }
@@ -6025,6 +6072,10 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
     bool game2_is_over = true;
     if (game_runner2) {
       game2_is_over = game_runner_is_game_over(game_runner2);
+      if (!game2_is_over && traj_below_floor(game_runner2)) {
+        game2_is_over = true;
+        truncated[1] = true;
+      }
       if (!game2_is_over) {
         move2 = game_runner_play_move(autoplay_worker, game_runner2);
       }
@@ -6053,7 +6104,10 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
       for (int gi = 0; gi < 2; gi++) {
         GameRunner *gr = grs[gi];
         if (!gr || !gr->trajectory_buf) continue;
-        if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD) {
+        if (truncated[gi]) {
+          // Stopped below MAGPIE_TRAJECTORY_MIN_BAG: positions only, no outcome.
+          trajectory_game_buffer_commit_unfinished(traj_r_end, gr->trajectory_buf);
+        } else if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD) {
           // Final scores reflect end-of-game tile-bag penalty adjustment
           // (magpie applies this internally on STANDARD termination).
           const int final_p1 = equity_to_int(

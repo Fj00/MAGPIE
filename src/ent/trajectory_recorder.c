@@ -264,6 +264,34 @@ void trajectory_game_buffer_commit(
   tr_buf_free_rows(b);
 }
 
+// A game stopped early (MAGPIE_TRAJECTORY_MIN_BAG): same rows and routing as
+// trajectory_game_buffer_commit, but eventual_outcome = -1 and final_spread = 0 --
+// there is no game end. Such rows feed position pools only; anything that reads
+// outcomes (aggregate_trajectory_wl) must skip outcome -1.
+void trajectory_game_buffer_commit_unfinished(TrajectoryRecorder *r,
+                                              TrajectoryGameBuffer *b) {
+  if (!r || !b) return;
+  for (int i = 0; i < b->count; i++) {
+    const int bag_idx = b->rows[i].bag_idx;
+    const int bag = (bag_idx == TR_BAG_MAX - TR_BAG_MIN + 1)
+                       ? TR_OPENER_BAG
+                       : bag_idx + TR_BAG_MIN;
+    if (r->shard) {
+      FILE *fh = tr_get_own_file(r, b, bag_idx, bag);
+      fputs(b->rows[i].line, fh);
+      fputs(",-1,0\n", fh);
+    } else {
+      FILE *fh = tr_get_file(r, bag_idx, bag);
+      if (!fh) continue;
+      pthread_mutex_lock(&r->mutexes[bag_idx]);
+      fputs(b->rows[i].line, fh);
+      fputs(",-1,0\n", fh);
+      pthread_mutex_unlock(&r->mutexes[bag_idx]);
+    }
+  }
+  tr_buf_free_rows(b);
+}
+
 void trajectory_game_buffer_discard(TrajectoryGameBuffer *b) {
   if (!b) return;
   tr_buf_free_rows(b);

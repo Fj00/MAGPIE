@@ -66,6 +66,11 @@ void trajectory_game_buffer_commit(
     TrajectoryRecorder *r, TrajectoryGameBuffer *b,
     int final_p1_score, int final_p2_score);
 
+// Game stopped below MAGPIE_TRAJECTORY_MIN_BAG: rows written with
+// eventual_outcome -1 and final_spread 0 (positions only). Resets the buffer.
+void trajectory_game_buffer_commit_unfinished(TrajectoryRecorder *r,
+                                              TrajectoryGameBuffer *b);
+
 // Drop all staged rows without writing. Call when the just-played game
 // ended via consecutive-zeros / pass-out (pathological positions).
 // Resets the buffer.
