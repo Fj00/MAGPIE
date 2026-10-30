@@ -2561,6 +2561,8 @@ static _Atomic uint64_t g_pass_gap_hist[10];    // (pass - best_play) in 0.1 bin
 // under MAGPIE_PP_FANOUT: one worklist line branches many playouts).
 static _Atomic uint64_t g_term_standard = 0;
 static _Atomic uint64_t g_term_sixpass  = 0;
+// Picker decisions where exchanges were barred by the standoff guard (2026-10-30).
+static _Atomic uint64_t g_exch_guard_blocked = 0;
 static _Atomic uint64_t g_vmodel_eg_pass_big  = 0;  // margin >= 0.05
 static _Atomic uint64_t g_vmodel_eg_pass_live = 0;  // 0.02 < pass p < 0.98
 // MAGPIE_VMODEL_PLAYOUT_NO_PASS=1: the V-model playout policy never picks a pass
@@ -2826,6 +2828,9 @@ for (int src = 0; src < 2; src++) {
               egp ? 100.0 * (double)egpb / (double)egp : 0.0,
               (unsigned long long)egpl,
               egp ? 100.0 * (double)egpl / (double)egp : 0.0);
+      fprintf(stderr, "vmodel:   standoff guard barred exchanges in %llu picks\n",
+              (unsigned long long)atomic_load_explicit(&g_exch_guard_blocked,
+                                                       memory_order_relaxed));
       fprintf(stderr, "vmodel:   HastyBot fell back: no-model %llu, no-moves "
               "%llu, none-scoreable %llu | moves unscored %llu/%llu (%.3f%%)\n",
               (unsigned long long)atomic_load_explicit(&g_vmodel_eg_null_nomodel, memory_order_relaxed),
@@ -3460,6 +3465,21 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   // on a single shared counter, once per scored move from all 256 threads --
   // billions per rung, each bouncing the cache line between cores and sockets.
   uint64_t n_scored = 0, n_unscored = 0;
+  // EXCHANGE STANDOFF GUARD (2026-10-30): an exchange is a scoreless turn too, but
+  // only passes were guarded. In decided self-play games the side that loses the
+  // six-pass tally, barred from passing at 4 scoreless turns, exchanged instead and
+  // the leader passed the game out (274 of 2,000 test games ended on scoreless
+  // turns). Same rule as the pass below: an exchange that makes the count 5 or 6
+  // is only allowed if we win the six-pass ending (tally on the current rack).
+  bool exch_allowed = true;
+  {
+    const int zeros = game_get_consecutive_scoreless_turns(game);
+    const int maxz = game_get_max_scoreless_turns(game);
+    if (zeros + 1 >= maxz - 1 && pp_sixpass_diff(game, on, pre_diff) <= 0) {
+      exch_allowed = false;
+      atomic_fetch_add_explicit(&g_exch_guard_blocked, 1, memory_order_relaxed);
+    }
+  }
   for (int i = 0; i < n_moves; i++) {
     Move *m = move_list_get_move(ml, i);
     int kind;
@@ -3469,6 +3489,7 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       case GAME_EVENT_TILE_PLACEMENT_MOVE: kind = 2; break;
       default: continue;
     }
+    if (kind == 1 && !exch_allowed) continue;
     // Passing is considered ONLY in the guarded pass block below. movegen DOES
     // emit a pass here (MAGPIE_VMODEL_PICK_TEST, 2026-10-20: a bag-8 position at
     // 5 scoreless turns, 100 behind, picked this unguarded pass -- passing into a
@@ -3572,6 +3593,7 @@ static const Move *vmodel_endgame_pick_move(Game *game,
         default: continue;
       }
       if (kind == 0 && no_pass) continue;
+      if (kind == 1 && !exch_allowed) continue;
       rack_reset(&leave_rack);
       get_leave_for_move(m, game, &leave_rack);
       uint8_t leave_idx[16];
