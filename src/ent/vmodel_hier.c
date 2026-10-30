@@ -195,6 +195,7 @@ VModelHier *vmodel_hier_create(const char *path) {
         else if (!strcmp(t, "count_steps")) m->count_steps = v;
         else if (!strcmp(t, "count_cum")) m->count_cum = v;
         else if (!strcmp(t, "play_unseen_pairs")) m->play_unseen_pairs = v;
+        else if (!strcmp(t, "int_tails")) m->int_tails = v;
         else { fprintf(stderr, "vmodel_hier: unknown opt %s\n", t); goto done; }
       }
     } else if (strcmp(key, "type_lengths") == 0 || strcmp(key, "type_kinds") == 0) {
@@ -240,7 +241,8 @@ VModelHier *vmodel_hier_create(const char *path) {
     }
   }
   if (ok && (strata_read != m->n_strata || rows_read != n_rows ||
-             m->n_kf - 4 != m->feat_k || m->n_ki - 4 != m->int_k)) {
+             m->n_kf - 4 != m->feat_k ||
+             m->n_ki - 4 + (m->int_tails ? VMH_N_TAIL : 0) != m->int_k)) {
     fprintf(stderr, "vmodel_hier: %s: incomplete (strata %d/%d, rows %d/%d)\n", path,
             strata_read, m->n_strata, rows_read, n_rows);
     ok = false;
@@ -460,6 +462,17 @@ static double finish(const VModelHier *m, const double *vec, int len, int kind,
   for (int k = 0; k < 4; k++) {
     z += bi[k] * m->a0[c0 + k];
     if (as) z += bi[k] * as[c0 + k];
+  }
+  if (m->int_tails) {
+    // Linear tails beyond the knot range (hier_model.int_basis, 2026-10-30): the
+    // spline is constant outside [lo, hi], so without these every lead past the
+    // 0.2% tails scored the same.
+    const int nb = m->n_ki - 4;
+    const double lo = m->knots_i[3], hi = m->knots_i[m->n_ki - 4];
+    const double tl = (diff < lo ? (double)diff - lo : 0.0) / VMH_TAIL_SCALE;
+    const double th = (diff > hi ? (double)diff - hi : 0.0) / VMH_TAIL_SCALE;
+    z += m->a0[nb] * tl + m->a0[nb + 1] * th;
+    if (as) z += as[nb] * tl + as[nb + 1] * th;
   }
   if (z > 40.0) z = 40.0;
   if (z < -40.0) z = -40.0;

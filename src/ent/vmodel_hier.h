@@ -29,6 +29,8 @@
 #define VMH_N_TYPE 7      // all cons mixed vowel cons? mixed? vowel?
 #define VMH_N_BLANK 2
 #define VMH_N_XLEN 8
+#define VMH_N_TAIL 2          // int_tails: intercept slopes below / above the knot range
+#define VMH_TAIL_SCALE 100.0  // hier_model.TAIL_SCALE
 
 typedef struct VModelHier {
   int bag;
@@ -40,6 +42,7 @@ typedef struct VModelHier {
   bool count_cum;                   // cumulative >=1..>=4 steps (cge_), no XX pairs
   bool play_unseen_pairs;           // plays / exchanges get unseen pair counts too
   bool pass_sixpass;                // pass rows were fit on sixpass_diff
+  bool int_tails;                   // a0 / a_s carry 2 linear tail slopes after the spline
   int pass_unseen;
   // stratum index by (kind, keep length, type); -1 = no curve (shared one only)
   int16_t sidx[VMH_N_KIND][VMH_N_LEN][VMH_N_TYPE];
