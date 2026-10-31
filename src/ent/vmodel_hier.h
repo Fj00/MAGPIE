@@ -46,6 +46,12 @@ typedef struct VModelHier {
   bool int_tails;                   // a0 / a_s carry 2 linear tail slopes after the spline
   bool pass_shared_unseen;          // the pass uses the plays' unseen block, not its own
   bool target_spread;               // a spread model: predict returns points, not win%
+  int unseen_mode;                  // 0 raw (ucnt/beq + pass block), 1 exp, 2 split
+  int bexp_row[VMH_NT];             // expected draws per tile (draws x u_t / U)
+  int brest_row[VMH_NT];            // split: not-to-you copies per tile (u_t - bexp_t)
+  bool next_rack_vowels;            // nrv_: leave vowels + expected vowels drawn, curve
+  int nrv_row[5];                   // quadratic B-spline bases 0..4 (2 = reference, -1)
+  int useen_row[3];                 // shared: blanks, S, vowels unseen
   int pass_unseen;
   // stratum index by (kind, keep length, type); -1 = no curve (shared one only)
   int16_t sidx[VMH_N_KIND][VMH_N_LEN][VMH_N_TYPE];

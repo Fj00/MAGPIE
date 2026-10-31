@@ -30,6 +30,8 @@ static void stratum_key(char *out, int kind, int len, int typ, bool use_type) {
   snprintf(out, 24, "K%d_L%d_%s", kind, len, use_type ? TYPE_NAME[typ] : "all");
 }
 
+static void nrv_tab_init(void);   // next-rack-vowel table, defined with block_nrv
+
 static int tile_index(char c) {
   if (c == '?') return 0;
   if (c >= 'A' && c <= 'Z') return c - 'A' + 1;
@@ -107,6 +109,18 @@ static void map_feature(VModelHier *m, const char *name, int row) {
   } else if (strncmp(name, "upair_", 6) == 0 && n == 8) {
     a = tile_index(name[6]), b = tile_index(name[7]);
     if (a >= 0 && b >= 0) m->upair_row[a][b] = row;
+  } else if (strncmp(name, "bexp_", 5) == 0 && n == 6) {
+    if ((a = tile_index(name[5])) >= 0) m->bexp_row[a] = row;
+  } else if (strncmp(name, "brest_", 6) == 0 && n == 7) {
+    if ((a = tile_index(name[6])) >= 0) m->brest_row[a] = row;
+  } else if (strncmp(name, "nrv_", 4) == 0 && n == 5 && name[4] >= '0' && name[4] <= '4') {
+    m->nrv_row[name[4] - '0'] = row;
+  } else if (strcmp(name, "useen_blank") == 0) {
+    m->useen_row[0] = row;
+  } else if (strcmp(name, "useen_S") == 0) {
+    m->useen_row[1] = row;
+  } else if (strcmp(name, "useen_vowel") == 0) {
+    m->useen_row[2] = row;
   } else {
     fprintf(stderr, "vmodel_hier: unknown feature '%s'\n", name);
   }
@@ -141,6 +155,10 @@ VModelHier *vmodel_hier_create(const char *path) {
   memset(m->ucnt_row, -1, sizeof(m->ucnt_row));
   memset(m->beq_row, -1, sizeof(m->beq_row));
   memset(m->exch_row, -1, sizeof(m->exch_row));
+  memset(m->bexp_row, -1, sizeof(m->bexp_row));
+  memset(m->useen_row, -1, sizeof(m->useen_row));
+  memset(m->brest_row, -1, sizeof(m->brest_row));
+  memset(m->nrv_row, -1, sizeof(m->nrv_row));
   memset(m->pcnt_row, -1, sizeof(m->pcnt_row));
   memset(m->upair_row, -1, sizeof(m->upair_row));
   if (!fgets(line, VMH_LINE_CAP, f) || strncmp(line, "VMH1", 4) != 0) {
@@ -198,6 +216,8 @@ VModelHier *vmodel_hier_create(const char *path) {
         else if (!strcmp(t, "int_tails")) m->int_tails = v;
         else if (!strcmp(t, "pass_shared_unseen")) m->pass_shared_unseen = v;
         else if (!strcmp(t, "target_spread")) m->target_spread = v;
+        else if (!strcmp(t, "unseen_mode")) m->unseen_mode = v;
+        else if (!strcmp(t, "next_rack_vowels")) m->next_rack_vowels = v;
         else { fprintf(stderr, "vmodel_hier: unknown opt %s\n", t); goto done; }
       }
     } else if (strcmp(key, "type_lengths") == 0 || strcmp(key, "type_kinds") == 0) {
@@ -249,6 +269,11 @@ VModelHier *vmodel_hier_create(const char *path) {
             strata_read, m->n_strata, rows_read, n_rows);
     ok = false;
   }
+  if (ok && m->unseen_mode == 1) {     // exp (useen summary) has no C path
+    fprintf(stderr, "vmodel_hier: %s: unseen_mode 1 (exp) not supported\n", path);
+    ok = false;
+  }
+  if (ok && m->next_rack_vowels) nrv_tab_init();   // at load: no race at play time
   if (ok) {   // stratum curve per (kind, len, type): no string compares per move
     char key[24];
     for (int k = 0; k < VMH_N_KIND; k++)
@@ -444,6 +469,89 @@ static void block_exch(const VModelHier *m, const uint8_t rack[VMH_NT],
   }
 }
 
+// ---------------------------------------------- unseen_mode split + next-rack vowels
+// (hier_model.row_features, 2026-10-31) -- tile order "?ABC...Z", as TILE_BAG.
+static int split_draws(const int unseen[VMH_NT], int leave_len, int kind, int *U_out) {
+  int U = 0;
+  for (int t = 0; t < VMH_NT; t++) U += unseen[t];
+  *U_out = U;
+  if (kind == 0 || U <= 0) return 0;
+  int d = 7 - leave_len, cap = U - 7 > 0 ? U - 7 : 0;
+  return d < cap ? d : cap;
+}
+
+// move-independent part of split: last-copy flags (+ bags 8-9 unseen pairs)
+static void block_split_shared(const VModelHier *m, const int unseen[VMH_NT], double *vec) {
+  for (int t = 0; t < VMH_NT; t++) {
+    if (TILE_BAG[t] != 2) continue;
+    if (unseen[t] == 0) axpy(m, m->beq_row[t][0], 1.0, vec);
+    else if (unseen[t] == 1) axpy(m, m->beq_row[t][1], 1.0, vec);
+  }
+  if (m->play_unseen_pairs) {
+    for (int i = 0; i < VMH_NT; i++) {
+      for (int j = i; j < VMH_NT; j++) {
+        if (i == j && TILE_BAG[i] < 2) continue;
+        int v = (i == j) ? unseen[i] * (unseen[i] - 1) / 2 : unseen[i] * unseen[j];
+        if (v) axpy(m, m->upair_row[i][j], v, vec);
+      }
+    }
+  }
+}
+
+// move-dependent part: to-you (draws x u / U) and not-to-you (u - that) per tile
+static void block_split_draw(const VModelHier *m, const int unseen[VMH_NT], int leave_len,
+                             int kind, double *vec) {
+  int U;
+  const int d = split_draws(unseen, leave_len, kind, &U);
+  for (int t = 0; t < VMH_NT; t++) {
+    const int u = unseen[t];
+    if (!u) continue;
+    const double e = d ? (double)d * u / U : 0.0;
+    if (e != 0.0) axpy(m, m->bexp_row[t], e, vec);
+    if ((double)u - e != 0.0) axpy(m, m->brest_row[t], (double)u - e, vec);
+  }
+}
+
+// next-rack vowels: quadratic B-spline on [0, 7], knots 2 and 4, tabulated on the
+// same 0.001 grid as hier_model._nrv_table (basis 2 is the reference: no row)
+static double nrv_tab[7001][5];
+static bool nrv_tab_ready = false;
+static double bsp(const double *t, int i, int k, double x) {
+  if (k == 0) return (t[i] <= x && x < t[i + 1]) ? 1.0 : 0.0;
+  double a = 0.0, b = 0.0;
+  if (t[i + k] > t[i]) a = (x - t[i]) / (t[i + k] - t[i]) * bsp(t, i, k - 1, x);
+  if (t[i + k + 1] > t[i + 1])
+    b = (t[i + k + 1] - x) / (t[i + k + 1] - t[i + 1]) * bsp(t, i + 1, k - 1, x);
+  return a + b;
+}
+static void nrv_tab_init(void) {
+  static const double kn[8] = {0, 0, 0, 2, 4, 7, 7, 7};
+  for (int g = 0; g <= 7000; g++) {
+    double x = g / 1000.0;
+    if (x > 7.0 - 7e-9) x = 7.0 - 7e-9;     // hier_model.basis clamps to hi - 1e-9*hi
+    for (int b = 0; b < 5; b++) nrv_tab[g][b] = bsp(kn, b, 2, x);
+  }
+  nrv_tab_ready = true;
+}
+static void block_nrv(const VModelHier *m, const uint8_t leave[VMH_NT], int leave_len,
+                      int kind, const int unseen[VMH_NT], double *vec) {
+  static const int vow[5] = {1, 5, 9, 15, 21};   // A E I O U
+  int U;
+  const int d = split_draws(unseen, leave_len, kind, &U);
+  double v = 0.0;
+  int uv = 0;
+  for (int i = 0; i < 5; i++) {
+    v += leave[vow[i]];
+    uv += unseen[vow[i]];
+  }
+  if (d) v += (double)d * uv / U;
+  if (v < 0.0) v = 0.0;
+  if (v > 7.0) v = 7.0;
+  const int g = (int)rint(v * 1000.0);   // half-to-even, like Python's round()
+  for (int b = 0; b < 5; b++)
+    if (nrv_tab[g][b] != 0.0) axpy(m, m->nrv_row[b], nrv_tab[g][b], vec);
+}
+
 // Sel . vec + intercept curve -> win probability
 static double finish(const VModelHier *m, const double *vec, int len, int kind,
                      int typ, int hb, int diff) {
@@ -492,8 +600,15 @@ double vmodel_hier_predict(const VModelHier *m, const uint8_t rack[VMH_NT],
   if (len > 0) axpy(m, m->static_row, (double)(float)static_leave, vec);
   block_leave(m, leave, len, vec);
   // pass_shared_unseen: the pass takes the plays' unseen block (hier_model.row_features)
-  if (m->pass_shared_unseen || !(kind == 0 && len == 7)) block_unseen(m, unseen, vec);
-  else block_pass(m, unseen, vec);
+  if (m->unseen_mode == 2) {                 // split: shared flags + per-move draw part
+    block_split_shared(m, unseen, vec);
+    block_split_draw(m, unseen, len, kind, vec);
+  } else if (m->pass_shared_unseen || !(kind == 0 && len == 7)) {
+    block_unseen(m, unseen, vec);
+  } else {
+    block_pass(m, unseen, vec);
+  }
+  if (m->next_rack_vowels) block_nrv(m, leave, len, kind, unseen, vec);
   if (kind == 1) block_exch(m, rack, leave, vec);
   return finish(m, vec, len, kind, vmodel_hier_leave_type(m, leave, kind),
                 leave[0] > 0 ? 1 : 0, diff);
@@ -544,8 +659,14 @@ void vmh_turn_begin(VmhTurnCache *c, const VModelHier *m, const uint8_t *rack_id
   c->static_ctx = static_ctx;
   memset(c->unseen_vec, 0, sizeof(c->unseen_vec));
   memset(c->pass_vec, 0, sizeof(c->pass_vec));
-  block_unseen(m, c->unseen, c->unseen_vec);
-  block_pass(m, c->unseen, c->pass_vec);
+  if (m->unseen_mode == 2) {
+    // split: only the move-independent part is cached; the draw part and nrv are
+    // added per move in vmh_turn_predict. pass_vec stays zero (passes use unseen_vec).
+    block_split_shared(m, c->unseen, c->unseen_vec);
+  } else {
+    block_unseen(m, c->unseen, c->unseen_vec);
+    block_pass(m, c->unseen, c->pass_vec);
+  }
   for (int s = 0; s < VMH_SLOTS; s++) c->slots[s].key = 0;
 }
 
@@ -590,9 +711,18 @@ double vmh_turn_predict(VmhTurnCache *c, const uint8_t *leave_idx, int leave_len
   VmhSlot *s = leave_slot(c, leave_idx, leave_len);
   if (!s) return -1.0;
   double vec[VMH_J_MAX];
-  const double *blk = (kind == 0 && leave_len == 7 && !c->m->pass_shared_unseen)
+  const double *blk = (kind == 0 && leave_len == 7 && !c->m->pass_shared_unseen &&
+                       m->unseen_mode != 2)
                           ? c->pass_vec : c->unseen_vec;
   for (int j = 0; j < m->J; j++) vec[j] = s->leave_vec[j] + blk[j];
+  if (m->unseen_mode == 2 || m->next_rack_vowels) {    // per-move unseen terms
+    if (m->unseen_mode == 2) block_split_draw(m, c->unseen, leave_len, kind, vec);
+    if (m->next_rack_vowels) {
+      uint8_t leave[VMH_NT] = {0};
+      for (int i = 0; i < leave_len; i++) leave[leave_idx[i]]++;
+      block_nrv(m, leave, leave_len, kind, c->unseen, vec);
+    }
+  }
   if (kind == 1) {
     if (!s->has_exch) {
       uint8_t leave[VMH_NT] = {0};
