@@ -31,6 +31,7 @@
 #define VMH_N_XLEN 8
 #define VMH_N_TAIL 2          // int_tails: intercept slopes below / above the knot range
 #define VMH_TAIL_SCALE 100.0  // hier_model.TAIL_SCALE
+#define VMH_SPREAD_SCALE 100.0  // hier_model.SPREAD_SCALE (spread models' target unit)
 
 typedef struct VModelHier {
   int bag;
@@ -43,6 +44,8 @@ typedef struct VModelHier {
   bool play_unseen_pairs;           // plays / exchanges get unseen pair counts too
   bool pass_sixpass;                // pass rows were fit on sixpass_diff
   bool int_tails;                   // a0 / a_s carry 2 linear tail slopes after the spline
+  bool pass_shared_unseen;          // the pass uses the plays' unseen block, not its own
+  bool target_spread;               // a spread model: predict returns points, not win%
   int pass_unseen;
   // stratum index by (kind, keep length, type); -1 = no curve (shared one only)
   int16_t sidx[VMH_N_KIND][VMH_N_LEN][VMH_N_TYPE];

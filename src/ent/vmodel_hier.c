@@ -196,6 +196,8 @@ VModelHier *vmodel_hier_create(const char *path) {
         else if (!strcmp(t, "count_cum")) m->count_cum = v;
         else if (!strcmp(t, "play_unseen_pairs")) m->play_unseen_pairs = v;
         else if (!strcmp(t, "int_tails")) m->int_tails = v;
+        else if (!strcmp(t, "pass_shared_unseen")) m->pass_shared_unseen = v;
+        else if (!strcmp(t, "target_spread")) m->target_spread = v;
         else { fprintf(stderr, "vmodel_hier: unknown opt %s\n", t); goto done; }
       }
     } else if (strcmp(key, "type_lengths") == 0 || strcmp(key, "type_kinds") == 0) {
@@ -474,6 +476,8 @@ static double finish(const VModelHier *m, const double *vec, int len, int kind,
     z += m->a0[nb] * tl + m->a0[nb + 1] * th;
     if (as) z += as[nb] * tl + as[nb + 1] * th;
   }
+  // target_spread: a spread model -> expected final spread in POINTS (mover's view)
+  if (m->target_spread) return z * VMH_SPREAD_SCALE;
   if (z > 40.0) z = 40.0;
   if (z < -40.0) z = -40.0;
   return 1.0 / (1.0 + exp(-z));
@@ -487,7 +491,8 @@ double vmodel_hier_predict(const VModelHier *m, const uint8_t rack[VMH_NT],
   double vec[VMH_J_MAX] = {0};
   if (len > 0) axpy(m, m->static_row, (double)(float)static_leave, vec);
   block_leave(m, leave, len, vec);
-  if (!(kind == 0 && len == 7)) block_unseen(m, unseen, vec);
+  // pass_shared_unseen: the pass takes the plays' unseen block (hier_model.row_features)
+  if (m->pass_shared_unseen || !(kind == 0 && len == 7)) block_unseen(m, unseen, vec);
   else block_pass(m, unseen, vec);
   if (kind == 1) block_exch(m, rack, leave, vec);
   return finish(m, vec, len, kind, vmodel_hier_leave_type(m, leave, kind),
@@ -585,7 +590,8 @@ double vmh_turn_predict(VmhTurnCache *c, const uint8_t *leave_idx, int leave_len
   VmhSlot *s = leave_slot(c, leave_idx, leave_len);
   if (!s) return -1.0;
   double vec[VMH_J_MAX];
-  const double *blk = (kind == 0 && leave_len == 7) ? c->pass_vec : c->unseen_vec;
+  const double *blk = (kind == 0 && leave_len == 7 && !c->m->pass_shared_unseen)
+                          ? c->pass_vec : c->unseen_vec;
   for (int j = 0; j < m->J; j++) vec[j] = s->leave_vec[j] + blk[j];
   if (kind == 1) {
     if (!s->has_exch) {
