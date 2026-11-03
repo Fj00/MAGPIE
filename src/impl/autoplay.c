@@ -116,6 +116,13 @@ static VModelHier *g_vmh_spread_by_bag[VMH_MAX_BAG];
 static _Thread_local VmhTurnCache *tl_vmh_tc_spr = NULL;
 static int g_s2_on = 0;
 static float g_s2_delta = 0.001f;
+// paired-test switches (2026-11-03): MAGPIE_PICK_STRATEGY2_PLAYER=0|1 applies strategy 2
+// to that player only (unset: both); MAGPIE_TIE_MIN_BAG (default 8) = lowest bag the tie
+// rule runs at; MAGPIE_TIE_OFF=1 / MAGPIE_PASS_FILTER_OFF=1 turn either part off
+static int g_s2_player = -1;
+static int g_s2_tie_min_bag = 8;
+static int g_s2_tie_on = 1;
+static int g_s2_filter_on = 1;
 static float g_s2_cut[3][VMH_MAX_BAG];          // [type 0=7,1=8,2=n][bag]
 #define S2_HASH_BITS 22
 #define S2_HASH_SIZE (1u << S2_HASH_BITS)
@@ -153,6 +160,17 @@ static void s2_load(void) {
   if (!g_s2_on) return;
   e = getenv("MAGPIE_TIE_DELTA");
   if (e && e[0]) g_s2_delta = (float)atof(e);
+  e = getenv("MAGPIE_PICK_STRATEGY2_PLAYER");
+  if (e && e[0]) g_s2_player = atoi(e);
+  e = getenv("MAGPIE_TIE_MIN_BAG");
+  if (e && e[0]) g_s2_tie_min_bag = atoi(e);
+  e = getenv("MAGPIE_TIE_OFF");
+  g_s2_tie_on = !(e && e[0] == '1');
+  e = getenv("MAGPIE_PASS_FILTER_OFF");
+  g_s2_filter_on = !(e && e[0] == '1');
+  fprintf(stderr, "strategy2: player %s, tie rule %s (bags >= %d), pass filter %s\n",
+          g_s2_player < 0 ? "both" : g_s2_player == 0 ? "0 (p1)" : "1 (p2)",
+          g_s2_tie_on ? "on" : "OFF", g_s2_tie_min_bag, g_s2_filter_on ? "on" : "OFF");
   for (int t = 0; t < 3; t++)
     for (int b = 0; b < VMH_MAX_BAG; b++) g_s2_cut[t][b] = 999.0f;
   const char *cp = getenv("MAGPIE_PASS_CUTOFFS");
@@ -3823,7 +3841,9 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     }
   }
   // strategy 2 pass filter (bags 10-91; not a certain winning pass-out)
-  if (pass_allowed && g_s2_on && !pass_wins_outright && bag_key >= 10 && bag_key <= 91) {
+  const bool s2_mine = g_s2_on && (g_s2_player < 0 || on == g_s2_player);
+  if (pass_allowed && s2_mine && g_s2_filter_on && !pass_wins_outright &&
+      bag_key >= 10 && bag_key <= 91) {
     if (s2_n == 0) {
       atomic_fetch_add_explicit(&g_s2_pass_kept_only, 1, memory_order_relaxed);
     } else if (s2_bingo) {
@@ -3895,7 +3915,8 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   }
   // strategy 2 tie rule: the spread model picks among the moves within delta of the
   // best win% (measured from the top move). Not for a certain winning pass-out.
-  if (g_s2_on && best_move && hmod && !pass_wins_outright) {
+  if (s2_mine && g_s2_tie_on && bag_key >= g_s2_tie_min_bag && best_move && hmod &&
+      !pass_wins_outright) {
     atomic_fetch_add_explicit(&g_s2_picks, 1, memory_order_relaxed);
     const VModelHier *smod = g_vmh_spread_by_bag[bag_key];
     const float floor_p = best_win - g_s2_delta - 1e-6f;
