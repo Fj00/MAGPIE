@@ -101,6 +101,111 @@ static int g_vmh_use = 1;
 static _Atomic uint64_t g_vmh_scored = 0;     // moves scored by a .vmh model
 static _Thread_local VmhTurnCache *tl_vmh_tc = NULL;
 
+// ---- PICK STRATEGY 2 (2026-11-03, iteration-2 self-play; B repo
+// docs/pass_tie_strategy.md). MAGPIE_PICK_STRATEGY2=1 turns it on in the bag picker
+// (vmodel_endgame_pick_move); off by default, so fills / chains are unchanged.
+//   1 pass filter, bags 10-91: no pass when a bingo (a play using all 7 tiles) is
+//     playable; otherwise a pass needs rack value >= cutoff[type][bag]
+//     (MAGPIE_PASS_RACK_TABLE: rack,value,type 7|8|n; MAGPIE_PASS_CUTOFFS:
+//     bag,cut7,cut8,cutn, 999 = never). If no other move is legal the pass stays.
+//   2 tie rule: among the moves within MAGPIE_TIE_DELTA (default 0.001 = 0.1 win%
+//     point) of the best win%, the bag's spread model picks (spread .vmh, loaded from
+//     the same MAGPIE_VMODEL_BAGS dir: target_spread models go to g_vmh_spread_by_bag).
+//   A certain winning pass-out still wins outright; the standoff guards are unchanged.
+static VModelHier *g_vmh_spread_by_bag[VMH_MAX_BAG];
+static _Thread_local VmhTurnCache *tl_vmh_tc_spr = NULL;
+static int g_s2_on = 0;
+static float g_s2_delta = 0.001f;
+static float g_s2_cut[3][VMH_MAX_BAG];          // [type 0=7,1=8,2=n][bag]
+#define S2_HASH_BITS 22
+#define S2_HASH_SIZE (1u << S2_HASH_BITS)
+typedef struct { uint64_t k; float v; int8_t t; } S2RackEntry;   // k = 0: empty slot
+static S2RackEntry *g_s2_racks = NULL;
+static _Atomic uint64_t g_s2_pass_no_bingo = 0;   // pass removed: a bingo was playable
+static _Atomic uint64_t g_s2_pass_no_value = 0;   // pass removed: rack value < cutoff
+static _Atomic uint64_t g_s2_pass_kept_only = 0;  // pass kept: no other legal move
+static _Atomic uint64_t g_s2_rack_missing = 0;    // rack not in the table (pass removed)
+static _Atomic uint64_t g_s2_tie_sets = 0;        // picks with >= 2 moves within delta
+static _Atomic uint64_t g_s2_tie_changed = 0;     // ... where the spread model changed it
+static _Atomic uint64_t g_s2_picks = 0;
+
+// 7 sorted tile indices (blank 0, A..Z 1..26) packed 5 bits each; never 0
+static uint64_t s2_rack_key(const uint8_t *idx, int len) {
+  uint64_t k = 0;
+  for (int i = 0; i < len; i++) k = (k << 5) | (uint64_t)(idx[i] + 1);
+  return k;
+}
+static uint32_t s2_hash(uint64_t k) {
+  k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33;
+  return (uint32_t)(k & (S2_HASH_SIZE - 1));
+}
+static const S2RackEntry *s2_rack_lookup(const uint8_t *idx, int len) {
+  if (!g_s2_racks) return NULL;
+  const uint64_t k = s2_rack_key(idx, len);
+  for (uint32_t h = s2_hash(k);; h = (h + 1) & (S2_HASH_SIZE - 1)) {
+    if (g_s2_racks[h].k == k) return &g_s2_racks[h];
+    if (g_s2_racks[h].k == 0) return NULL;
+  }
+}
+static void s2_load(void) {
+  const char *e = getenv("MAGPIE_PICK_STRATEGY2");
+  g_s2_on = (e && e[0] == '1') ? 1 : 0;
+  if (!g_s2_on) return;
+  e = getenv("MAGPIE_TIE_DELTA");
+  if (e && e[0]) g_s2_delta = (float)atof(e);
+  for (int t = 0; t < 3; t++)
+    for (int b = 0; b < VMH_MAX_BAG; b++) g_s2_cut[t][b] = 999.0f;
+  const char *cp = getenv("MAGPIE_PASS_CUTOFFS");
+  const char *rp = getenv("MAGPIE_PASS_RACK_TABLE");
+  if (!cp || !cp[0] || !rp || !rp[0])
+    log_fatal("strategy2: MAGPIE_PICK_STRATEGY2=1 needs MAGPIE_PASS_CUTOFFS and "
+              "MAGPIE_PASS_RACK_TABLE");
+  FILE *f = fopen(cp, "r");
+  if (!f) log_fatal("strategy2: cannot open %s", cp);
+  char line[256];
+  int nc = 0;
+  while (fgets(line, sizeof(line), f)) {
+    int b;
+    float c7, c8, cn;
+    if (line[0] == '#' || sscanf(line, "%d,%f,%f,%f", &b, &c7, &c8, &cn) != 4) continue;
+    if (b < 0 || b >= VMH_MAX_BAG) continue;
+    g_s2_cut[0][b] = c7; g_s2_cut[1][b] = c8; g_s2_cut[2][b] = cn;
+    nc++;
+  }
+  fclose(f);
+  g_s2_racks = calloc_or_die(S2_HASH_SIZE, sizeof(S2RackEntry));
+  f = fopen(rp, "r");
+  if (!f) log_fatal("strategy2: cannot open %s", rp);
+  int nr = 0;
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0] == '#') continue;
+    char *c1 = strchr(line, ',');
+    if (!c1 || c1 - line != 7) continue;
+    char *c2 = strchr(c1 + 1, ',');
+    if (!c2) continue;
+    uint8_t idx[7];
+    int ok = 1;
+    for (int i = 0; i < 7; i++) {
+      const char ch = line[i];
+      if (ch == '?') idx[i] = 0;
+      else if (ch >= 'A' && ch <= 'Z') idx[i] = (uint8_t)(ch - 'A' + 1);
+      else ok = 0;
+    }
+    if (!ok) continue;
+    const uint64_t k = s2_rack_key(idx, 7);
+    uint32_t h = s2_hash(k);
+    while (g_s2_racks[h].k != 0 && g_s2_racks[h].k != k) h = (h + 1) & (S2_HASH_SIZE - 1);
+    g_s2_racks[h].k = k;
+    g_s2_racks[h].v = (float)atof(c1 + 1);
+    g_s2_racks[h].t = (int8_t)(c2[1] == '7' ? 0 : c2[1] == '8' ? 1 : 2);
+    nr++;
+  }
+  fclose(f);
+  if ((uint32_t)nr > S2_HASH_SIZE * 0.8) log_fatal("strategy2: rack table too large");
+  fprintf(stderr, "strategy2: ON -- tie delta %.4f, %d cutoff bags (%s), %d racks (%s)\n",
+          g_s2_delta, nc, cp, nr, rp);
+}
+
 // static leave value for vmh_turn_begin, from the same table and canonical form
 // the training features used (static.get(canonicalize_leave(leave), 0.0))
 static float vmh_static_cb(const uint8_t *idx, int len, void *ctx) {
@@ -1432,6 +1537,12 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
           if (!hm) log_fatal("vmodel: failed to load %s", hpath);
           if (hm->bag < 0 || hm->bag >= VMODEL_MAX_BAG)
             log_fatal("vmodel: %s has bag %d out of range", hpath, hm->bag);
+          if (hm->target_spread) {   // strategy 2's tie-breaker, not a picker model
+            if (g_vmh_spread_by_bag[hm->bag])
+              log_fatal("vmodel: duplicate spread .vmh for bag %d (%s)", hm->bag, hpath);
+            g_vmh_spread_by_bag[hm->bag] = hm;
+            continue;
+          }
           if (g_vmh_by_bag[hm->bag])
             log_fatal("vmodel: duplicate .vmh for bag %d (%s)", hm->bag, hpath);
           g_vmh_by_bag[hm->bag] = hm;
@@ -1474,7 +1585,20 @@ autoplay_shared_data_create(const AutoplayArgs *args, int num_autoplay_threads,
           if (g_vmh_by_bag[b]) bi += snprintf(banner + bi, sizeof(banner) - bi, " %d", b);
         fprintf(stderr, "%s\n", banner);
       }
+      int n_spr = 0;
+      for (int b = 0; b < VMH_MAX_BAG; b++) n_spr += g_vmh_spread_by_bag[b] != NULL;
+      if (n_spr) fprintf(stderr, "vmodel: spread .vmh loaded for %d bag(s)\n", n_spr);
     }
+  }
+  s2_load();
+  if (g_s2_on) {
+    int missing = 0;
+    for (int b = 0; b < VMH_MAX_BAG; b++)
+      if (g_vmh_by_bag[b] && !g_vmh_spread_by_bag[b]) {
+        fprintf(stderr, "strategy2: bag %d has a win model but no spread model\n", b);
+        missing++;
+      }
+    if (missing) log_fatal("strategy2: %d bag(s) without a spread model", missing);
   }
 
   // V-model picks (precomputed rack→move lookup tables). Same env-var
@@ -2831,6 +2955,21 @@ for (int src = 0; src < 2; src++) {
       fprintf(stderr, "vmodel:   standoff guard barred exchanges in %llu picks\n",
               (unsigned long long)atomic_load_explicit(&g_exch_guard_blocked,
                                                        memory_order_relaxed));
+      if (g_s2_on) {
+        const uint64_t sp = atomic_load_explicit(&g_s2_picks, memory_order_relaxed);
+        const uint64_t ts = atomic_load_explicit(&g_s2_tie_sets, memory_order_relaxed);
+        const uint64_t tc = atomic_load_explicit(&g_s2_tie_changed, memory_order_relaxed);
+        fprintf(stderr, "strategy2: %llu picks; tie sets %llu (%.2f%%), spread model "
+                "changed the pick %llu (%.2f%%)\n", (unsigned long long)sp,
+                (unsigned long long)ts, sp ? 100.0 * (double)ts / (double)sp : 0.0,
+                (unsigned long long)tc, sp ? 100.0 * (double)tc / (double)sp : 0.0);
+        fprintf(stderr, "strategy2: pass removed -- bingo playable %llu, rack value < "
+                "cutoff %llu, rack not in table %llu; kept (only move) %llu\n",
+                (unsigned long long)atomic_load_explicit(&g_s2_pass_no_bingo, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&g_s2_pass_no_value, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&g_s2_rack_missing, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&g_s2_pass_kept_only, memory_order_relaxed));
+      }
       fprintf(stderr, "vmodel:   HastyBot fell back: no-model %llu, no-moves "
               "%llu, none-scoreable %llu | moves unscored %llu/%llu (%.3f%%)\n",
               (unsigned long long)atomic_load_explicit(&g_vmodel_eg_null_nomodel, memory_order_relaxed),
@@ -3480,6 +3619,13 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       atomic_fetch_add_explicit(&g_exch_guard_blocked, 1, memory_order_relaxed);
     }
   }
+  // strategy 2: every scored candidate (for the tie rule) and whether a bingo is legal
+  typedef struct { Move *m; float p; int8_t kind; uint8_t llen; uint8_t leave[8]; int diff; }
+      S2Cand;
+  static _Thread_local S2Cand *s2c = NULL;
+  static _Thread_local int s2c_cap = 0;
+  int s2_n = 0;
+  bool s2_bingo = false;
   for (int i = 0; i < n_moves; i++) {
     Move *m = move_list_get_move(ml, i);
     int kind;
@@ -3515,6 +3661,7 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       if (played[t & 31]) played[t & 31]--;
       else leave_idx[leave_len++] = t;
     }
+    if (kind == 2 && rack_len == RACK_SIZE && leave_len == 0) s2_bingo = true;
     if (tc_verify) {
       rack_reset(&leave_rack);
       get_leave_for_move(m, game, &leave_rack);
@@ -3546,6 +3693,16 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       continue;
     }
     const float p_round = roundf(p * 10000.0f) / 10000.0f;
+    if (g_s2_on) {
+      if (s2_n >= s2c_cap) {
+        s2c_cap = s2c_cap ? 2 * s2c_cap : 1024;
+        s2c = realloc_or_die(s2c, sizeof(*s2c) * (size_t)s2c_cap);
+      }
+      S2Cand *c = &s2c[s2_n++];
+      c->m = m; c->p = p_round; c->kind = (int8_t)kind; c->diff = diff;
+      c->llen = (uint8_t)(leave_len < 8 ? leave_len : 7);
+      memcpy(c->leave, leave_idx, c->llen);
+    }
     // Sorted list: strict > keeps the equity-first tie order. Unsorted: break
     // the tie explicitly with the same comparator the sort uses.
     if (p_round > best_win ||
@@ -3665,6 +3822,25 @@ static const Move *vmodel_endgame_pick_move(Game *game,
       else if (zeros + 1 >= maxz) pass_wins_outright = true;
     }
   }
+  // strategy 2 pass filter (bags 10-91; not a certain winning pass-out)
+  if (pass_allowed && g_s2_on && !pass_wins_outright && bag_key >= 10 && bag_key <= 91) {
+    if (s2_n == 0) {
+      atomic_fetch_add_explicit(&g_s2_pass_kept_only, 1, memory_order_relaxed);
+    } else if (s2_bingo) {
+      pass_allowed = false;
+      atomic_fetch_add_explicit(&g_s2_pass_no_bingo, 1, memory_order_relaxed);
+    } else {
+      const S2RackEntry *re = rack_len == RACK_SIZE ? s2_rack_lookup(rack_idx, rack_len)
+                                                    : NULL;
+      if (!re) {
+        pass_allowed = false;
+        atomic_fetch_add_explicit(&g_s2_rack_missing, 1, memory_order_relaxed);
+      } else if (re->v < g_s2_cut[re->t][bag_key]) {
+        pass_allowed = false;
+        atomic_fetch_add_explicit(&g_s2_pass_no_value, 1, memory_order_relaxed);
+      }
+    }
+  }
   if (pass_allowed) {
     Move *spare = move_list_get_spare_move(ml);
     move_set_as_pass(spare);
@@ -3688,6 +3864,16 @@ static const Move *vmodel_endgame_pick_move(Game *game,
     }
     if (p >= 0.0f) {
       const float p_round = roundf(p * 10000.0f) / 10000.0f;
+      if (g_s2_on) {   // the pass as a tie-rule candidate (diff = raw lead here)
+        if (s2_n >= s2c_cap) {
+          s2c_cap = s2c_cap ? 2 * s2c_cap : 1024;
+          s2c = realloc_or_die(s2c, sizeof(*s2c) * (size_t)s2c_cap);
+        }
+        S2Cand *c = &s2c[s2_n++];
+        c->m = spare; c->p = p_round; c->kind = 0; c->diff = pre_diff;
+        c->llen = (uint8_t)(rack_len < 8 ? rack_len : 7);
+        memcpy(c->leave, rack_idx, c->llen);
+      }
       // Strict > so a tie keeps the play: in a decided position the spread head
       // decides, and its MAE (20-25 pts) exceeds the gaps it would adjudicate.
       // Except a winning pass-out: that win is CERTAIN, a play's 1.0 is a model
@@ -3704,6 +3890,46 @@ static const Move *vmodel_endgame_pick_move(Game *game,
         if (p_round > 0.02f && p_round < 0.98f)
           atomic_fetch_add_explicit(&g_vmodel_eg_pass_live, 1,
                                     memory_order_relaxed);
+      }
+    }
+  }
+  // strategy 2 tie rule: the spread model picks among the moves within delta of the
+  // best win% (measured from the top move). Not for a certain winning pass-out.
+  if (g_s2_on && best_move && hmod && !pass_wins_outright) {
+    atomic_fetch_add_explicit(&g_s2_picks, 1, memory_order_relaxed);
+    const VModelHier *smod = g_vmh_spread_by_bag[bag_key];
+    const float floor_p = best_win - g_s2_delta - 1e-6f;
+    int nt = 0;
+    for (int i = 0; i < s2_n; i++) nt += s2c[i].p >= floor_p;
+    if (smod && nt >= 2) {
+      atomic_fetch_add_explicit(&g_s2_tie_sets, 1, memory_order_relaxed);
+      if (!tl_vmh_tc_spr) tl_vmh_tc_spr = vmh_turn_cache_create();
+      vmh_turn_begin(tl_vmh_tc_spr, smod, rack_idx, rack_len, unseen, vmh_static_cb,
+                     (void *)sl);
+      Move *pick = NULL;
+      double pick_s = 0.0;
+      float pick_p = -1.0f;
+      for (int i = 0; i < s2_n; i++) {
+        const S2Cand *c = &s2c[i];
+        if (c->p < floor_p) continue;
+        int d = c->diff;
+        if (c->kind == 0 && smod->pass_sixpass) {
+          uint8_t rc[VMH_NT] = {0};
+          for (int k = 0; k < rack_len; k++) rc[rack_idx[k]]++;
+          d = vmodel_hier_sixpass_diff(rc, unseen, c->diff);
+        }
+        const double s = vmh_turn_predict(tl_vmh_tc_spr, c->leave, c->llen, c->kind, d);
+        // ties in spread keep the win model's order (higher win%, then compare_moves)
+        if (!pick || s > pick_s ||
+            (s == pick_s && (c->p > pick_p ||
+                             (c->p == pick_p && compare_moves(c->m, pick, false))))) {
+          pick = c->m; pick_s = s; pick_p = c->p;
+        }
+      }
+      if (pick && pick != best_move) {
+        atomic_fetch_add_explicit(&g_s2_tie_changed, 1, memory_order_relaxed);
+        best_move = pick;
+        best_win = pick_p;
       }
     }
   }
