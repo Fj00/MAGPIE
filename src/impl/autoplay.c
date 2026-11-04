@@ -6376,9 +6376,15 @@ void play_autoplay_game_or_game_pair(AutoplayWorker *autoplay_worker,
         if (truncated[gi]) {
           // Stopped below MAGPIE_TRAJECTORY_MIN_BAG: positions only, no outcome.
           trajectory_game_buffer_commit_unfinished(traj_r_end, gr->trajectory_buf);
-        } else if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD) {
+        } else if (game_get_game_end_reason(gr->game) == GAME_END_REASON_STANDARD ||
+                   (game_get_game_end_reason(gr->game) ==
+                        GAME_END_REASON_CONSECUTIVE_ZEROS &&
+                    getenv("MAGPIE_TRAJECTORY_KEEP_ZEROS") &&
+                    getenv("MAGPIE_TRAJECTORY_KEEP_ZEROS")[0] == '1')) {
           // Final scores reflect end-of-game tile-bag penalty adjustment
           // (magpie applies this internally on STANDARD termination).
+          // MAGPIE_TRAJECTORY_KEEP_ZEROS=1 (2026-11-04, diagnostics): also keep games
+          // that ended on scoreless turns (normally discarded) to study those endings.
           const int final_p1 = equity_to_int(
               player_get_score(game_get_player(gr->game, 0)));
           const int final_p2 = equity_to_int(
