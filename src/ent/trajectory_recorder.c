@@ -30,6 +30,17 @@ struct TrajectoryRecorder {
   pthread_mutex_t open_mutex;
   pthread_mutex_t mutexes[TR_NUM_BAGS];
   FILE *fhs[TR_NUM_BAGS];
+  // POOL MODE (2026-11-06; B repo plan noble-popping-kitten.md): MAGPIE_TRAJECTORY_POOL=1
+  // writes fill-pool lines "on-turn-first CGP<TAB>opponent leave" to
+  // positions/pp_bag<NN>[.w<W>].txt instead of the CSV rows; =2 writes both (test).
+  // MAGPIE_POOL_SPEC: bag,lead_lo,lead_hi,p_mid -- keep every position with lead <=
+  // lead_lo or >= lead_hi, the rest with probability p_mid (hash of the CGP, so a
+  // repeated position is kept or dropped consistently). Bags without a spec row: none.
+  int pool;
+  uint8_t pool_has[TR_NUM_BAGS];
+  int pool_lo[TR_NUM_BAGS], pool_hi[TR_NUM_BAGS];
+  double pool_p[TR_NUM_BAGS];
+  FILE *pool_fhs[TR_NUM_BAGS];  // non-shard mode: shared per-bag pool files
 };
 
 static const char *TR_CSV_HEADER =
@@ -47,6 +58,12 @@ typedef struct StagedRow {
   int bag_idx;
   uint8_t on_turn;  // 0 = p1, 1 = p2
   char *line;       // heap-allocated, owned by the buffer; no trailing \n
+  // pool mode only:
+  int turn;
+  int lead;          // score_diff_pre (mover's view)
+  uint8_t mover7;    // mover holds 7 tiles
+  char *pool_cgp;    // on-turn-first CGP (heap) or NULL
+  char leave[12];    // this move's leave = the NEXT row's opponent leave
 } StagedRow;
 
 struct TrajectoryGameBuffer {
@@ -54,7 +71,9 @@ struct TrajectoryGameBuffer {
   int count;
   int capacity;
   int worker_index;
-  FILE *own_fhs[TR_NUM_BAGS];  // shard mode: this worker's per-bag files
+  int pool;                         // MAGPIE_TRAJECTORY_POOL at creation
+  FILE *own_fhs[TR_NUM_BAGS];       // shard mode: this worker's per-bag files
+  FILE *own_pool_fhs[TR_NUM_BAGS];  // shard mode: this worker's per-bag pool files
 };
 
 static void tr_mkdir_or_die(const char *path) {
@@ -74,6 +93,39 @@ static void tr_raise_nofile_limit(void) {
   }
 }
 
+static void tr_load_pool_spec(TrajectoryRecorder *r) {
+  const char *pe = getenv("MAGPIE_TRAJECTORY_POOL");
+  r->pool = (pe && pe[0]) ? atoi(pe) : 0;
+  for (int i = 0; i < TR_NUM_BAGS; i++) {
+    r->pool_has[i] = 0;
+    r->pool_fhs[i] = NULL;
+  }
+  if (r->pool <= 0) return;
+  const char *sp = getenv("MAGPIE_POOL_SPEC");
+  if (!sp || !sp[0]) log_fatal("trajectory_recorder: MAGPIE_TRAJECTORY_POOL needs MAGPIE_POOL_SPEC");
+  FILE *f = fopen(sp, "r");
+  if (!f) log_fatal("trajectory_recorder: cannot open %s: %s", sp, strerror(errno));
+  char line[256];
+  int n = 0;
+  while (fgets(line, sizeof(line), f)) {
+    int bag, lo, hi;
+    double p;
+    if (line[0] == '#' || sscanf(line, "%d,%d,%d,%lf", &bag, &lo, &hi, &p) != 4) continue;
+    const int bi = tr_bag_to_index(bag);
+    if (bi < 0) continue;
+    r->pool_has[bi] = 1;
+    r->pool_lo[bi] = lo;
+    r->pool_hi[bi] = hi;
+    r->pool_p[bi] = p;
+    n++;
+  }
+  fclose(f);
+  if (n == 0) log_fatal("trajectory_recorder: no bag rows in %s", sp);
+  fprintf(stderr, "trajectory_recorder: POOL mode %d -- %d bag(s) from %s; writes "
+          "pp_bag<NN>%s.txt%s\n", r->pool, n, sp, r->shard ? ".w<WORKER>" : "",
+          r->pool == 2 ? " AND the CSV rows" : " (no CSV rows)");
+}
+
 TrajectoryRecorder *trajectory_recorder_create(const char *base_dir) {
   if (!base_dir || !base_dir[0]) return NULL;
   tr_raise_nofile_limit();
@@ -87,6 +139,7 @@ TrajectoryRecorder *trajectory_recorder_create(const char *base_dir) {
     pthread_mutex_init(&r->mutexes[i], NULL);
     r->fhs[i] = NULL;
   }
+  tr_load_pool_spec(r);
   tr_mkdir_or_die(r->base_dir);
   char positions_dir[1024];
   snprintf(positions_dir, sizeof(positions_dir), "%s/positions", r->base_dir);
@@ -107,6 +160,10 @@ void trajectory_recorder_destroy(TrajectoryRecorder *r) {
     if (r->fhs[i]) {
       fflush(r->fhs[i]);
       fclose(r->fhs[i]);
+    }
+    if (r->pool_fhs[i]) {
+      fflush(r->pool_fhs[i]);
+      fclose(r->pool_fhs[i]);
     }
     pthread_mutex_destroy(&r->mutexes[i]);
   }
@@ -146,7 +203,12 @@ TrajectoryGameBuffer *trajectory_game_buffer_create(int worker_index) {
   b->count = 0;
   b->rows = malloc_or_die(sizeof(StagedRow) * b->capacity);
   b->worker_index = worker_index;
-  for (int i = 0; i < TR_NUM_BAGS; i++) b->own_fhs[i] = NULL;
+  const char *pe = getenv("MAGPIE_TRAJECTORY_POOL");
+  b->pool = (pe && pe[0]) ? atoi(pe) : 0;
+  for (int i = 0; i < TR_NUM_BAGS; i++) {
+    b->own_fhs[i] = NULL;
+    b->own_pool_fhs[i] = NULL;
+  }
   return b;
 }
 
@@ -168,7 +230,10 @@ static FILE *tr_get_own_file(TrajectoryRecorder *r, TrajectoryGameBuffer *b,
 }
 
 static void tr_buf_free_rows(TrajectoryGameBuffer *b) {
-  for (int i = 0; i < b->count; i++) free(b->rows[i].line);
+  for (int i = 0; i < b->count; i++) {
+    free(b->rows[i].line);
+    free(b->rows[i].pool_cgp);
+  }
   b->count = 0;
 }
 
@@ -180,6 +245,10 @@ void trajectory_game_buffer_destroy(TrajectoryGameBuffer *b) {
       fflush(b->own_fhs[i]);
       fclose(b->own_fhs[i]);
     }
+    if (b->own_pool_fhs[i]) {
+      fflush(b->own_pool_fhs[i]);
+      fclose(b->own_pool_fhs[i]);
+    }
   }
   free(b->rows);
   free(b);
@@ -188,6 +257,34 @@ void trajectory_game_buffer_destroy(TrajectoryGameBuffer *b) {
 void trajectory_game_buffer_reset(TrajectoryGameBuffer *b) {
   if (!b) return;
   tr_buf_free_rows(b);
+}
+
+// The recorded CGP is P1-FIRST ("board r1/r2 s1/s2 ..."); magpie's game_load_cgp
+// treats rack1 as the player on turn. For on_turn == 1 swap racks and scores --
+// exactly B repo build_bag_balanced_pool.to_on_turn_first. Returns a heap string.
+static char *tr_on_turn_first(const char *cgp, int on_turn) {
+  const size_t len = strlen(cgp);
+  char *out = malloc_or_die(len + 1);
+  memcpy(out, cgp, len + 1);
+  if (on_turn != 1) return out;
+  const char *sp1 = strchr(cgp, ' ');
+  const char *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
+  if (!sp1 || !sp2) return out;
+  const char *sp3 = strchr(sp2 + 1, ' ');
+  const char *racks = sp1 + 1, *racks_end = sp2;
+  const char *scores = sp2 + 1, *scores_end = sp3 ? sp3 : cgp + len;
+  const char *rs = memchr(racks, '/', (size_t)(racks_end - racks));
+  const char *ss = memchr(scores, '/', (size_t)(scores_end - scores));
+  if (!rs || !ss) return out;
+  char *w = out + (sp1 - cgp) + 1;   // rewrite from the racks field on
+  const size_t r2 = (size_t)(racks_end - rs - 1), r1 = (size_t)(rs - racks);
+  memcpy(w, rs + 1, r2); w += r2; *w++ = '/';
+  memcpy(w, racks, r1); w += r1; *w++ = ' ';
+  const size_t s2 = (size_t)(scores_end - ss - 1), s1 = (size_t)(ss - scores);
+  memcpy(w, ss + 1, s2); w += s2; *w++ = '/';
+  memcpy(w, scores, s1); w += s1;
+  memcpy(w, scores_end, len - (size_t)(scores_end - cgp) + 1);   // rest incl. '\0'
+  return out;
 }
 
 void trajectory_game_buffer_add(
@@ -224,12 +321,83 @@ void trajectory_game_buffer_add(
   row->on_turn = (uint8_t)(on_turn ? 1 : 0);
   row->line = malloc_or_die((size_t)n + 1);
   memcpy(row->line, line, (size_t)n + 1);
+  // pool fields: every row (the previous row supplies the next one's opponent leave);
+  // the pool CGP only where a pool line can be written (bags 8..91)
+  row->turn = turn;
+  row->lead = score_diff_pre;
+  const char *mr = on_turn ? p2_rack : p1_rack;
+  row->mover7 = (uint8_t)(mr && strlen(mr) == 7);
+  snprintf(row->leave, sizeof(row->leave), "%s", leave ? leave : "");
+  row->pool_cgp = (b->pool > 0 && bag >= 8 && bag <= TR_BAG_MAX && board_cgp)
+                      ? tr_on_turn_first(board_cgp, on_turn ? 1 : 0)
+                      : NULL;
+}
+
+// ---- pool mode writer ----
+static uint64_t tr_fnv1a(const char *s) {
+  uint64_t h = 1469598103934665603ULL;
+  for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
+  return h;
+}
+
+static FILE *tr_get_pool_file(TrajectoryRecorder *r, TrajectoryGameBuffer *b,
+                              int bag_idx, int bag) {
+  FILE **slot = r->shard ? &b->own_pool_fhs[bag_idx] : &r->pool_fhs[bag_idx];
+  if (*slot) return *slot;
+  if (!r->shard) pthread_mutex_lock(&r->open_mutex);
+  if (!*slot) {
+    char path[1024];
+    if (r->shard)
+      snprintf(path, sizeof(path), "%s/positions/pp_bag%02d.w%d.txt", r->base_dir, bag,
+               b->worker_index);
+    else
+      snprintf(path, sizeof(path), "%s/positions/pp_bag%02d.txt", r->base_dir, bag);
+    FILE *fh = fopen(path, "w");
+    if (!fh) log_fatal("trajectory_recorder: cannot open %s: %s", path, strerror(errno));
+    *slot = fh;
+  }
+  if (!r->shard) pthread_mutex_unlock(&r->open_mutex);
+  return *slot;
+}
+
+// One pool line per kept row: on-turn-first CGP <TAB> the opponent's leave (the
+// previous row's leave when that row is the opponent's move on the previous turn --
+// same as build_pool_full's (game, turn-1) join; "" otherwise).
+static void tr_write_pool(TrajectoryRecorder *r, TrajectoryGameBuffer *b) {
+  if (r->pool <= 0) return;
+  for (int i = 0; i < b->count; i++) {
+    const StagedRow *row = &b->rows[i];
+    const int bi = row->bag_idx;
+    if (!row->pool_cgp || !row->mover7 || !r->pool_has[bi]) continue;
+    const int tail = row->lead <= r->pool_lo[bi] || row->lead >= r->pool_hi[bi];
+    if (!tail) {
+      const double u = (double)(tr_fnv1a(row->pool_cgp) >> 11) * (1.0 / 9007199254740992.0);
+      if (u >= r->pool_p[bi]) continue;
+    }
+    const char *opp = "";
+    if (i > 0 && b->rows[i - 1].on_turn != row->on_turn &&
+        b->rows[i - 1].turn == row->turn - 1)
+      opp = b->rows[i - 1].leave;
+    const int bag = bi + TR_BAG_MIN;
+    FILE *fh = tr_get_pool_file(r, b, bi, bag);
+    if (!r->shard) pthread_mutex_lock(&r->mutexes[bi]);
+    fputs(row->pool_cgp, fh);
+    fputc('\t', fh);
+    fputs(opp, fh);
+    fputc('\n', fh);
+    if (!r->shard) pthread_mutex_unlock(&r->mutexes[bi]);
+  }
 }
 
 void trajectory_game_buffer_commit(
     TrajectoryRecorder *r, TrajectoryGameBuffer *b,
     int final_p1_score, int final_p2_score) {
   if (!r || !b) return;
+  tr_write_pool(r, b);
+  if (r->pool == 1) {   // pool lines only, no CSV rows
+    tr_buf_free_rows(b);
+    return;
+  }
   // Per-row eventual_outcome (from row->on_turn player's perspective):
   //   1 = on_turn player won, 0 = lost, 2 = tied.
   // Derive once per game; per-row routing only needs row->on_turn.
@@ -271,6 +439,11 @@ void trajectory_game_buffer_commit(
 void trajectory_game_buffer_commit_unfinished(TrajectoryRecorder *r,
                                               TrajectoryGameBuffer *b) {
   if (!r || !b) return;
+  tr_write_pool(r, b);
+  if (r->pool == 1) {   // pool lines only, no CSV rows
+    tr_buf_free_rows(b);
+    return;
+  }
   for (int i = 0; i < b->count; i++) {
     const int bag_idx = b->rows[i].bag_idx;
     const int bag = (bag_idx == TR_BAG_MAX - TR_BAG_MIN + 1)
