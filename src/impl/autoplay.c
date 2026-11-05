@@ -123,6 +123,15 @@ static int g_s2_player = -1;
 static int g_s2_tie_min_bag = 8;
 static int g_s2_tie_on = 1;
 static int g_s2_filter_on = 1;
+// 2026-11-05 (bags 8-9): the pass filter's lowest bag per player (default 10 both;
+// MAGPIE_PASS_FILTER_MIN_BAG sets both, _P0 / _P1 override one -- paired tests of filter
+// variants), and the bingo rule's exception: at bags <= MAGPIE_PASS_BINGO_AHEAD_MAX_BAG
+// (default 9) a pass with a playable bingo stays allowed when the mover leads by
+// >= MAGPIE_PASS_BINGO_AHEAD (default 50) -- equal wins, better spread (bingo_vs_pass);
+// the rack-value cutoff and the tie rule still apply.
+static int g_s2_filter_min[2] = {10, 10};
+static int g_s2_bingo_ahead = 50;
+static int g_s2_bingo_ahead_max_bag = 9;
 static float g_s2_cut[3][VMH_MAX_BAG];          // [type 0=7,1=8,2=n][bag]
 #define S2_HASH_BITS 22
 #define S2_HASH_SIZE (1u << S2_HASH_BITS)
@@ -168,6 +177,19 @@ static void s2_load(void) {
   g_s2_tie_on = !(e && e[0] == '1');
   e = getenv("MAGPIE_PASS_FILTER_OFF");
   g_s2_filter_on = !(e && e[0] == '1');
+  e = getenv("MAGPIE_PASS_FILTER_MIN_BAG");
+  if (e && e[0]) g_s2_filter_min[0] = g_s2_filter_min[1] = atoi(e);
+  e = getenv("MAGPIE_PASS_FILTER_MIN_BAG_P0");
+  if (e && e[0]) g_s2_filter_min[0] = atoi(e);
+  e = getenv("MAGPIE_PASS_FILTER_MIN_BAG_P1");
+  if (e && e[0]) g_s2_filter_min[1] = atoi(e);
+  e = getenv("MAGPIE_PASS_BINGO_AHEAD");
+  if (e && e[0]) g_s2_bingo_ahead = atoi(e);
+  e = getenv("MAGPIE_PASS_BINGO_AHEAD_MAX_BAG");
+  if (e && e[0]) g_s2_bingo_ahead_max_bag = atoi(e);
+  fprintf(stderr, "strategy2: pass filter from bag %d (p1) / %d (p2); bingo rule exception "
+          "at bags <= %d when ahead >= %d\n", g_s2_filter_min[0], g_s2_filter_min[1],
+          g_s2_bingo_ahead_max_bag, g_s2_bingo_ahead);
   fprintf(stderr, "strategy2: player %s, tie rule %s (bags >= %d), pass filter %s\n",
           g_s2_player < 0 ? "both" : g_s2_player == 0 ? "0 (p1)" : "1 (p2)",
           g_s2_tie_on ? "on" : "OFF", g_s2_tie_min_bag, g_s2_filter_on ? "on" : "OFF");
@@ -3843,10 +3865,11 @@ static const Move *vmodel_endgame_pick_move(Game *game,
   // strategy 2 pass filter (bags 10-91; not a certain winning pass-out)
   const bool s2_mine = g_s2_on && (g_s2_player < 0 || on == g_s2_player);
   if (pass_allowed && s2_mine && g_s2_filter_on && !pass_wins_outright &&
-      bag_key >= 10 && bag_key <= 91) {
+      bag_key >= g_s2_filter_min[on] && bag_key <= 91) {
     if (s2_n == 0) {
       atomic_fetch_add_explicit(&g_s2_pass_kept_only, 1, memory_order_relaxed);
-    } else if (s2_bingo) {
+    } else if (s2_bingo && !(bag_key <= g_s2_bingo_ahead_max_bag &&
+                             pre_diff >= g_s2_bingo_ahead)) {
       pass_allowed = false;
       atomic_fetch_add_explicit(&g_s2_pass_no_bingo, 1, memory_order_relaxed);
     } else {
