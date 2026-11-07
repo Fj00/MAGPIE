@@ -8394,7 +8394,9 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         }
         int rpick[PP_RANK_MAX + 2];
         int n_rpick = 0;
-        if (pp_fan1 && !index_build && pp_rank_k > 0) {
+        // First reroll only (g == 0): rerolls replay the same position with a new
+        // bag order; repeating the ranked set there would multiply its cost.
+        if (pp_fan1 && !index_build && pp_rank_k > 0 && g == 0) {
           int top[PP_RANK_MAX];
           int ntop = 0;
           int bx = -1, bb = -1;
@@ -8468,6 +8470,13 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             }
             if (!cell_pick && !rank_pick) continue;
           }
+          // MAGPIE_PP_EG_MAX_SOLVES spent on this position: only ranked picks go
+          // on, as ranked-only (credit nothing). They never count toward the cap.
+          if (pos_capped) {
+            if (!rank_pick) continue;
+            cell_pick = false;
+          }
+          const bool rank_only = rank_pick && !cell_pick;
           const Move *mv = move_list_get_move(fan_ml, m);
           if (pass_only && move_get_type(mv) != GAME_EVENT_PASS)
             continue;  // pass-only relabel: skip plays/exchanges
@@ -8553,7 +8562,6 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             // playout when the next position offers another.
             // A RANKED-only pick (not a cell pick) is recorded and played out but
             // credits nothing: nft = 0 empties every credit loop below.
-            const bool rank_only = rank_pick && !cell_pick;
             if (rank_only) nft = 0;
             if (nft == 0 && !rank_only &&
                 !(nonplay_fan && move_get_type(mv) == GAME_EVENT_PASS))
@@ -8666,9 +8674,10 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
               if (traj_r && gr->trajectory_buf)
                 trajectory_game_buffer_discard(gr->trajectory_buf);
               game_destroy(dg);
-              if (eg_max_solves > 0 && ++pos_playouts >= eg_max_solves) {
+              if (eg_max_solves > 0 && !rank_only &&
+                  ++pos_playouts >= eg_max_solves) {
                 pos_capped = true;
-                break;
+                if (n_rpick == 0) break;
               }
               continue;
             }
@@ -8742,9 +8751,9 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             trajectory_game_buffer_discard(gr->trajectory_buf);
           }
           game_destroy(dg);
-          if (eg_max_solves > 0 && ++pos_playouts >= eg_max_solves) {
+          if (eg_max_solves > 0 && !rank_only && ++pos_playouts >= eg_max_solves) {
             pos_capped = true;
-            break;  // enough branches at this position — move on
+            if (n_rpick == 0) break;  // enough branches at this position — move on
           }
         }
       } else {
