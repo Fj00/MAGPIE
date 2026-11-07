@@ -8039,6 +8039,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         // Per-position endgame budget accumulator (wall-seconds spent solving
         // this position's branches); tightens the cap once exceeded.
         double eg_spent = 0.0;
+        double rk_spent = 0.0;  // ranked-only picks' own budget (MAGPIE_PP_RANK_TOPK)
         // Natural-ratio crediting: a STRATUM cell is credited at most ONCE
         // per position (its target is a distinct-position count). Track the
         // stratum cell ordinals already credited by this position's fanned
@@ -8695,7 +8696,10 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
               eg_solve,
               eg_plies, eg_caps, eg_signstable_k, eg_diffgate, eg_first_win,
               eg_tt_frac,
-              &eg_spent, eg_pos_budget, eg_overflow_cap, &win, &tie, &f0, &f1,
+              // ranked-only picks keep their OWN per-position time budget, so they
+              // never push the cell picks' solves into the overflow cap
+              rank_only ? &rk_spent : &eg_spent, eg_pos_budget, eg_overflow_cap,
+              &win, &tie, &f0, &f1,
               &spread,
               sd->vmodel_bags_any_loaded ? sd->vmodels_by_bag : NULL,
               sd->vmodel_static_leaves);
