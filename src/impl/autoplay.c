@@ -6842,6 +6842,8 @@ static void pp_render_leave(const Move *move, const Game *game, char *out,
 // Exchange picks kept per position, bounded by the number of distinct
 // exchanges a 7-tile rack can produce (2^7 - 1 = 127).
 #define PP_XPICK_MAX 128
+// MAGPIE_PP_RANK_TOPK upper bound (top-K plays by equity per position).
+#define PP_RANK_MAX 16
 
 // Match a fan-out move's force-table cells: leave cells (stratum/tile/pair via
 // the tile-bitmap predicate) + bag_tile cells (via the pre-move-rack predicate).
@@ -8374,9 +8376,72 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             }
           }
         }
+        // RANKED picks (MAGPIE_PP_RANK_TOPK=K, default 0 = off; 2026-11-07, for a
+        // within-position ranking term): besides the cell picks, record the top K
+        // plays by static equity, the best exchange and the best bingo (7 tiles
+        // played) -- the moves that actually compete for the choice, incl. the
+        // pass-vs-bingo / exchange cases. They are played out like any branch
+        // (same opponent rack and bag order as the cell picks) but credit NO
+        // force-table cell, so each cell's win% still rests on hash-picked moves
+        // only. Not in the catalog (index_build). fan_ml is a max-heap, so scan it
+        // all. pick column: 1 = cell pick, 2 = ranked, 3 = both.
+        static _Thread_local int pp_rank_k = -1;
+        if (pp_rank_k < 0) {
+          const char *e = getenv("MAGPIE_PP_RANK_TOPK");
+          pp_rank_k = (e && e[0]) ? atoi(e) : 0;
+          if (pp_rank_k > PP_RANK_MAX) pp_rank_k = PP_RANK_MAX;
+          if (pp_rank_k < 0) pp_rank_k = 0;
+        }
+        int rpick[PP_RANK_MAX + 2];
+        int n_rpick = 0;
+        if (pp_fan1 && !index_build && pp_rank_k > 0) {
+          int top[PP_RANK_MAX];
+          int ntop = 0;
+          int bx = -1, bb = -1;
+          for (int mm = 0; mm < nm; mm++) {
+            const Move *pv = move_list_get_move(fan_ml, mm);
+            const game_event_t ty = move_get_type(pv);
+            const Equity eq = move_get_equity(pv);
+            if (ty == GAME_EVENT_EXCHANGE) {
+              if (bx < 0 || eq > move_get_equity(move_list_get_move(fan_ml, bx)))
+                bx = mm;
+              continue;
+            }
+            if (ty != GAME_EVENT_TILE_PLACEMENT_MOVE) continue;
+            if (move_get_tiles_played(pv) == RACK_SIZE &&
+                (bb < 0 || eq > move_get_equity(move_list_get_move(fan_ml, bb))))
+              bb = mm;
+            // insertion into the top-K list (descending equity)
+            int pos = ntop;
+            while (pos > 0 &&
+                   eq > move_get_equity(move_list_get_move(fan_ml, top[pos - 1])))
+              pos--;
+            if (pos < pp_rank_k) {
+              const int last = ntop < pp_rank_k ? ntop : pp_rank_k - 1;
+              for (int q = last; q > pos; q--) top[q] = top[q - 1];
+              top[pos] = mm;
+              if (ntop < pp_rank_k) ntop++;
+            }
+          }
+          for (int q = 0; q < ntop; q++) rpick[n_rpick++] = top[q];
+          if (bx >= 0) rpick[n_rpick++] = bx;
+          if (bb >= 0) {
+            bool dup = false;
+            for (int q = 0; q < ntop; q++)
+              if (top[q] == bb) dup = true;
+            if (!dup) rpick[n_rpick++] = bb;
+          }
+        }
         for (int oi = 0; oi < pp_iter_n &&
                          (all_plays || nseen < PP_FANOUT_MAX); oi++) {
           const int m = all_plays ? oi : rr_order[oi];
+          bool cell_pick = true;   // pp_fan1: picked for an open force-table cell
+          bool rank_pick = false;  // MAGPIE_PP_RANK_TOPK pick (credits nothing)
+          for (int q = 0; q < n_rpick; q++)
+            if (rpick[q] == m) {
+              rank_pick = true;
+              break;
+            }
           // Mirror the registration exemption: the play cap must not discard a
           // pass/exchange that pp_keep marked from beyond it. pp_keep_n (the
           // scanned window) is the real bound either way.
@@ -8396,13 +8461,12 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
                   picked = true;
                   break;
                 }
-              if (!picked) continue;
+              cell_pick = picked;
             } else {
               const bool m_np = m_pass || m_exch;
-              if (m >= pp_keep_n) continue;
-              if (!m_np && m >= kcap) continue;
-              if (!pp_keep[m]) continue;
+              cell_pick = m < pp_keep_n && (m_np || m < kcap) && pp_keep[m];
             }
+            if (!cell_pick && !rank_pick) continue;
           }
           const Move *mv = move_list_get_move(fan_ml, m);
           if (pass_only && move_get_type(mv) != GAME_EVENT_PASS)
@@ -8487,7 +8551,11 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
             // Exchanges and plays keep the gate: both are picked BECAUSE they
             // resolve an open cell, so one that resolves nothing is not worth a
             // playout when the next position offers another.
-            if (nft == 0 &&
+            // A RANKED-only pick (not a cell pick) is recorded and played out but
+            // credits nothing: nft = 0 empties every credit loop below.
+            const bool rank_only = rank_pick && !cell_pick;
+            if (rank_only) nft = 0;
+            if (nft == 0 && !rank_only &&
                 !(nonplay_fan && move_get_type(mv) == GAME_EVENT_PASS))
               continue;
             if (index_build) {
@@ -8561,6 +8629,9 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           if (traj_r && gr->trajectory_buf) {
             trajectory_game_buffer_reset(gr->trajectory_buf);
           }
+          if (traj_r && gr->trajectory_buf)
+            trajectory_game_buffer_set_next_pick(
+                gr->trajectory_buf, (cell_pick ? 1 : 0) | (rank_pick ? 2 : 0));
           eb_stage_trajectory_row(gr, gr->game, mv, on_idx);
           play_move(mv, dg, NULL);
           bool win = false, tie = false;

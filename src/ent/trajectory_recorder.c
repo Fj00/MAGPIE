@@ -47,7 +47,11 @@ static const char *TR_CSV_HEADER =
     "game_id,turn,bag,on_turn,p1_rack,p2_rack,p1_score,p2_score,"
     "board_cgp,action_kind,action_repr,action_size,"
     "move_score,score_diff_pre,score_diff_post,leave,eventual_outcome,"
-    "final_spread\n";
+    "final_spread,pick\n";
+// pick (2026-11-07, LAST column so positional readers are unaffected): why a
+// position-pool fan-out recorded this move -- bit 1 = cell pick (credits the
+// force table), bit 2 = ranked pick (top equity / best exchange / best bingo,
+// MAGPIE_PP_RANK_TOPK; credits nothing). 0 = an ordinary game move.
 
 // Pre-formatted CSV line (without trailing newline / eventual_outcome)
 // + which per-bag file it routes to + which player is on turn. The
@@ -64,6 +68,7 @@ typedef struct StagedRow {
   uint8_t mover7;    // mover holds 7 tiles
   char *pool_cgp;    // on-turn-first CGP (heap) or NULL
   char leave[12];    // this move's leave = the NEXT row's opponent leave
+  uint8_t pick;      // the trailing `pick` column
 } StagedRow;
 
 struct TrajectoryGameBuffer {
@@ -71,6 +76,7 @@ struct TrajectoryGameBuffer {
   int count;
   int capacity;
   int worker_index;
+  int next_pick;                    // pick of the next staged row (then reset)
   int pool;                         // MAGPIE_TRAJECTORY_POOL at creation
   FILE *own_fhs[TR_NUM_BAGS];       // shard mode: this worker's per-bag files
   FILE *own_pool_fhs[TR_NUM_BAGS];  // shard mode: this worker's per-bag pool files
@@ -203,6 +209,7 @@ TrajectoryGameBuffer *trajectory_game_buffer_create(int worker_index) {
   b->count = 0;
   b->rows = malloc_or_die(sizeof(StagedRow) * b->capacity);
   b->worker_index = worker_index;
+  b->next_pick = 0;
   const char *pe = getenv("MAGPIE_TRAJECTORY_POOL");
   b->pool = (pe && pe[0]) ? atoi(pe) : 0;
   for (int i = 0; i < TR_NUM_BAGS; i++) {
@@ -257,6 +264,10 @@ void trajectory_game_buffer_destroy(TrajectoryGameBuffer *b) {
 void trajectory_game_buffer_reset(TrajectoryGameBuffer *b) {
   if (!b) return;
   tr_buf_free_rows(b);
+}
+
+void trajectory_game_buffer_set_next_pick(TrajectoryGameBuffer *b, int pick) {
+  if (b) b->next_pick = pick;
 }
 
 // The recorded CGP is P1-FIRST ("board r1/r2 s1/s2 ..."); magpie's game_load_cgp
@@ -328,6 +339,8 @@ void trajectory_game_buffer_add(
   const char *mr = on_turn ? p2_rack : p1_rack;
   row->mover7 = (uint8_t)(mr && strlen(mr) == 7);
   snprintf(row->leave, sizeof(row->leave), "%s", leave ? leave : "");
+  row->pick = (uint8_t)b->next_pick;
+  b->next_pick = 0;
   row->pool_cgp = (b->pool > 0 && bag >= 8 && bag <= TR_BAG_MAX && board_cgp)
                       ? tr_on_turn_first(board_cgp, on_turn ? 1 : 0)
                       : NULL;
@@ -419,13 +432,13 @@ void trajectory_game_buffer_commit(
       // Per-worker shard file — this worker owns it, no lock needed.
       FILE *fh = tr_get_own_file(r, b, bag_idx, bag);
       fputs(b->rows[i].line, fh);
-      fprintf(fh, ",%d,%d\n", outcome, spread);
+      fprintf(fh, ",%d,%d,%d\n", outcome, spread, b->rows[i].pick);
     } else {
       FILE *fh = tr_get_file(r, bag_idx, bag);
       if (!fh) continue;
       pthread_mutex_lock(&r->mutexes[bag_idx]);
       fputs(b->rows[i].line, fh);
-      fprintf(fh, ",%d,%d\n", outcome, spread);
+      fprintf(fh, ",%d,%d,%d\n", outcome, spread, b->rows[i].pick);
       pthread_mutex_unlock(&r->mutexes[bag_idx]);
     }
   }
@@ -452,13 +465,13 @@ void trajectory_game_buffer_commit_unfinished(TrajectoryRecorder *r,
     if (r->shard) {
       FILE *fh = tr_get_own_file(r, b, bag_idx, bag);
       fputs(b->rows[i].line, fh);
-      fputs(",-1,0\n", fh);
+      fprintf(fh, ",-1,0,%d\n", b->rows[i].pick);
     } else {
       FILE *fh = tr_get_file(r, bag_idx, bag);
       if (!fh) continue;
       pthread_mutex_lock(&r->mutexes[bag_idx]);
       fputs(b->rows[i].line, fh);
-      fputs(",-1,0\n", fh);
+      fprintf(fh, ",-1,0,%d\n", b->rows[i].pick);
       pthread_mutex_unlock(&r->mutexes[bag_idx]);
     }
   }

@@ -46,6 +46,10 @@ void trajectory_game_buffer_destroy(TrajectoryGameBuffer *b);
 // Clear buffered rows. Call at the start of each new game.
 void trajectory_game_buffer_reset(TrajectoryGameBuffer *b);
 
+// The `pick` column of the NEXT staged row (bit 1 cell pick, bit 2 ranked pick);
+// reset to 0 once that row is staged.
+void trajectory_game_buffer_set_next_pick(TrajectoryGameBuffer *b, int pick);
+
 // Stage one position row in the buffer. Same field semantics as the
 // pre-staging API. Returns immediately on a NULL buffer (recorder
 // disabled).
