@@ -52,6 +52,8 @@ static const char *TR_CSV_HEADER =
 // position-pool fan-out recorded this move -- bit 1 = cell pick (credits the
 // force table), bit 2 = ranked pick (top equity / best exchange / best bingo,
 // MAGPIE_PP_RANK_TOPK; credits nothing). 0 = an ordinary game move.
+// For ranked picks pick >> 2 = the rank: 0..K-1 equity rank among plays, 16 = the
+// best exchange, 17 = the best bingo outside the top K (test pick & 3 for the kind).
 
 // Pre-formatted CSV line (without trailing newline / eventual_outcome)
 // + which per-bag file it routes to + which player is on turn. The

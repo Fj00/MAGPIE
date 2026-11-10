@@ -8394,6 +8394,7 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           if (pp_rank_k < 0) pp_rank_k = 0;
         }
         int rpick[PP_RANK_MAX + 2];
+        int rcode[PP_RANK_MAX + 2];
         int n_rpick = 0;
         // First reroll only (g == 0): rerolls replay the same position with a new
         // bag order; repeating the ranked set there would multiply its cost.
@@ -8426,13 +8427,24 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
               if (ntop < pp_rank_k) ntop++;
             }
           }
-          for (int q = 0; q < ntop; q++) rpick[n_rpick++] = top[q];
-          if (bx >= 0) rpick[n_rpick++] = bx;
+          // rcode = the pick's rank, recorded as pick >> 2: 0..K-1 = equity rank among
+          // plays, PP_RANK_MAX = best exchange, PP_RANK_MAX + 1 = best bingo (outside top K)
+          for (int q = 0; q < ntop; q++) {
+            rcode[n_rpick] = q;
+            rpick[n_rpick++] = top[q];
+          }
+          if (bx >= 0) {
+            rcode[n_rpick] = PP_RANK_MAX;
+            rpick[n_rpick++] = bx;
+          }
           if (bb >= 0) {
             bool dup = false;
             for (int q = 0; q < ntop; q++)
               if (top[q] == bb) dup = true;
-            if (!dup) rpick[n_rpick++] = bb;
+            if (!dup) {
+              rcode[n_rpick] = PP_RANK_MAX + 1;
+              rpick[n_rpick++] = bb;
+            }
           }
         }
         for (int oi = 0; oi < pp_iter_n &&
@@ -8440,9 +8452,11 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           const int m = all_plays ? oi : rr_order[oi];
           bool cell_pick = true;   // pp_fan1: picked for an open force-table cell
           bool rank_pick = false;  // MAGPIE_PP_RANK_TOPK pick (credits nothing)
+          int rank_code = 0;       // its rcode (pick >> 2)
           for (int q = 0; q < n_rpick; q++)
             if (rpick[q] == m) {
               rank_pick = true;
+              rank_code = rcode[q];
               break;
             }
           // Mirror the registration exemption: the play cap must not discard a
@@ -8640,7 +8654,8 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
           }
           if (traj_r && gr->trajectory_buf)
             trajectory_game_buffer_set_next_pick(
-                gr->trajectory_buf, (cell_pick ? 1 : 0) | (rank_pick ? 2 : 0));
+                gr->trajectory_buf, (cell_pick ? 1 : 0) | (rank_pick ? 2 : 0) |
+                                        (rank_pick ? rank_code << 2 : 0));
           eb_stage_trajectory_row(gr, gr->game, mv, on_idx);
           play_move(mv, dg, NULL);
           bool win = false, tie = false;
