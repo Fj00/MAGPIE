@@ -8398,7 +8398,14 @@ static void position_pool_run_worker(AutoplayWorker *worker, GameRunner *gr) {
         int n_rpick = 0;
         // First reroll only (g == 0): rerolls replay the same position with a new
         // bag order; repeating the ranked set there would multiply its cost.
-        if (pp_fan1 && !index_build && pp_rank_k > 0 && g == 0) {
+        // MAGPIE_PP_RANK_ALL_REROLLS=1 ranks on every reroll (headroom test: each
+        // ranked move's expected result over many deals, 2026-11-09).
+        static _Thread_local int pp_rank_all = -1;
+        if (pp_rank_all < 0) {
+          const char *e = getenv("MAGPIE_PP_RANK_ALL_REROLLS");
+          pp_rank_all = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (pp_fan1 && !index_build && pp_rank_k > 0 && (g == 0 || pp_rank_all)) {
           int top[PP_RANK_MAX];
           int ntop = 0;
           int bx = -1, bb = -1;
