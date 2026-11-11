@@ -132,6 +132,16 @@ static int g_s2_filter_on = 1;
 static int g_s2_filter_min[2] = {10, 10};
 static int g_s2_bingo_ahead = 50;
 static int g_s2_bingo_ahead_max_bag = 9;
+// 2026-11-11 close-game pass block: at bags <= MAGPIE_PASS_CLOSE_MAX_BAG (default 0 =
+// off; iteration 2 sets 8) no pass when the lead before the move is in
+// [MAGPIE_PASS_CLOSE_LO, MAGPIE_PASS_CLOSE_HI) (defaults -25, 25). Measured on bag 8's
+// iteration-2 fill (exact labels): the passes the model prefers at lead -25..0 lose
+// 19.9 pt of wins vs its play, at 0..25 11.0 pt, and neither the bingo rule nor the
+// rack cutoffs catch them. A certain winning pass-out and an only-move pass stay.
+static int g_s2_close_max_bag = 0;
+static int g_s2_close_lo = -25;
+static int g_s2_close_hi = 25;
+static _Atomic uint64_t g_s2_pass_no_close = 0;   // pass removed: close game at a low bag
 static float g_s2_cut[3][VMH_MAX_BAG];          // [type 0=7,1=8,2=n][bag]
 #define S2_HASH_BITS 22
 #define S2_HASH_SIZE (1u << S2_HASH_BITS)
@@ -187,9 +197,17 @@ static void s2_load(void) {
   if (e && e[0]) g_s2_bingo_ahead = atoi(e);
   e = getenv("MAGPIE_PASS_BINGO_AHEAD_MAX_BAG");
   if (e && e[0]) g_s2_bingo_ahead_max_bag = atoi(e);
+  e = getenv("MAGPIE_PASS_CLOSE_MAX_BAG");
+  if (e && e[0]) g_s2_close_max_bag = atoi(e);
+  e = getenv("MAGPIE_PASS_CLOSE_LO");
+  if (e && e[0]) g_s2_close_lo = atoi(e);
+  e = getenv("MAGPIE_PASS_CLOSE_HI");
+  if (e && e[0]) g_s2_close_hi = atoi(e);
   fprintf(stderr, "strategy2: pass filter from bag %d (p1) / %d (p2); bingo rule exception "
-          "at bags <= %d when ahead >= %d\n", g_s2_filter_min[0], g_s2_filter_min[1],
-          g_s2_bingo_ahead_max_bag, g_s2_bingo_ahead);
+          "at bags <= %d when ahead >= %d; close-game block at bags <= %d for lead in "
+          "[%d, %d)\n", g_s2_filter_min[0], g_s2_filter_min[1],
+          g_s2_bingo_ahead_max_bag, g_s2_bingo_ahead, g_s2_close_max_bag, g_s2_close_lo,
+          g_s2_close_hi);
   fprintf(stderr, "strategy2: player %s, tie rule %s (bags >= %d), pass filter %s\n",
           g_s2_player < 0 ? "both" : g_s2_player == 0 ? "0 (p1)" : "1 (p2)",
           g_s2_tie_on ? "on" : "OFF", g_s2_tie_min_bag, g_s2_filter_on ? "on" : "OFF");
@@ -3003,9 +3021,10 @@ for (int src = 0; src < 2; src++) {
                 "changed the pick %llu (%.2f%%)\n", (unsigned long long)sp,
                 (unsigned long long)ts, sp ? 100.0 * (double)ts / (double)sp : 0.0,
                 (unsigned long long)tc, sp ? 100.0 * (double)tc / (double)sp : 0.0);
-        fprintf(stderr, "strategy2: pass removed -- bingo playable %llu, rack value < "
-                "cutoff %llu, rack not in table %llu; kept (only move) %llu\n",
+        fprintf(stderr, "strategy2: pass removed -- bingo playable %llu, close game %llu, "
+                "rack value < cutoff %llu, rack not in table %llu; kept (only move) %llu\n",
                 (unsigned long long)atomic_load_explicit(&g_s2_pass_no_bingo, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&g_s2_pass_no_close, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&g_s2_pass_no_value, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&g_s2_rack_missing, memory_order_relaxed),
                 (unsigned long long)atomic_load_explicit(&g_s2_pass_kept_only, memory_order_relaxed));
@@ -3872,6 +3891,10 @@ static const Move *vmodel_endgame_pick_move(Game *game,
                              pre_diff >= g_s2_bingo_ahead)) {
       pass_allowed = false;
       atomic_fetch_add_explicit(&g_s2_pass_no_bingo, 1, memory_order_relaxed);
+    } else if (bag_key <= g_s2_close_max_bag && pre_diff >= g_s2_close_lo &&
+               pre_diff < g_s2_close_hi) {
+      pass_allowed = false;   // close game at a low bag (see g_s2_close_max_bag)
+      atomic_fetch_add_explicit(&g_s2_pass_no_close, 1, memory_order_relaxed);
     } else {
       const S2RackEntry *re = rack_len == RACK_SIZE ? s2_rack_lookup(rack_idx, rack_len)
                                                     : NULL;
