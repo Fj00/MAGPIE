@@ -1111,19 +1111,16 @@ void endgame_ctx_reset(EndgameCtx *es, EndgameResults *results,
   es->soft_time_limit = endgame_args->soft_time_limit;
   es->hard_time_limit = endgame_args->hard_time_limit;
   es->external_deadline_ns = endgame_args->external_deadline_ns;
-  // hard_time_limit on its own is only consulted BETWEEN depths (via the EBF
-  // projection in iterative_deepening), so a single depth whose cost the EBF
-  // underestimates runs to completion regardless of the cap. Arm an absolute
-  // deadline from it when the caller has not supplied one: workers then check
-  // it in-search and the cap is actually honoured. A caller-supplied
-  // external_deadline_ns always wins (it is the more specific request).
-  // (Upstream 2026-11 arms its own depth deadline once a first depth has
-  // finished; this one applies from the start, which the position-pool fill's
-  // 0.5-12 s per-solve caps rely on. Both hold.)
-  if (es->external_deadline_ns == 0 && es->hard_time_limit > 0) {
-    es->external_deadline_ns =
-        ctimer_monotonic_ns() + (int64_t)(es->hard_time_limit * 1e9);
-  }
+  // hard_time_limit is honoured IN-SEARCH: thread 0 arms depth_deadline_ns to
+  // the end of the limit after each completed depth (upstream 2026-11-01,
+  // "-etlim stops a depth that is already running"), and check_depth_deadline
+  // stops the search on min(depth deadline, external_deadline_ns). Depth 1
+  // always completes, so a limit too short for any depth still returns a
+  // depth-1 value (test_endgame_time_limit_stops_depth). Our fork's earlier
+  // start-of-solve arming of external_deadline_ns from hard_time_limit
+  // (2026-07-30) is therefore gone: it interrupted depth 1 under tight caps.
+  // The position-pool fill's 0.5-12 s per-solve caps are enforced from depth 2
+  // on, as they effectively were (depth 1 is a single ply).
   es->stop_fn = endgame_args->stop_fn;
   es->stop_data = endgame_args->stop_data;
   bool create_separate_kwgs =
