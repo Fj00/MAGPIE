@@ -9,8 +9,12 @@ fi
 echo "$CLANG_TIDY_EXEC version:"
 $CLANG_TIDY_EXEC --version
 
-SEARCH_DIRECTORIES="src/ test/ cmd/"
-EXCLUDED_FILES="linenoise.c"
+SEARCH_DIRECTORIES="src/ test/ cmd/ tools/ wasmentry/"
+# With "windows" as the second argument, lint src/compat's Windows branches:
+# only src/compat, compiled for MinGW-w64 with _WIN32 defined. Use a
+# clang-tidy that can find the MinGW headers, such as llvm-mingw's.
+TIDY_PLATFORM="$2"
+EXCLUDED_FILES="linenoise.c cjson.c sha256.c"
 CLANG_TIDY_CHECKS="*,
                   -readability-magic-numbers,
                   -cppcoreguidelines-avoid-magic-numbers,
@@ -32,8 +36,44 @@ CLANG_TIDY_CHECKS="*,
                   -llvm-header-guard,
                   -android-cloexec-pipe,
                   -cppcoreguidelines-avoid-non-const-global-variables"
-CLANG_TIDY_EXCLUDE_HEADER_FILTER="^(?!.*linenoise\.(c|h)).*"
+CLANG_TIDY_EXCLUDE_HEADER_FILTER="^(?!.*(linenoise|cjson|sha256|miniaudio)\.(c|h)).*"
 C_COMPILER_FLAGS="-std=c99 -Wno-trigraphs -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -D__linux__ -U_WIN32 -U__APPLE__ "
+if [ "$TIDY_PLATFORM" = "windows" ]; then
+    SEARCH_DIRECTORIES="src/compat/"
+    # MINGW_SYSROOT: the MinGW headers' root, for a clang-tidy that is not
+    # llvm-mingw's own (e.g. CI's clang-tidy-18 with llvm-mingw unpacked).
+    C_COMPILER_FLAGS="-std=c99 -Wno-trigraphs --target=x86_64-w64-mingw32 -D_WIN32_WINNT=0x0A00 -DBOARD_DIM=15 -DRACK_SIZE=7"
+    if [ -n "$MINGW_SYSROOT" ]; then
+        C_COMPILER_FLAGS="$C_COMPILER_FLAGS -isystem $MINGW_SYSROOT/x86_64-w64-mingw32/include -isystem $MINGW_SYSROOT/generic-w64-mingw32/include"
+    fi
+    # Windows' API is documented, and meant to be included, as <windows.h>,
+    # whose declarations include-cleaner would rather each came from its own
+    # internal header.
+    CLANG_TIDY_CHECKS="$CLANG_TIDY_CHECKS,-misc-include-cleaner"
+fi
+
+# The TUI also needs the notcurses and FreeType headers. Their umbrella
+# headers (notcurses/notcurses.h, FT_FREETYPE_H) are the supported entry
+# points, so include-cleaner ignores those libraries' internal headers,
+# along with glibc's and the kernel's internal ones (bits/, asm/), which
+# it can't always attribute to the public header (CLOCK_MONOTONIC and
+# <time.h>, for one).
+# Without the headers tui/ is skipped, unless MAGPIE_TIDY_REQUIRE_TUI is
+# set (as in CI), which makes that an error.
+TUI_DIRECTORY="tui/"
+TUI_COMPILER_FLAGS=""
+TUI_TIDY_CONFIG="{CheckOptions: {misc-include-cleaner.IgnoreHeaders: 'notcurses/.*;freetype/.*;ft2build.h;zconf.h;zlib.h;bits/.*;asm/.*;asm-generic/.*'}}"
+if [ -d "$TUI_DIRECTORY" ]; then
+    if pkg-config --exists notcurses-core freetype2 2>/dev/null; then
+        TUI_COMPILER_FLAGS="$C_COMPILER_FLAGS $(pkg-config --cflags notcurses-core freetype2)"
+        SEARCH_DIRECTORIES="$SEARCH_DIRECTORIES $TUI_DIRECTORY"
+    elif [ -n "$MAGPIE_TIDY_REQUIRE_TUI" ]; then
+        echo "ERROR: notcurses or FreeType development headers not found; cannot analyze $TUI_DIRECTORY" >&2
+        exit 1
+    else
+        echo "Skipping $TUI_DIRECTORY: notcurses or FreeType development headers not found."
+    fi
+fi
 
 MAX_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
 LOG_FILE=$(mktemp)
@@ -43,6 +83,7 @@ set -o pipefail
 
 # Export variables for use in parallel subprocesses
 export CLANG_TIDY_EXEC CLANG_TIDY_EXCLUDE_HEADER_FILTER CLANG_TIDY_CHECKS C_COMPILER_FLAGS
+export TUI_DIRECTORY TUI_COMPILER_FLAGS TUI_TIDY_CONFIG
 
 echo "Starting clang-tidy static analysis for C files in: $SEARCH_DIRECTORIES"
 echo "Using $MAX_CORES parallel workers"
@@ -69,10 +110,19 @@ find $SEARCH_DIRECTORIES -name "*.c" -print0 | grep -zv "$EXCLUDE_PATTERN" | \
         SAFE_NAME=$(echo "$C_FILE" | tr "/" "_")
         OUTPUT_FILE="$RESULT_DIR/$SAFE_NAME"
         echo "Analyzing: $C_FILE"
+        FILE_FLAGS="$C_COMPILER_FLAGS"
+        set --
+        case "$C_FILE" in
+            "$TUI_DIRECTORY"*)
+                FILE_FLAGS="$TUI_COMPILER_FLAGS"
+                set -- --config="$TUI_TIDY_CONFIG"
+                ;;
+        esac
         $CLANG_TIDY_EXEC "$C_FILE" \
             --header-filter="$CLANG_TIDY_EXCLUDE_HEADER_FILTER" \
             -checks="$CLANG_TIDY_CHECKS" \
-            -- $C_COMPILER_FLAGS > "$OUTPUT_FILE" 2>&1
+            "$@" \
+            -- $FILE_FLAGS > "$OUTPUT_FILE" 2>&1
         TIDY_EXIT=$?
         if [ $TIDY_EXIT -ne 0 ]; then
             echo "ERROR: clang-tidy command failed for $C_FILE (exit code $TIDY_EXIT)." >> "$OUTPUT_FILE"

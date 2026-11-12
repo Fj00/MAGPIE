@@ -1,3 +1,5 @@
+#include "kwg_maker.h"
+
 #include "../def/board_defs.h"
 #include "../def/cross_set_defs.h"
 #include "../def/kwg_defs.h"
@@ -283,7 +285,9 @@ static inline void transition_stack_mark_accepts(TransitionStack *stack) {
 }
 
 // Build a DAWG/GADDAG using the transition stack approach
-// words must be sorted
+// words must be sorted. Callers that build their own lists satisfy this by
+// construction; the convert commands sort first, since text files carry no
+// ordering guarantee and unordered input silently inflates the graph.
 // Returns the index of the first state in the root's child chain
 static uint32_t build_dawg_from_sorted_words(const DictionaryWordList *words,
                                              StateList *states,
@@ -730,14 +734,22 @@ static uint32_t wolges_convert_chain(WolgesConverter *converter,
   uint8_t tiles[MACHINE_LETTER_MAX_VALUE];
   uint8_t accepts[MACHINE_LETTER_MAX_VALUE];
   uint32_t arcs[MACHINE_LETTER_MAX_VALUE];
+  // One node per distinct tile, so this bound cannot truncate a well-formed
+  // chain. A longer one is reported below rather than overrunning the buffers.
   uint32_t count = 0;
-  for (uint32_t s = src_head; s != 0;
+  uint32_t s = src_head;
+  for (; s != 0 && count < (MACHINE_LETTER_MAX_VALUE);
        s = converter->src->states[s].next_index) {
     tiles[count] = converter->src->states[s].tile;
     accepts[count] = converter->src->states[s].accepts;
     arcs[count] =
         wolges_convert_chain(converter, converter->src->states[s].arc_index);
     count++;
+  }
+  if (s != 0) {
+    log_fatal("sibling chain from state %u exceeds %d entries; the source "
+              "graph is malformed",
+              src_head, (MACHINE_LETTER_MAX_VALUE));
   }
   // Chaining next_index = previous insertion while iterating highest -> lowest
   // produces the ascending chain (head = lowest tile, highest carries
@@ -890,9 +902,16 @@ typedef struct ReorderItemHead {
 } ReorderItemHead;
 
 static int reorder_pair_cmp(const void *a, const void *b) {
-  const uint64_t x = ((const ReorderItemHead *)a)->key;
-  const uint64_t y = ((const ReorderItemHead *)b)->key;
-  return (x > y) - (x < y);
+  const ReorderItemHead *first = (const ReorderItemHead *)a;
+  const ReorderItemHead *second = (const ReorderItemHead *)b;
+  if (first->key != second->key) {
+    return (first->key > second->key) - (first->key < second->key);
+  }
+  // Pairs are built in ascending head order, so breaking ties on head gives
+  // the order a stable sort would. Without it the layout of the KWG, and so
+  // the bytes of every KLV built through it, would depend on how the C
+  // library's qsort orders ties.
+  return (first->head > second->head) - (first->head < second->head);
 }
 
 // Returns true if `key` is present in the sorted item array of head `h`.
@@ -1818,8 +1837,9 @@ static inline int get_letters_in_common(const DictionaryWord *word,
 }
 
 // The dictionary word list must be in alphabetical order.
-KWG *make_kwg_from_words(const DictionaryWordList *words,
-                         kwg_maker_output_t output, kwg_maker_merge_t merging) {
+static KWG *make_full_kwg(const DictionaryWordList *words,
+                          kwg_maker_output_t output,
+                          kwg_maker_merge_t merging) {
   if (merging == KWG_MAKER_MERGE_TAIL_REORDER) {
     if (output != KWG_MAKER_OUTPUT_DAWG) {
       log_fatal("KWG_MAKER_MERGE_TAIL_REORDER supports DAWG output only");
@@ -1909,11 +1929,22 @@ KWG *make_kwg_from_words(const DictionaryWordList *words,
   return kwg;
 }
 
+// The dictionary word list must be in alphabetical order for the KWG to get
+// its tile bitsets (kwg_try_build_tile_bitsets) and serve as a lexicon. A
+// leave graph made from racks in generation order gets none; its KLV reads
+// only its nodes.
+KWG *make_kwg_from_words(const DictionaryWordList *words,
+                         kwg_maker_output_t output, kwg_maker_merge_t merging) {
+  KWG *kwg = make_full_kwg(words, output, merging);
+  kwg_try_build_tile_bitsets(kwg);
+  return kwg;
+}
+
 // Optimized version for small dictionaries (endgame wordprune case).
 // Uses the compact state builder for efficiency.
-KWG *make_kwg_from_words_small(const DictionaryWordList *words,
-                               kwg_maker_output_t output,
-                               kwg_maker_merge_t merging) {
+static KWG *make_small_kwg(const DictionaryWordList *words,
+                           kwg_maker_output_t output,
+                           kwg_maker_merge_t merging) {
   if (merging == KWG_MAKER_MERGE_TAIL_REORDER) {
     if (output != KWG_MAKER_OUTPUT_DAWG) {
       log_fatal("KWG_MAKER_MERGE_TAIL_REORDER supports DAWG output only");
@@ -2013,5 +2044,15 @@ KWG *make_kwg_from_words_small(const DictionaryWordList *words,
 
   mutable_node_list_destroy(nodes);
   node_pointer_list_destroy(ordered_pointers);
+  return kwg;
+}
+
+// The words must be in alphabetical order for the KWG to get its tile bitsets
+// (kwg_try_build_tile_bitsets).
+KWG *make_kwg_from_words_small(const DictionaryWordList *words,
+                               kwg_maker_output_t output,
+                               kwg_maker_merge_t merging) {
+  KWG *kwg = make_small_kwg(words, output, merging);
+  kwg_try_build_tile_bitsets(kwg);
   return kwg;
 }

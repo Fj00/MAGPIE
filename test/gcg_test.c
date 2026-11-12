@@ -1,3 +1,5 @@
+#include "gcg_test.h"
+
 #include "../src/def/board_defs.h"
 #include "../src/def/game_defs.h"
 #include "../src/def/game_history_defs.h"
@@ -140,6 +142,33 @@ void test_game_history(GameHistory *game_history) {
                        "some_game" GCG_EXTENSION);
 }
 
+// A minimal valid GCG (the pragma block from the fixtures plus two exchange
+// events) with the first rack substituted, so the rack-size bound can be
+// tested without a fixture file.
+static void test_first_rack_size_case(Config *config, GameHistory *game_history,
+                                      const char *first_rack,
+                                      const bool expect_too_many) {
+  char gcg[1024];
+  (void)snprintf(gcg, sizeof(gcg),
+                 "#character-encoding UTF-8\n"
+                 "#lexicon CSW21\n"
+                 "#game-type classic\n"
+                 "#board-layout standard15\n"
+                 "#tile-set english set\n"
+                 "#tile-distribution english\n"
+                 "#player1 HastyBot HastyBot\n"
+                 "#player2 RightBehindYou RightBehindYou\n"
+                 ">HastyBot: %s -IIILU +0 0\n"
+                 ">RightBehindYou: AEINRST -AEINRST +0 0\n",
+                 first_rack);
+  const error_code_t status = test_parse_gcg_string(gcg, config, game_history);
+  if (expect_too_many) {
+    assert(status == ERROR_STATUS_GCG_PARSE_RACK_TOO_MANY_LETTERS);
+  } else {
+    assert(status != ERROR_STATUS_GCG_PARSE_RACK_TOO_MANY_LETTERS);
+  }
+}
+
 void test_error_cases(GameHistory *game_history) {
   Config *config = config_create_or_die(
       "set -lex CSW21 -s1 equity -s2 equity -r1 all -r2 all -numplays 1");
@@ -176,8 +205,12 @@ void test_error_cases(GameHistory *game_history) {
                          ERROR_STATUS_GCG_PARSE_PLAYED_LETTERS_NOT_IN_RACK);
   test_single_error_case("exchange_not_in_rack", config, game_history,
                          ERROR_STATUS_GCG_PARSE_MOVE_VALIDATION_ERROR);
+  // The rack in this fixture ("AEEG.TTV") uses "." where the file's author
+  // intended a malformed character; since "." is now a valid alias for "?"
+  // (blank), it parses as a well-formed 8-letter rack and instead fails
+  // later, when that rack doesn't match the tracked game state.
   test_single_error_case("exchange_malformed", config, game_history,
-                         ERROR_STATUS_GCG_PARSE_RACK_MALFORMED);
+                         ERROR_STATUS_GCG_PARSE_MOVE_VALIDATION_ERROR);
   test_single_error_case("pass_rack_malformed", config, game_history,
                          ERROR_STATUS_GCG_PARSE_RACK_MALFORMED);
   test_single_error_case("challenge_bonus_rack_malformed", config, game_history,
@@ -224,6 +257,12 @@ void test_error_cases(GameHistory *game_history) {
                          ERROR_STATUS_GCG_PARSE_END_GAME_EVENT_BEFORE_GAME_END);
   test_single_error_case("first_rack_not_in_bag", config, game_history,
                          ERROR_STATUS_GCG_PARSE_RACK_NOT_IN_BAG);
+  // A rack wider than RACK_SIZE parses (rack_set_to_string allows up to
+  // MAX_RACK_SIZE) but must be refused when replay puts it on the player.
+  // 7 is the control; 8 is one over; 10 is what a hand-edited GCG might hold.
+  test_first_rack_size_case(config, game_history, "DIIIILU", false);
+  test_first_rack_size_case(config, game_history, "DIIIILUA", true);
+  test_first_rack_size_case(config, game_history, "DIIIILUAEN", true);
   test_single_error_case("midgame_rack_not_in_bag", config, game_history,
                          ERROR_STATUS_GCG_PARSE_RACK_NOT_IN_BAG);
   test_single_error_case("event_after_last_rack", config, game_history,
@@ -966,9 +1005,8 @@ void test_success_board_layout_pragma(GameHistory *game_history) {
     }
   }
 
-  char *ext_gcg = string_builder_dump(ext_bdn_sb, NULL);
+  char *ext_gcg = string_builder_dump_and_destroy(ext_bdn_sb, NULL);
 
-  string_builder_destroy(ext_bdn_sb);
   string_splitter_destroy(split_standard);
   free(std_gcg);
 
@@ -1227,9 +1265,8 @@ void test_multiple_description_pragmas(GameHistory *game_history) {
     }
   }
 
-  char *multi_desc_gcg = string_builder_dump(multi_desc_sb, NULL);
+  char *multi_desc_gcg = string_builder_dump_and_destroy(multi_desc_sb, NULL);
 
-  string_builder_destroy(multi_desc_sb);
   string_splitter_destroy(split_standard);
   free(std_gcg);
 
@@ -1349,8 +1386,8 @@ void test_success_trailing_overtime_penalty(GameHistory *game_history) {
   string_builder_add_string(partial_gcg_sb,
                             ">RightBehindYou:  (time) -10 69\n");
 
-  char *gcg_with_penalty = string_builder_dump(partial_gcg_sb, NULL);
-  string_builder_destroy(partial_gcg_sb);
+  char *gcg_with_penalty =
+      string_builder_dump_and_destroy(partial_gcg_sb, NULL);
   string_splitter_destroy(split_standard);
   free(std_gcg);
 
@@ -1364,12 +1401,29 @@ void test_success_trailing_overtime_penalty(GameHistory *game_history) {
   config_destroy(config);
 }
 
+// gcg_parser_create reports an empty or whitespace-only GCG as an error
+// rather than failing, for callers that don't go through
+// config_parse_gcg_string's own check.
+static void test_parser_create_empty(GameHistory *game_history) {
+  const char *const empty_gcgs[] = {"", "  ", "\n\n", " \r\n\t\n"};
+  const int num_gcgs = (int)(sizeof(empty_gcgs) / sizeof(empty_gcgs[0]));
+  for (int gcg_idx = 0; gcg_idx < num_gcgs; gcg_idx++) {
+    ErrorStack *error_stack = error_stack_create();
+    GCGParser *gcg_parser =
+        gcg_parser_create(empty_gcgs[gcg_idx], game_history, NULL, error_stack);
+    assert(error_stack_top(error_stack) == ERROR_STATUS_GCG_PARSE_GCG_EMPTY);
+    gcg_parser_destroy(gcg_parser);
+    error_stack_destroy(error_stack);
+  }
+}
+
 void test_gcg(void) {
   // Use the same game_history for all tests to thoroughly test the
   // game_history_reset function
   GameHistory *game_history = game_history_create();
   test_game_history(game_history);
   test_error_cases(game_history);
+  test_parser_create_empty(game_history);
   test_parse_special_char(game_history);
   test_parse_special_utf8_no_header(game_history);
   test_parse_special_utf8_with_header(game_history);

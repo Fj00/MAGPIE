@@ -1,9 +1,12 @@
 #include "convert.h"
 
+#include "../compat/cfile.h"
+#include "../compat/cpath.h"
 #include "../def/board_defs.h"
 #include "../def/convert_defs.h"
 #include "../def/kwg_defs.h"
 #include "../def/letter_distribution_defs.h"
+#include "../def/rack_defs.h"
 #include "../ent/conversion_results.h"
 #include "../ent/data_filepaths.h"
 #include "../ent/dawg_packed.h"
@@ -12,17 +15,193 @@
 #include "../ent/klv_csv.h"
 #include "../ent/kwg.h"
 #include "../ent/letter_distribution.h"
+#include "../ent/rack.h"
 #include "../ent/rack_info_table.h"
+#include "../ent/win_pct_counts.h"
 #include "../ent/wmp.h"
+#include "../ent/word_info_table.h"
 #include "../util/fileproxy.h"
 #include "../util/io_util.h"
 #include "../util/string_util.h"
 #include "kwg_maker.h"
 #include "rack_info_table_maker.h"
+#include "rack_list.h"
+#include "win_pct_smoother.h"
 #include "wmp_maker.h"
+#include "word_info_table_maker.h"
+#include "word_plus_floater_maker.h"
+#include "xs_convert.h"
+#include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+// The largest line a rack equity CSV may contain. A row is a rack, a count and
+// a sum: the rack is at most RACK_SIZE multi-character letters, and the two
+// numbers are a uint64 and a double in text. Nothing legitimate comes close,
+// and the bound is what stops a malformed file from being read into memory a
+// gigabyte at a time.
+enum { RACK_EQUITY_CSV_MAX_LINE_LENGTH = 512 };
+
+// Builds the KLV a generation's aggregated results imply.
+//
+// birdtest's server holds one row per full rack -- an occurrence count and a
+// sum of equities -- folded from every contribution to a leave-generation
+// generation. The individual games are long gone. This is the conversion from
+// those aggregates to the leave values they imply, so that the server no
+// longer has to carry its own translation of rack_list_write_to_klv and
+// generate_leaves and keep it in step by hand (see birdtest's README.md,
+// "Leave-generation KLVs").
+//
+// The input is `lexica/<input_name>.csv`, one `rack,count,equity_sum` row per
+// full rack, and the output is `lexica/<output_name>.klv2`. Every full rack
+// drawable from `ld` must appear exactly once: a rack the file omits would
+// silently contribute a mean of zero to every leave it contains, which is a
+// real leave value and indistinguishable from one that was measured, so the
+// count is checked rather than assumed.
+//
+// A rack with a count of zero is not the same as a missing rack. It is a rack
+// that was enumerated and never drawn, and it contributes a mean of zero with
+// full weight, exactly as it does within a leavegen run. Its equity_sum must
+// be zero too, since there is nothing to have summed.
+static void convert_rack_equity_to_klv(const LetterDistribution *ld,
+                                       const char *data_paths,
+                                       const char *input_name,
+                                       const char *output_name,
+                                       ErrorStack *error_stack) {
+  char *csv_filename = data_filepaths_get_readable_filename(
+      data_paths, input_name, DATA_FILEPATH_TYPE_LEAVES, error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    return;
+  }
+  FILE *stream = stream_from_filename(csv_filename, error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    free(csv_filename);
+    return;
+  }
+
+  // target_rack_count is irrelevant here: it governs which racks stay eligible
+  // to be drawn as rare, and nothing in this conversion draws one. Zero forced
+  // racks leaves the list unrestricted, which is the cheapest thing to build.
+  RackList *rack_list =
+      rack_list_create(ld, /*target_rack_count=*/1, NULL, 0, error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    fclose_or_die(stream);
+    free(csv_filename);
+    return;
+  }
+
+  // Every rack starts unset, so that a rack the file never mentions is an
+  // error rather than a mean of zero nobody asked for.
+  rack_list_mark_all_racks_unset(rack_list);
+
+  Rack rack;
+  rack_set_dist_size(&rack, ld_get_size(ld));
+  char *line = NULL;
+  size_t line_capacity = 0;
+  int64_t line_length;
+  int rows = 0;
+  while ((line_length = getline_ignore_carriage_return(&line, &line_capacity,
+                                                       stream)) != -1) {
+    if (line_length >= RACK_EQUITY_CSV_MAX_LINE_LENGTH) {
+      error_stack_push(
+          error_stack, ERROR_STATUS_CONVERT_MALFORMED_RACK_EQUITY_ROW,
+          get_formatted_string(
+              "line %d of rack equity csv file '%s' exceeds max length of %d",
+              rows + 1, csv_filename, RACK_EQUITY_CSV_MAX_LINE_LENGTH));
+      break;
+    }
+    // A trailing newline leaves an empty final line, which is not a row.
+    if (line_length == 0 || line[0] == '\n') {
+      continue;
+    }
+    char *rack_str = strtok(line, ",");
+    char *count_str = strtok(NULL, ",");
+    char *equity_sum_str = strtok(NULL, "\n");
+    if (rack_str) {
+      trim_whitespace(rack_str);
+    }
+    if (count_str) {
+      trim_whitespace(count_str);
+    }
+    if (equity_sum_str) {
+      trim_whitespace(equity_sum_str);
+    }
+    if (!rack_str || !count_str || !equity_sum_str) {
+      error_stack_push(
+          error_stack, ERROR_STATUS_CONVERT_MALFORMED_RACK_EQUITY_ROW,
+          get_formatted_string("line %d of rack equity csv file '%s' is not "
+                               "rack,count,equity_sum",
+                               rows + 1, csv_filename));
+      break;
+    }
+    if (rack_set_to_string(ld, &rack, rack_str) < 0) {
+      error_stack_push(
+          error_stack, ERROR_STATUS_CONVERT_MALFORMED_RACK_EQUITY_ROW,
+          get_formatted_string("line %d of rack equity csv file '%s': rack "
+                               "equity rows must name full racks of %d tiles "
+                               "drawable from this letter distribution, and "
+                               "'%s' does not parse as a rack of its letters",
+                               rows + 1, csv_filename, (RACK_SIZE), rack_str));
+      break;
+    }
+    const uint64_t count = string_to_uint64(count_str, error_stack);
+    const double equity_sum =
+        error_stack_is_empty(error_stack)
+            ? string_to_double(equity_sum_str, error_stack)
+            : 0.0;
+    if (!error_stack_is_empty(error_stack)) {
+      error_stack_push(
+          error_stack, ERROR_STATUS_CONVERT_MALFORMED_RACK_EQUITY_ROW,
+          get_formatted_string("line %d of rack equity csv file '%s' has a "
+                               "count or equity sum that is not a number: %s",
+                               rows + 1, csv_filename, rack_str));
+      break;
+    }
+    // The mean, not the sum, is what a rack contributes. A rack that never
+    // occurred has a mean of zero and still carries its full draw weight, as
+    // it does within a leavegen run.
+    const double mean = count > 0 ? equity_sum / (double)count : 0.0;
+    rack_list_set_rack_count_and_mean(rack_list, &rack, count, mean,
+                                      error_stack);
+    if (!error_stack_is_empty(error_stack)) {
+      error_stack_push(
+          error_stack, ERROR_STATUS_CONVERT_MALFORMED_RACK_EQUITY_ROW,
+          get_formatted_string("line %d of rack equity csv file '%s': %s",
+                               rows + 1, csv_filename, rack_str));
+      break;
+    }
+    rows++;
+  }
+  free(line);
+  fclose_or_die(stream);
+
+  // Duplicates are caught as they are read, so an unset rack at this point is
+  // one the file left out.
+  const int unset = rack_list_get_number_of_unset_racks(rack_list);
+  if (error_stack_is_empty(error_stack) && unset != 0) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_CONVERT_INCOMPLETE_RACK_EQUITY_CSV,
+        get_formatted_string(
+            "rack equity csv file '%s' has %d rows covering %d of the %d full "
+            "racks this letter distribution draws; every one must appear "
+            "exactly once",
+            csv_filename, rows,
+            rack_list_get_number_of_racks(rack_list) - unset,
+            rack_list_get_number_of_racks(rack_list)));
+  }
+  free(csv_filename);
+
+  if (error_stack_is_empty(error_stack)) {
+    KLV *klv = klv_create_empty(ld, output_name);
+    rack_list_write_to_klv(rack_list, ld, klv);
+    klv_write(klv, data_paths, output_name, error_stack);
+    klv_destroy(klv);
+  }
+  rack_list_destroy(rack_list);
+}
 
 void convert_from_text_with_dwl(const LetterDistribution *ld,
                                 conversion_type_t conversion_type,
@@ -50,7 +229,7 @@ void convert_from_text_with_dwl(const LetterDistribution *ld,
 
   char *line = NULL;
   size_t len = 0;
-  ssize_t read;
+  int64_t read;
   // Use BOARD_DIM + 2 so we can distinguish "too long" (mls_length ==
   // BOARD_DIM + 1) from "invalid letter" (mls_length == -1). Multi-byte
   // or multichar tiles (e.g. UTF-8, [QU]) mean raw byte length can exceed
@@ -102,6 +281,11 @@ void convert_from_text_with_dwl(const LetterDistribution *ld,
     fclose_or_die(input_file);
     return;
   }
+
+  // Text files carry no ordering guarantee and the DAWG builders require one.
+  // Sorting here keeps every convert command safe without charging internal
+  // callers, which build ordered lists themselves.
+  dictionary_word_list_sort(strings);
 
   if (conversion_type == CONVERT_TEXT2WORDMAP) {
     char *wmp_output_filename = data_filepaths_get_writable_filename(
@@ -179,10 +363,153 @@ void convert_from_text_with_dwl(const LetterDistribution *ld,
   }
 }
 
+// Unlike the ordinary readable-file search, do not skip an existing file that
+// cannot be opened. In particular, an unreadable future-version file must not
+// be mistaken for a missing file and replaced by an output-path override.
+// kwg_get_hash of the lexicon `lexicon`'s word graph, or 0 when it cannot be
+// loaded: a rack info table built from its wordmap records it.
+static uint64_t convert_lexicon_kwg_hash(const char *data_paths,
+                                         const char *lexicon) {
+  ErrorStack *errors = error_stack_create();
+  KWG *kwg = kwg_create(data_paths, lexicon, errors);
+  const uint64_t hash = error_stack_is_empty(errors) ? kwg_get_hash(kwg) : 0;
+  kwg_destroy(kwg);
+  error_stack_destroy(errors);
+  return hash;
+}
+
+static char *get_existing_wit_filename(const char *data_paths, const char *name,
+                                       ErrorStack *error_stack) {
+  if (data_paths == NULL) {
+    error_stack_push(error_stack, ERROR_STATUS_FILEPATH_NULL_PATH,
+                     string_duplicate("word info table data path is empty"));
+    return NULL;
+  }
+  char **paths = NULL;
+  const int paths_count = cpath_split_list(data_paths, &paths);
+  char *filename = NULL;
+  const int count = paths_count;
+  for (int path_index = 0; path_index < count; path_index++) {
+    char *candidate = get_filepath(paths[path_index], name,
+                                   DATA_FILEPATH_TYPE_WORD_INFO_TABLE);
+    CFileIdentity identity;
+    if (fileproxy_file_exists(candidate) ||
+        cfile_identity(candidate, &identity)) {
+      filename = candidate;
+      break;
+    }
+    const int error_number = errno;
+    if (error_number != ENOENT) {
+      error_stack_push(
+          error_stack, ERROR_STATUS_RW_FAILED_TO_OPEN_STREAM,
+          get_formatted_string("could not inspect word info table %s: %s",
+                               candidate, strerror(error_number)));
+      free(candidate);
+      break;
+    }
+    free(candidate);
+  }
+  cpath_list_destroy(paths, paths_count);
+  return filename;
+}
+
+static bool wit_has_required_positional_masks(const WordInfoTable *wit,
+                                              const KWG *kwg) {
+  // Match the native maker's alphabet decision using playable DAWG words,
+  // rather than the letter distribution or unrelated/unplayable KWG nodes.
+  // Verify the complete terminal set before treating empty base rows as having
+  // no positional requirement; a matching fingerprint alone is insufficient.
+  DictionaryWordList *words = dictionary_word_list_create();
+  kwg_write_words(kwg, kwg_get_dawg_root_node_index(kwg), words, NULL);
+  bool supported = true;
+  bool complete = true;
+  uint32_t words_per_length[BOARD_DIM + 1] = {0};
+  const int count = dictionary_word_list_get_count(words);
+  for (int word_index = 0; complete && word_index < count; word_index++) {
+    const DictionaryWord *word =
+        dictionary_word_list_get_word(words, word_index);
+    const MachineLetter *letters = dictionary_word_get_word(word);
+    const int length = dictionary_word_get_length(word);
+    if (length < 1 || length > BOARD_DIM ||
+        word_info_table_lookup(wit, letters, length) == NULL) {
+      complete = false;
+      break;
+    }
+    words_per_length[length]++;
+    for (int position = 0; position < length; position++) {
+      if (letters[position] > WPF_ALPHABET_SIZE) {
+        supported = false;
+        break;
+      }
+    }
+  }
+  dictionary_word_list_destroy(words);
+  for (int length = 1; complete && length <= BOARD_DIM; length++) {
+    complete = words_per_length[length] == wit->tries[length].num_values;
+  }
+  if (!complete) {
+    return false;
+  }
+  if (!supported) {
+    return true;
+  }
+  for (int length = WPF_MIN_BLOCK_LENGTH; length <= WPF_MAX_BLOCK_LENGTH;
+       length++) {
+    if (wit->tries[length].num_values != 0 &&
+        wit->word_plus_floater[length] == NULL) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool wit_file_is_current(const KWG *kwg, const char *name,
+                                const char *filename, ErrorStack *error_stack) {
+  FILE *stream = stream_from_filename(filename, error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    return false;
+  }
+  // This byte only prevents downgrading newer files. Reuse still requires the
+  // full native loader's structural, payload and trailing-data validation.
+  const int version = fgetc(stream);
+  bool read_failed = ferror(stream) != 0;
+  if (fclose(stream) != 0) {
+    read_failed = true;
+  }
+  if (read_failed) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_RW_READ_ERROR,
+        get_formatted_string("could not read word info table %s", filename));
+    return false;
+  }
+  if (version > WIT_VERSION) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_WMP_UNSUPPORTED_VERSION,
+        get_formatted_string("word info table %s has newer version %d than %d",
+                             filename, version, WIT_VERSION));
+    return false;
+  }
+  ErrorStack *load_errors = error_stack_create();
+  WordInfoTable *wit = calloc_or_die(1, sizeof(WordInfoTable));
+  word_info_table_load(wit, name, filename, load_errors);
+  const bool current = error_stack_is_empty(load_errors) &&
+                       wit->version == WIT_VERSION && wit->kwg_hash != 0 &&
+                       wit->kwg_hash == kwg_get_hash(kwg) &&
+                       wit_has_required_positional_masks(wit, kwg);
+  if (error_stack_top(load_errors) == ERROR_STATUS_RW_FAILED_TO_OPEN_STREAM) {
+    error_stack_push(error_stack, ERROR_STATUS_RW_FAILED_TO_OPEN_STREAM,
+                     error_stack_get_string_and_reset(load_errors));
+  }
+  word_info_table_destroy(wit);
+  error_stack_destroy(load_errors);
+  return current;
+}
+
 void convert_with_names(const LetterDistribution *ld,
                         conversion_type_t conversion_type,
                         const char *data_paths, const char *input_name,
-                        const char *output_name,
+                        const char *output_name, const char *klv_name,
+                        const char *wmp_name,
                         ConversionResults *conversion_results, int num_threads,
                         ErrorStack *error_stack) {
   if ((conversion_type == CONVERT_TEXT2DAWG) ||
@@ -239,11 +566,13 @@ void convert_with_names(const LetterDistribution *ld,
     }
     klv_destroy(klv);
   } else if (conversion_type == CONVERT_KLVWMP2RIT) {
-    KLV *klv = klv_create(data_paths, input_name, error_stack);
+    KLV *klv =
+        klv_create(data_paths, klv_name ? klv_name : input_name, error_stack);
     if (!error_stack_is_empty(error_stack)) {
       return;
     }
-    WMP *wmp = wmp_create(data_paths, input_name, error_stack);
+    WMP *wmp =
+        wmp_create(data_paths, wmp_name ? wmp_name : input_name, error_stack);
     if (!error_stack_is_empty(error_stack)) {
       klv_destroy(klv);
       return;
@@ -263,6 +592,11 @@ void convert_with_names(const LetterDistribution *ld,
       const uint8_t playthrough_min_played_size = 1;
       RackInfoTable *rit = make_rack_info_table(klv, wmp, ld, num_threads,
                                                 playthrough_min_played_size);
+      // What it is built from, so a load for another lexicon or other leaves
+      // refuses it. A lexicon whose word graph is not on disk goes unrecorded.
+      rit->klv_hash = klv_get_hash(klv);
+      rit->kwg_hash = convert_lexicon_kwg_hash(
+          data_paths, wmp_name ? wmp_name : input_name);
       rack_info_table_write_to_file(rit, rit_output_filename, error_stack);
       if (!error_stack_is_empty(error_stack)) {
         error_stack_push(
@@ -276,11 +610,104 @@ void convert_with_names(const LetterDistribution *ld,
     free(rit_output_filename);
     wmp_destroy(wmp);
     klv_destroy(klv);
+  } else if (conversion_type == CONVERT_RACKEQUITY2KLV) {
+    convert_rack_equity_to_klv(ld, data_paths, input_name, output_name,
+                               error_stack);
+  } else if (conversion_type == CONVERT_KWG2WIT ||
+             conversion_type == CONVERT_KWG2WIT_IF_NEEDED ||
+             conversion_type == CONVERT_KWG2WIT_V4) {
+    KWG *kwg = kwg_create(data_paths, input_name, error_stack);
+    bool current = false;
+    if (error_stack_is_empty(error_stack) &&
+        conversion_type == CONVERT_KWG2WIT_IF_NEEDED) {
+      char *existing_filename =
+          get_existing_wit_filename(data_paths, output_name, error_stack);
+      if (existing_filename != NULL && error_stack_is_empty(error_stack)) {
+        current = wit_file_is_current(kwg, output_name, existing_filename,
+                                      error_stack);
+      }
+      free(existing_filename);
+    }
+    if (!current && error_stack_is_empty(error_stack)) {
+      char *wit_output_filename = data_filepaths_get_writable_filename(
+          data_paths, output_name, DATA_FILEPATH_TYPE_WORD_INFO_TABLE,
+          error_stack);
+      if (error_stack_is_empty(error_stack)) {
+        WordInfoTable *wit = make_word_info_table_from_kwg(kwg, num_threads);
+        make_word_plus_floater_from_kwg(kwg, wit, error_stack);
+        if (error_stack_is_empty(error_stack) &&
+            conversion_type == CONVERT_KWG2WIT_V4) {
+          word_info_table_write_version_4_to_file(wit, wit_output_filename,
+                                                  error_stack);
+        } else if (error_stack_is_empty(error_stack)) {
+          word_info_table_write_to_file(wit, wit_output_filename, error_stack);
+        }
+        if (!error_stack_is_empty(error_stack)) {
+          error_stack_push(
+              error_stack, ERROR_STATUS_CONVERT_OUTPUT_FILE_NOT_WRITABLE,
+              get_formatted_string(
+                  "could not write word info table to output file: %s",
+                  wit_output_filename));
+        }
+        word_info_table_destroy(wit);
+      }
+      free(wit_output_filename);
+    }
+    kwg_destroy(kwg);
   } else {
     error_stack_push(error_stack,
                      ERROR_STATUS_CONVERT_UNIMPLEMENTED_CONVERSION_TYPE,
                      string_duplicate("unimplemented conversion type"));
   }
+}
+
+static void convert_win_pct(const char *data_paths, const char *input_name,
+                            const char *output_name,
+                            ConversionResults *conversion_results,
+                            ErrorStack *error_stack) {
+  if (output_name == NULL) {
+    error_stack_push(
+        error_stack, ERROR_STATUS_CONVERT_OUTPUT_FILE_NOT_WRITABLE,
+        string_duplicate("the winpct conversion needs an output table name: "
+                         "convert winpct <recorded table> <output table>"));
+    return;
+  }
+  char *input_filename = data_filepaths_get_readable_filename(
+      data_paths, input_name, DATA_FILEPATH_TYPE_WIN_PCT, error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    free(input_filename);
+    return;
+  }
+  char *contents = get_string_from_file(input_filename, error_stack);
+  WinPctCounts *counts = NULL;
+  if (error_stack_is_empty(error_stack)) {
+    counts = win_pct_counts_create_from_string(contents, input_filename,
+                                               error_stack);
+  }
+  free(contents);
+  free(input_filename);
+  if (!error_stack_is_empty(error_stack)) {
+    return;
+  }
+  StringBuilder *report = string_builder_create();
+  WinPctCounts *smoothed = win_pct_smooth(counts, report, error_stack);
+  win_pct_counts_destroy(counts);
+  char *output_filename = NULL;
+  if (error_stack_is_empty(error_stack)) {
+    output_filename = data_filepaths_get_writable_filename(
+        data_paths, output_name, DATA_FILEPATH_TYPE_WIN_PCT, error_stack);
+  }
+  if (error_stack_is_empty(error_stack)) {
+    char *smoothed_string = win_pct_counts_get_string(smoothed);
+    write_string_to_file(output_filename, "wb", smoothed_string, error_stack);
+    free(smoothed_string);
+    string_builder_add_formatted_string(report, "wrote %s\n", output_filename);
+  }
+  free(output_filename);
+  win_pct_counts_destroy(smoothed);
+  conversion_results_set_report(conversion_results,
+                                string_builder_dump(report, NULL));
+  string_builder_destroy(report);
 }
 
 conversion_type_t
@@ -312,6 +739,27 @@ get_conversion_type_from_string(const char *conversion_type_string) {
     conversion_type = CONVERT_DAWG2WORDMAP;
   } else if (strings_equal(conversion_type_string, "klvwmp2rit")) {
     conversion_type = CONVERT_KLVWMP2RIT;
+  } else if (strings_equal(conversion_type_string, "rackequity2klv")) {
+    conversion_type = CONVERT_RACKEQUITY2KLV;
+  } else if (strings_equal(conversion_type_string, "kwg2wit")) {
+    conversion_type = CONVERT_KWG2WIT;
+  } else if (strings_equal(conversion_type_string, "kwg2witifneeded")) {
+    conversion_type = CONVERT_KWG2WIT_IF_NEEDED;
+  } else if (strings_equal(conversion_type_string, "kwg2witv4")) {
+    conversion_type = CONVERT_KWG2WIT_V4;
+  } else if (strings_equal(conversion_type_string, "winpct")) {
+    conversion_type = CONVERT_WINPCT;
+  }
+  if (strings_equal(conversion_type_string, "counts2xsw")) {
+    conversion_type = CONVERT_COUNTS2XSW;
+  } else if (strings_equal(conversion_type_string, "cgp2xsp")) {
+    conversion_type = CONVERT_CGP2XSP;
+  } else if (strings_equal(conversion_type_string, "xsp2cgp")) {
+    conversion_type = CONVERT_XSP2CGP;
+  } else if (strings_equal(conversion_type_string, "gcg2xsg")) {
+    conversion_type = CONVERT_GCG2XSG;
+  } else if (strings_equal(conversion_type_string, "xsg2gcg")) {
+    conversion_type = CONVERT_XSG2GCG;
   }
   return conversion_type;
 }
@@ -336,6 +784,21 @@ void convert(const ConversionArgs *args, ConversionResults *conversion_results,
     return;
   }
 
+  if (conversion_type >= CONVERT_COUNTS2XSW &&
+      conversion_type <= CONVERT_XSG2GCG) {
+    xs_convert(args->input_and_output_name, args->ld_name, args->klv_name,
+               args->wmp_name, args->data_paths, conversion_type,
+               conversion_results, error_stack);
+    return;
+  }
+  if (conversion_type == CONVERT_WINPCT) {
+    // The third argument, a letter distribution for the other conversions,
+    // names the output table.
+    convert_win_pct(args->data_paths, args->input_and_output_name,
+                    args->ld_name, conversion_results, error_stack);
+    return;
+  }
+
   char *ld_name = NULL;
   if (args->ld_name != NULL) {
     ld_name = string_duplicate(args->ld_name);
@@ -348,13 +811,14 @@ void convert(const ConversionArgs *args, ConversionResults *conversion_results,
   }
 
   LetterDistribution *ld = ld_create(args->data_paths, ld_name, error_stack);
+  free(ld_name);
   if (!error_stack_is_empty(error_stack)) {
     return;
   }
-  free(ld_name);
 
   convert_with_names(ld, conversion_type, args->data_paths,
                      args->input_and_output_name, args->input_and_output_name,
-                     conversion_results, args->num_threads, error_stack);
+                     args->klv_name, args->wmp_name, conversion_results,
+                     args->num_threads, error_stack);
   ld_destroy(ld);
 }

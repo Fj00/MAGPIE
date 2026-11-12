@@ -1,11 +1,16 @@
 #include "config_test.h"
 
+#include "../src/compat/cfile.h"
+#include "../src/def/config_defs.h"
 #include "../src/def/game_defs.h"
 #include "../src/def/letter_distribution_defs.h"
 #include "../src/def/move_defs.h"
 #include "../src/def/players_data_defs.h"
 #include "../src/def/rack_defs.h"
+#include "../src/def/thread_control_defs.h"
 #include "../src/ent/bag.h"
+#include "../src/ent/board.h"
+#include "../src/ent/endgame_results.h"
 #include "../src/ent/equity.h"
 #include "../src/ent/game.h"
 #include "../src/ent/game_history.h"
@@ -15,20 +20,27 @@
 #include "../src/ent/players_data.h"
 #include "../src/ent/rack.h"
 #include "../src/ent/sim_results.h"
+#include "../src/ent/thread_control.h"
 #include "../src/ent/trie.h"
 #include "../src/ent/validated_move.h"
 #include "../src/ent/wmp.h"
 #include "../src/impl/config.h"
+#include "../src/impl/contribute_tables.h"
+#include "../src/impl/exec.h"
+#include "../src/impl/help_table.h"
+#include "../src/str/game_string.h"
 #include "../src/str/move_string.h"
 #include "../src/util/io_util.h"
 #include "../src/util/string_util.h"
 #include "test_constants.h"
+#include "test_platform.h"
 #include "test_util.h"
 #include <assert.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
+#include <string.h>
 
 #define TEST_GCG_FILENAME "a.gcg"
 
@@ -88,6 +100,18 @@ void test_config_load_error_cases(void) {
                          error_stack);
   test_config_load_error(config, "set -seed -2",
                          ERROR_STATUS_CONFIG_LOAD_MALFORMED_INT_ARG,
+                         error_stack);
+  test_config_load_error(config, "set -pc1 -2",
+                         ERROR_STATUS_CONFIG_LOAD_DOUBLE_ARG_OUT_OF_BOUNDS,
+                         error_stack);
+  test_config_load_error(config, "set -pc2 nope",
+                         ERROR_STATUS_CONFIG_LOAD_MALFORMED_DOUBLE_ARG,
+                         error_stack);
+  test_config_load_error(config, "set -otpenalty -1",
+                         ERROR_STATUS_CONFIG_LOAD_INT_ARG_OUT_OF_BOUNDS,
+                         error_stack);
+  test_config_load_error(config, "set -otperiod 0",
+                         ERROR_STATUS_CONFIG_LOAD_DOUBLE_ARG_OUT_OF_BOUNDS,
                          error_stack);
   test_config_load_error(config, "sim -lex CSW21 -it 1000 -plies",
                          ERROR_STATUS_CONFIG_LOAD_INSUFFICIENT_NUMBER_OF_VALUES,
@@ -238,7 +262,7 @@ void test_config_load_success(void) {
       "set -ld %s -bb %d -var %s -l1 %s -l2 %s -s1 %s -r1 "
       "%s -s2 %s -r2 %s  -numplays %d "
       "-plies %d -it "
-      "%lu -scond %d -seed %d -threads %d -pfreq %d -gp true -hr true ",
+      "%" PRIu64 " -scond %d -seed %d -threads %d -pfreq %d -gp true -hr true ",
       ld_name, bingo_bonus, game_variant, l1, l2, s1, r1, s2, r2, num_plays,
       plies, max_iterations, stopping_cond, seed, number_of_threads,
       print_info);
@@ -281,7 +305,7 @@ void test_config_load_success(void) {
   string_builder_add_formatted_string(
       test_string_builder,
       "set -ld %s -bb %d -l1 %s -l2 %s  -s1 "
-      "%s -r1 %s -s2 %s -r2 %s -plies %d -it %d "
+      "%s -r1 %s -s2 %s -r2 %s -plies %d -it %" PRIu64 " "
       "-threads %d "
       "-pfreq %d -gp false -hr false",
       ld_name, bingo_bonus, l1, l2, s1, r1, s2, r2, plies, max_iterations,
@@ -490,12 +514,10 @@ void test_config_exec_parse_args(void) {
   assert_config_exec_status(config, "cgp " EMPTY_CGP, ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "rack AB3C",
                             ERROR_STATUS_CONFIG_LOAD_MALFORMED_RACK_ARG);
-  assert_config_exec_status(config, "rack .ABC",
-                            ERROR_STATUS_CONFIG_LOAD_MALFORMED_RACK_ARG);
-  assert_config_exec_status(config, "rack AB.C",
-                            ERROR_STATUS_CONFIG_LOAD_MALFORMED_RACK_ARG);
-  assert_config_exec_status(config, "rack ABC.",
-                            ERROR_STATUS_CONFIG_LOAD_MALFORMED_RACK_ARG);
+  // "." is an alias for "?" (blank tile), so these are well-formed racks.
+  assert_config_exec_status(config, "rack .ABC", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "rack AB.C", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "rack ABC.", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "rack ABCDEFGH",
                             ERROR_STATUS_CONFIG_LOAD_MALFORMED_RACK_ARG);
   assert_config_exec_status(config, "rack ABCZZZ",
@@ -701,6 +723,107 @@ void test_config_exec_parse_args(void) {
                             ERROR_STATUS_GAME_HISTORY_INDEX_OUT_OF_RANGE);
   assert_config_exec_status(config6, "previous", ERROR_STATUS_SUCCESS);
   config_destroy(config6);
+
+  config_destroy(config);
+}
+
+// Confirms the "rg" command sets the player rack and generates moves (like
+// "rack" followed by "generate"), without running a simulation like
+// "rgsimulate"/"rgs" does. Also confirms "rg" resolves to itself rather
+// than being treated as an ambiguous abbreviation of "rgsimulate": the full
+// command name is "rg" so the exact-match check in get_token_from_string
+// wins before "rg" is ever considered a prefix of "rgsimulate".
+void test_config_rack_and_gen(void) {
+  Config *config = config_create_default_test();
+
+  assert_config_exec_status(config, "cgp " EMPTY_CGP, ERROR_STATUS_SUCCESS);
+
+  // Malformed and unavailable racks are rejected the same way "rack"
+  // rejects them.
+  assert_config_exec_status(config, "rg AB3C",
+                            ERROR_STATUS_CONFIG_LOAD_MALFORMED_RACK_ARG);
+  assert_config_exec_status(config, "rg ABCZZZ",
+                            ERROR_STATUS_CONFIG_LOAD_RACK_NOT_IN_BAG);
+
+  assert_config_exec_status(config, "cgp " OPENING_CGP, ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "rg AEINRST", ERROR_STATUS_SUCCESS);
+
+  const Game *game = config_get_game(config);
+  const Rack *player_on_turn_rack = player_get_rack(
+      game_get_player(game, game_get_player_on_turn_index(game)));
+  assert_rack_equals_string(config_get_ld(config), player_on_turn_rack,
+                            "AEINRST");
+  assert(move_list_get_count(config_get_move_list(config)) > 0);
+  // Unlike "rgsimulate"/"rgs", "rg" must not run a simulation.
+  assert(sim_results_get_number_of_plays(config_get_sim_results(config)) == 0);
+
+  config_destroy(config);
+}
+
+// Runs the given opponent known rack argument through the "sim", "gsim",
+// and "rgs" commands and asserts each returns expected_status. The game is
+// reloaded from OPENING_CGP before every invocation so that each command
+// sees the same bag/rack state regardless of what a previous simulation
+// left behind.
+//
+// Under OPENING_CGP, player 1 (the opponent) holds HIJKLM? and the bag
+// holds everything else: A:8 B:1 C:1 D:3 E:11 F:1 G:2 H:1 I:8 J:0 K:0 L:3
+// M:1 N:6 O:8 P:2 Q:1 R:6 S:4 T:6 U:4 V:2 W:2 X:1 Y:2 Z:1 blank:1 (opp_rack
+// counts add back on top of the bag when checking drawability, so e.g. H is
+// drawable even though the bag alone only has 1 left of the 2 total).
+static void assert_sim_family_opp_rack_status(Config *config,
+                                              const char *opp_rack_arg,
+                                              error_code_t expected_status) {
+  assert_config_exec_status(config, "cgp " OPENING_CGP, ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "gen -numplays 2", ERROR_STATUS_SUCCESS);
+  char *sim_cmd = get_formatted_string("sim %s -it 1", opp_rack_arg);
+  assert_config_exec_status(config, sim_cmd, expected_status);
+  free(sim_cmd);
+
+  // gsimulate and rgsimulate generate their own moves, so no prior "gen" is
+  // needed.
+  assert_config_exec_status(config, "cgp " OPENING_CGP, ERROR_STATUS_SUCCESS);
+  char *gsim_cmd = get_formatted_string("gsim %s -it 1", opp_rack_arg);
+  assert_config_exec_status(config, gsim_cmd, expected_status);
+  free(gsim_cmd);
+
+  assert_config_exec_status(config, "cgp " OPENING_CGP, ERROR_STATUS_SUCCESS);
+  char *rgs_cmd = get_formatted_string("rgs RETINAS %s -it 1", opp_rack_arg);
+  assert_config_exec_status(config, rgs_cmd, expected_status);
+  free(rgs_cmd);
+}
+
+// Confirms that an opponent rack specified for the "sim"/"gsimulate"/
+// "rgsimulate" commands is validated against the bag the same way the
+// player's own rack is, across an empty, partially known, and fully known
+// opponent rack. Before this check existed, an opponent rack that was not
+// actually available in the bag (e.g. requesting tiles already held by the
+// player or already exhausted from the bag) would reach set_random_rack()
+// during simulation and log_fatal(), crashing the process instead of
+// returning an error.
+void test_config_sim_opp_rack_not_in_bag(void) {
+  Config *config = config_create_default_test();
+
+  // Empty: '-' forces an unknown/random opponent rack, which skips the bag
+  // check entirely, so it must always succeed.
+  assert_sim_family_opp_rack_status(config, "-", ERROR_STATUS_SUCCESS);
+
+  // Partially known (fewer than RACK_SIZE letters).
+  assert_sim_family_opp_rack_status(config, "AB", ERROR_STATUS_SUCCESS);
+  // Only a single Z exists in the English tile distribution, and
+  // OPENING_CGP does not place one on the board or in either player's
+  // rack, so asking for two Z's in the opponent's rack is impossible.
+  assert_sim_family_opp_rack_status(config, "ZZ",
+                                    ERROR_STATUS_SIM_OPP_RACK_NOT_IN_BAG);
+
+  // Fully known (RACK_SIZE letters).
+  // A rack the bag can actually supply.
+  assert_sim_family_opp_rack_status(config, "BCFGHIL", ERROR_STATUS_SUCCESS);
+  // The opponent's own currently held rack is trivially drawable.
+  assert_sim_family_opp_rack_status(config, "HIJKLM?", ERROR_STATUS_SUCCESS);
+  // Only 1 Z exists in total, so 7 of them can never be drawn.
+  assert_sim_family_opp_rack_status(config, "ZZZZZZZ",
+                                    ERROR_STATUS_SIM_OPP_RACK_NOT_IN_BAG);
 
   config_destroy(config);
 }
@@ -915,19 +1038,213 @@ void test_game_display(void) {
   display_whole_game(TESTDATA_FILEPATH "gcgs/success_long_game.gcg");
 }
 
-void test_config_anno(void) {
-  // Commit and challenge
-  Config *config = config_create_default_test();
-  assert_config_exec_status(config, "set -iterations 100",
-                            ERROR_STATUS_SUCCESS);
+enum {
+  // The longest first sentence of a help text, which a list shows on one line.
+  HELP_SUMMARY_MAX_LENGTH = 100,
+};
 
-  // Test the help command
+// The output of a help command that must succeed. Caller owns the result.
+static char *get_help_output(Config *config, const char *command) {
+  // assert_config_exec_status leaves the status at started.
+  thread_control_set_status(config_get_thread_control(config),
+                            THREAD_CONTROL_STATUS_FINISHED);
+  ErrorStack *error_stack = error_stack_create();
+  char *output = NULL;
+  assert(run_str_api_command(config, error_stack, command, &output));
+  assert(error_stack_is_empty(error_stack));
+  error_stack_destroy(error_stack);
+  return output;
+}
+
+static void assert_help_has(Config *config, const char *command,
+                            const char *expected_text) {
+  char *output = get_help_output(config, command);
+  if (!has_substring(output, expected_text)) {
+    printf("'%s' does not print '%s':\n%s\n", command, expected_text, output);
+    abort();
+  }
+  free(output);
+}
+
+// Every option is in one group and every command in one section of the index,
+// so nothing goes missing from help.
+static void assert_help_table_is_complete(void) {
+  int times_seen[NUMBER_OF_ARG_TOKENS + 1] = {0};
+  for (int group_idx = 0; group_idx < NUMBER_OF_HELP_OPTION_GROUPS;
+       group_idx++) {
+    const HelpOptionGroup *group = help_table_get_option_group(group_idx);
+    assert(group->num_rows > 0);
+    for (int row_idx = 0; row_idx < group->num_rows; row_idx++) {
+      const HelpOptionRow *row = &group->rows[row_idx];
+      times_seen[row->both_players]++;
+      times_seen[row->player_one]++;
+      times_seen[row->player_two]++;
+    }
+  }
+  const int num_sections = help_table_get_num_command_sections();
+  for (int section_idx = 0; section_idx < num_sections; section_idx++) {
+    const HelpCommandSection *section =
+        help_table_get_command_section(section_idx);
+    for (int command_idx = 0; command_idx < section->num_commands;
+         command_idx++) {
+      const arg_token_t command = section->commands[command_idx];
+      times_seen[command]++;
+      assert(help_table_find_option_group(command) ==
+             NUMBER_OF_HELP_OPTION_GROUPS);
+      // A command with no row in the table fails here.
+      for (int group_idx = 0; group_idx < NUMBER_OF_HELP_OPTION_GROUPS;
+           group_idx++) {
+        assert(!(help_table_command_lists_group(command, group_idx) &&
+                 help_table_command_points_to_group(command, group_idx)));
+      }
+    }
+  }
+  for (int token_idx = 0; token_idx < NUMBER_OF_ARG_TOKENS; token_idx++) {
+    if (times_seen[token_idx] != 1) {
+      printf("token %d is in the help table %d times\n", token_idx,
+             times_seen[token_idx]);
+      abort();
+    }
+  }
+}
+
+static void test_config_help(void) {
+  assert_help_table_is_complete();
+
+  Config *config = config_create_default_test();
   assert_config_exec_status(config, "help holp",
                             ERROR_STATUS_CONFIG_LOAD_UNRECOGNIZED_ARG);
   assert_config_exec_status(config, "help l",
                             ERROR_STATUS_CONFIG_LOAD_AMBIGUOUS_COMMAND);
   assert_config_exec_status(config, "help set", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "help", ERROR_STATUS_SUCCESS);
+
+  // The async commands are listed by help, so help knows them.
+  assert_help_has(config, "help stop", "Stops the currently running command.");
+  assert_help_has(config, "help sto", "Stops the currently running command.");
+  assert_help_has(config, "help status", "Prints the status");
+  assert_help_has(config, "help sta", "Prints the status");
+  assert_help_has(config, "help s", "Shows the current game.");
+  assert_config_exec_status(config, "help stopp",
+                            ERROR_STATUS_CONFIG_LOAD_UNRECOGNIZED_ARG);
+
+  // An option can be asked about as it is typed, and asking does not set it.
+  assert_help_has(config, "help -numplays", "Specifies the number of plays");
+  assert_help_has(config, "help numplays", "Specifies the number of plays");
+  assert_config_exec_status(config, "help -holp",
+                            ERROR_STATUS_CONFIG_LOAD_UNRECOGNIZED_ARG);
+  assert_config_exec_status(config, "help -numplays 3",
+                            ERROR_STATUS_CONFIG_LOAD_UNRECOGNIZED_ARG);
+  assert_config_exec_status(config, "help -",
+                            ERROR_STATUS_CONFIG_LOAD_UNRECOGNIZED_ARG);
+
+  // Every name shown is one that reaches the entry, as it is typed.
+  assert_help_has(config, "help", "\n  rr, rrack ");
+  assert_help_has(config, "help", "\n  r, rack ");
+  assert_help_has(config, "help", "\n  p1 ");
+  assert_help_has(config, "help numplays", "-nump, -numplays\n");
+  assert_help_has(config, "help numplays", "-numplays 150\n");
+  assert_help_has(config, "help rrack", "rr, rrack\n");
+
+  // A sentence ends at the end of a word, not at a dot inside one.
+  assert_help_has(config, "help session",
+                  "to settings.txt after every command.\n");
+
+  // A command's help lists its own options and points to the rest.
+  assert_help_has(config, "help simulate", "Simulation options\n");
+  assert_help_has(config, "help simulate", "-plies, -pl1, -pl2");
+  assert_help_has(config, "help simulate", "Also uses\n");
+  assert_help_has(config, "help simulate", "help generate\n");
+  assert_help_has(config, "help analyze", "-apegmaxbag");
+  assert_help_has(config, "help analyze", "help peg\n");
+  assert_help_has(config, "help peg", "-pegtlim");
+  char *next_help = get_help_output(config, "help next");
+  assert(!has_substring(next_help, "Also uses"));
+  free(next_help);
+
+  // An option's help names the commands that use it, in any of its forms.
+  assert_help_has(config, "help plies", "Used by: ");
+  assert_help_has(config, "help pl1", "simulate, gsimulate, rgsimulate");
+  assert_help_has(config, "help -eplies", "endgame, analyze, autoplay");
+  // A shared option applies too widely, so it points to its topic.
+  assert_help_has(config, "help lex", "Game setup options: help setup\n");
+  char *numplays_help = get_help_output(config, "help numplays");
+  assert(!has_substring(numplays_help, "setoptions"));
+  free(numplays_help);
+
+  // The index is every command by task, and no options.
+  char *index = get_help_output(config, "help");
+  assert(!has_substring(index, "-numplays"));
+  const int num_sections = help_table_get_num_command_sections();
+  for (int section_idx = 0; section_idx < num_sections; section_idx++) {
+    const HelpCommandSection *section =
+        help_table_get_command_section(section_idx);
+    assert(has_substring(index, section->title));
+    for (int command_idx = 0; command_idx < section->num_commands;
+         command_idx++) {
+      StringBuilder *command_sb = string_builder_create();
+      config_add_help_summary(config, section->commands[command_idx],
+                              command_sb);
+      assert(has_substring(index, string_builder_peek(command_sb)));
+      string_builder_destroy(command_sb);
+    }
+  }
+  assert(has_substring(index, "While a command runs"));
+  assert(has_substring(index, "Stops the currently running command."));
+  assert(has_substring(index, "help " HELP_TOPIC_ALL_OPTIONS));
+  assert(has_substring(index, "help setup"));
+  free(index);
+
+  // Every group can be reached from where the table says it is.
+  char *all_options = get_help_output(config, "help options");
+  for (int group_idx = 0; group_idx < NUMBER_OF_HELP_OPTION_GROUPS;
+       group_idx++) {
+    const HelpOptionGroup *group = help_table_get_option_group(group_idx);
+    assert(has_substring(all_options, group->title));
+    char *group_command = get_formatted_string("help %s", group->help_subject);
+    assert_help_has(config, group_command, group->title);
+    assert_help_has(config, group_command, "-");
+    free(group_command);
+  }
+  // Every row of every group is listed, with its summary.
+  StringBuilder *row_sb = string_builder_create();
+  for (int group_idx = 0; group_idx < NUMBER_OF_HELP_OPTION_GROUPS;
+       group_idx++) {
+    const HelpOptionGroup *group = help_table_get_option_group(group_idx);
+    for (int row_idx = 0; row_idx < group->num_rows; row_idx++) {
+      const HelpOptionRow *row = &group->rows[row_idx];
+      string_builder_clear(row_sb);
+      config_add_help_summary(config,
+                              row->both_players != NUMBER_OF_ARG_TOKENS
+                                  ? row->both_players
+                                  : row->player_one,
+                              row_sb);
+      assert(has_substring(all_options, string_builder_peek(row_sb)));
+    }
+  }
+  string_builder_destroy(row_sb);
+  free(all_options);
+
+  StringBuilder *summary_sb = string_builder_create();
+  for (int token_idx = 0; token_idx < NUMBER_OF_ARG_TOKENS; token_idx++) {
+    string_builder_clear(summary_sb);
+    config_add_help_summary(config, token_idx, summary_sb);
+    const size_t summary_length = string_builder_length(summary_sb);
+    if (summary_length == 0 || summary_length > HELP_SUMMARY_MAX_LENGTH) {
+      printf("help summary of token %d is %zu characters: %s\n", token_idx,
+             summary_length, string_builder_peek(summary_sb));
+      abort();
+    }
+  }
+  string_builder_destroy(summary_sb);
+  config_destroy(config);
+}
+
+void test_config_anno(void) {
+  // Commit and challenge
+  Config *config = config_create_default_test();
+  assert_config_exec_status(config, "set -iterations 100",
+                            ERROR_STATUS_SUCCESS);
 
   const char *p1_name = "Alice Lastname-Jones";
   const char *p1_nickname = "Alice_Lastname-Jones";
@@ -1736,23 +2053,37 @@ void test_config_anno(void) {
   assert_config_exec_status(config, "t BARCHAN", ERROR_STATUS_SUCCESS);
   assert(player_get_score(game_get_player(game, 0)) == int_to_equity(86));
   assert(player_get_score(game_get_player(game, 1)) == int_to_equity(0));
+  // We're now at the live frontier, past the turn that was just
+  // committed: nothing's been generated for the new on-turn player yet,
+  // and there's no future turn recorded to fall back to, so shmoves
+  // correctly shows nothing rather than that committed turn's own
+  // (now stale, wrong-rack) analysis.
   assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
 
   // if a rack is present but there are no moves, moves should be automatically
   // generated to find the top play
   assert_config_exec_status(config, "goto start", ERROR_STATUS_SUCCESS);
-  assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
+  // Back at the position the BARCHAN turn above was decided from: its
+  // auto-generated move_list (used to pick that top play) is shown again.
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "rack BARCHAN", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "t", ERROR_STATUS_SUCCESS);
   assert(player_get_score(game_get_player(game, 0)) == int_to_equity(86));
   assert(player_get_score(game_get_player(game, 1)) == int_to_equity(0));
+  // Same as above: we're past the just-committed turn again, with
+  // nothing generated for the new position, so nothing to show.
   assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
 
   assert_config_exec_status(config, "goto start", ERROR_STATUS_SUCCESS);
-  assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
+  // Shows the (re-auto-generated) move_list from the "t" just above,
+  // saved on this same position.
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "rack BARCHAN -numplays 7",
                             ERROR_STATUS_SUCCESS);
-  assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
+  // Setting a fresh rack to explore this same position again clears the
+  // live move list, but doesn't touch the saved historical one, so it's
+  // still shown until something new is actually generated.
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "shmoves", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "t BARCHAN", ERROR_STATUS_SUCCESS);
@@ -1765,17 +2096,22 @@ void test_config_anno(void) {
   // Allow the sim to hit the stopping threshold
   assert_config_exec_status(config, "sim -seed 1 -iterations 100 -threads 10",
                             ERROR_STATUS_SUCCESS);
+  const Equity best_simmed_score =
+      move_get_score(sim_results_get_best_move(config_get_sim_results(config)));
   assert_config_exec_status(config, "t", ERROR_STATUS_SUCCESS);
   // No rack was given to the top commit command, so it should commit the best
-  // simmed play which should be anything except for 8H BARCHAN.
+  // simmed play, which is not the static best, 8H BARCHAN for 86.
   const Equity p0_score = player_get_score(game_get_player(game, 0));
-  assert(p0_score > int_to_equity(80) && p0_score < int_to_equity(86));
+  assert(p0_score == best_simmed_score);
+  assert(p0_score != int_to_equity(86));
   assert(player_get_score(game_get_player(game, 1)) == int_to_equity(0));
 
   assert_config_exec_status(config, "goto start", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "rack BARCHAN", ERROR_STATUS_SUCCESS);
-  // Generate and sim
-  assert_config_exec_status(config, "gsim -seed 1", ERROR_STATUS_SUCCESS);
+  // Generate and sim. Single rollouts, so that 8D BARCHAN sims best on this
+  // seed: the plays below build on it.
+  assert_config_exec_status(config, "gsim -seed 1 -sbagcycle false",
+                            ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "shm 1 -shplies 1", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "shm 2 -shplies 25", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "shm 5 -shplies 3", ERROR_STATUS_SUCCESS);
@@ -1846,14 +2182,19 @@ void test_config_anno(void) {
   assert(player_get_score(game_get_player(game, 1)) == int_to_equity(362));
   assert_config_exec_status(config, "endgame", ERROR_STATUS_SUCCESS);
 
+  // The inference above was for the game before this load.
   assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
-  assert_config_exec_status(config, "shinfer", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shinfer",
+                            ERROR_STATUS_NO_INFERENCE_TO_SHOW);
   assert_config_exec_status(config, "shendgame", ERROR_STATUS_SUCCESS);
 
+  // A new game drops the previous game's inference and endgame.
   assert_config_exec_status(config, "newgame", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
-  assert_config_exec_status(config, "shinfer", ERROR_STATUS_SUCCESS);
-  assert_config_exec_status(config, "shendgame", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shinfer",
+                            ERROR_STATUS_NO_INFERENCE_TO_SHOW);
+  assert_config_exec_status(config, "shendgame",
+                            ERROR_STATUS_NO_ENDGAME_TO_SHOW);
 
   assert_config_exec_status(config, "rack ABCDEFG", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
@@ -1882,9 +2223,9 @@ void test_config_anno(void) {
   // Test autosave
   assert_config_exec_status(config, "newgame au1.gcg", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "t RETINAS", ERROR_STATUS_SUCCESS);
-  assert(access("au1.gcg", F_OK) != 0);
+  assert(!cfile_access("au1.gcg", CFILE_ACCESS_EXISTS));
   assert_config_exec_status(config, "e", ERROR_STATUS_SUCCESS);
-  assert(access("au1.gcg", F_OK) == 0);
+  assert(cfile_access("au1.gcg", CFILE_ACCESS_EXISTS));
   char *au1_contents_1 = get_string_from_file_or_die("au1.gcg");
   assert_config_exec_status(config, "t CAZIQUE", ERROR_STATUS_SUCCESS);
   char *au1_contents_2 = get_string_from_file_or_die("au1.gcg");
@@ -1899,7 +2240,7 @@ void test_config_anno(void) {
 
   assert_config_exec_status(config, "set -autosave true", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "newgame au2.gcg", ERROR_STATUS_SUCCESS);
-  assert(access("au2.gcg", F_OK) == 0);
+  assert(cfile_access("au2.gcg", CFILE_ACCESS_EXISTS));
   char *au2_contents_1 = get_string_from_file_or_die("au2.gcg");
   assert_config_exec_status(config, "t CAZIQUE", ERROR_STATUS_SUCCESS);
   char *au2_contents_2 = get_string_from_file_or_die("au2.gcg");
@@ -2102,6 +2443,77 @@ void test_config_load_incomplete(void) {
   config_destroy(config);
 }
 
+// The game ends on six passes with an empty bag. The tiles each player has to
+// draw back for the end rack penalties are sitting on the other player's rack,
+// so both racks must be returned to the bag before either player draws.
+void test_config_six_pass_empty_bag(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -s1 equity -s2 equity -r1 all -r2 all -numplays 1");
+
+  load_and_exec_config_or_die(config, "load testdata/gcgs/success_standard");
+  // Rewind to the position just before the final outplay, where the bag is
+  // empty, HastyBot holds I and RightBehindYou holds OST.
+  load_and_exec_config_or_die(config, "goto 26");
+  const Game *game = config_get_game(config);
+  assert(bag_get_letters(game_get_bag(game)) == 0);
+  assert_rack_equals_string(game_get_ld(game),
+                            player_get_rack(game_get_player(game, 0)), "I");
+  assert_rack_equals_string(game_get_ld(game),
+                            player_get_rack(game_get_player(game, 1)), "OST");
+  assert(equity_to_int(player_get_score(game_get_player(game, 0))) == 516);
+  assert(equity_to_int(player_get_score(game_get_player(game, 1))) == 362);
+
+  for (int pass_index = 0; pass_index < 6; pass_index++) {
+    assert_config_exec_status(config, "com pass", ERROR_STATUS_SUCCESS);
+  }
+
+  game = config_get_game(config);
+  assert(game_get_game_end_reason(game) == GAME_END_REASON_CONSECUTIVE_ZEROS);
+  // Both players keep the rack they passed with and are penalized for it.
+  assert_rack_equals_string(game_get_ld(game),
+                            player_get_rack(game_get_player(game, 0)), "I");
+  assert_rack_equals_string(game_get_ld(game),
+                            player_get_rack(game_get_player(game, 1)), "OST");
+  assert(equity_to_int(player_get_score(game_get_player(game, 0))) == 515);
+  assert(equity_to_int(player_get_score(game_get_player(game, 1))) == 359);
+  // Six passes plus the two end rack penalty events.
+  assert(game_history_get_num_events(config_get_game_history(config)) == 34);
+
+  config_destroy(config);
+}
+
+// The game ends on six passes with fewer than RACK_SIZE tiles left in the bag,
+// so the two racks do not account for every unseen tile.
+void test_config_six_pass_partial_bag(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -s1 equity -s2 equity -r1 all -r2 all -numplays 1");
+
+  load_and_exec_config_or_die(config, "load testdata/gcgs/success_standard");
+  // Rewind to a position with 5 tiles left in the bag.
+  load_and_exec_config_or_die(config, "goto 22");
+  // RightBehindYou is on turn holding ILOOPQR. The other twelve unseen tiles
+  // are still in the bag object, seven of which are HastyBot's unknown rack,
+  // leaving five tiles that neither player will hold.
+  const Game *game = config_get_game(config);
+  assert(bag_get_letters(game_get_bag(game)) == 12);
+
+  for (int pass_index = 0; pass_index < 6; pass_index++) {
+    if (pass_index % 2 == 0) {
+      assert_config_exec_status(config, "rack ILOOPQR", ERROR_STATUS_SUCCESS);
+    } else {
+      assert_config_exec_status(config, "rack EEIIPRU", ERROR_STATUS_SUCCESS);
+    }
+    assert_config_exec_status(config, "com pass", ERROR_STATUS_SUCCESS);
+  }
+
+  game = config_get_game(config);
+  assert(game_get_game_end_reason(game) == GAME_END_REASON_CONSECUTIVE_ZEROS);
+  assert(equity_to_int(player_get_score(game_get_player(game, 0))) == 472);
+  assert(equity_to_int(player_get_score(game_get_player(game, 1))) == 271);
+
+  config_destroy(config);
+}
+
 void test_config_export(void) {
   Config *config = config_create_default_test();
   assert_config_exec_status(config, "ex",
@@ -2129,8 +2541,9 @@ void test_config_export(void) {
   assert_config_exec_status(config, "ex " TEST_GCG_FILENAME,
                             ERROR_STATUS_SUCCESS);
 
-  assert(access(game_history_get_gcg_filename(config_get_game_history(config)),
-                F_OK) == 0);
+  assert(cfile_access(
+      game_history_get_gcg_filename(config_get_game_history(config)),
+      CFILE_ACCESS_EXISTS));
 
   assert_config_exec_status(config, "rack HIJKLMN", ERROR_STATUS_SUCCESS);
   assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
@@ -2172,7 +2585,7 @@ void test_config_export(void) {
 
   char *default_name_1 = string_duplicate(
       game_history_get_gcg_filename(config_get_game_history(config)));
-  assert(access(default_name_1, F_OK) == 0);
+  assert(cfile_access(default_name_1, CFILE_ACCESS_EXISTS));
 
   // Names has not updated, so the "first try" default name will clash with the
   // existing file and it will have to be incremented.
@@ -2190,7 +2603,7 @@ void test_config_export(void) {
 
   char *default_name_2 = string_duplicate(
       game_history_get_gcg_filename(config_get_game_history(config)));
-  assert(access(default_name_2, F_OK) == 0);
+  assert(cfile_access(default_name_2, CFILE_ACCESS_EXISTS));
 
   // Names has not updated, so the "first try" and "second try" default names
   // will clash with the existing files and it will have to be incremented.
@@ -2208,7 +2621,7 @@ void test_config_export(void) {
 
   char *default_name_3 = string_duplicate(
       game_history_get_gcg_filename(config_get_game_history(config)));
-  assert(access(default_name_3, F_OK) == 0);
+  assert(cfile_access(default_name_3, CFILE_ACCESS_EXISTS));
 
   StringBuilder *sb_load_cmd = string_builder_create();
 
@@ -2360,6 +2773,47 @@ void test_config_note_move_interpolation(void) {
   string_builder_destroy(expected_sb);
 
   config_destroy(config);
+
+  // After an endgame, with nothing generated or simulated, $N names the first
+  // play of the endgame's N-th line.
+  config = config_create_or_die("set -s1 score -s2 score -threads 2 -etopk 3");
+  assert_config_exec_status(config, "load testdata/gcgs/success_standard.gcg",
+                            ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "goto end", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "endgame", ERROR_STATUS_SUCCESS);
+  const EndgameResults *endgame_results = config_get_endgame_results(config);
+  const int num_pvs = endgame_results_get_num_pvs(endgame_results);
+  assert(num_pvs >= 2);
+  expected_sb = string_builder_create();
+  string_builder_add_string(expected_sb, "best was ");
+  for (int pv_idx = 0; pv_idx < 2; pv_idx++) {
+    if (pv_idx > 0) {
+      string_builder_add_string(expected_sb, ", then ");
+    }
+    Move move;
+    small_move_to_move(
+        &move,
+        &endgame_results_get_multi_pvline(endgame_results, pv_idx)->moves[0],
+        game_get_board(config_get_game(config)));
+    string_builder_add_move(expected_sb,
+                            game_get_board(config_get_game(config)), &move,
+                            config_get_ld(config), false);
+  }
+  assert_config_exec_status(config, "note best was $1, then $2",
+                            ERROR_STATUS_SUCCESS);
+  gh = config_get_game_history(config);
+  assert_strings_equal(game_history_get_note_for_most_recent_event(gh),
+                       string_builder_peek(expected_sb));
+  string_builder_destroy(expected_sb);
+  cmd_sb = string_builder_create();
+  string_builder_add_formatted_string(cmd_sb, "note $%d", num_pvs + 1);
+  assert_config_exec_status(config, string_builder_peek(cmd_sb),
+                            ERROR_STATUS_NOTE_MOVE_INDEX_OUT_OF_RANGE);
+  string_builder_destroy(cmd_sb);
+  config_destroy(config);
 }
 
 void test_config_fg_required(void) {
@@ -2376,6 +2830,545 @@ void test_config_fg_required(void) {
   assert_config_exec_status(config, "newgame",
                             ERROR_STATUS_CONFIG_LOAD_MISSING_ARG);
   config_destroy(config);
+}
+
+// The saved settings of `config`, for checking what a settings file loaded.
+static char *saved_settings_string(const Config *config) {
+  StringBuilder *sb = string_builder_create();
+  config_add_saved_settings_to_string_builder(config, sb);
+  return string_builder_dump_and_destroy(sb, NULL);
+}
+
+// The expected warnings of a settings file that loads without any.
+static const char *const no_settings_warnings[] = {""};
+
+// Loads `settings_string` as a settings file into `config` and checks that
+// the warnings, in order, start with `expected_warning_prefixes`.
+static void assert_load_settings(Config *config, const char *settings_string,
+                                 const char *const *expected_warning_prefixes,
+                                 int num_expected_warnings) {
+  StringList *warnings = string_list_create();
+  config_load_settings(config, settings_string, warnings);
+  const int num_warnings = string_list_get_count(warnings);
+  if (num_warnings != num_expected_warnings) {
+    printf("expected %d settings warnings, got %d:\n", num_expected_warnings,
+           num_warnings);
+    for (int warning_idx = 0; warning_idx < num_warnings; warning_idx++) {
+      printf("%s\n", string_list_get_string(warnings, warning_idx));
+    }
+    assert(0);
+  }
+  for (int warning_idx = 0; warning_idx < num_warnings; warning_idx++) {
+    const char *warning = string_list_get_string(warnings, warning_idx);
+    if (!has_prefix(expected_warning_prefixes[warning_idx], warning)) {
+      printf("settings warning '%s' does not start with '%s'\n", warning,
+             expected_warning_prefixes[warning_idx]);
+      assert(0);
+    }
+  }
+  string_list_destroy(warnings);
+}
+
+// A settings file loads each setting on its own: what it does not keep, or
+// does not know, or cannot load, is left out and the rest still loads.
+void test_config_load_settings(void) {
+  Config *config = config_create_default_test();
+
+  // An old file (no -fileversion), which recorded every setting, loads only
+  // the settings a file keeps now, without those whose defaults changed
+  // (-pegoutwidth, in version 2). A negative value goes with its setting.
+  assert_load_settings(
+      config,
+      "setoptions -lex CSW21 -w1 true -rit1 false -tlim 60 -pegoutwidth 100 "
+      "-pc1 -1.000000000000000 -hr false -wit2 false -threads 4 -bb 40",
+      no_settings_warnings, 0);
+  char *saved = saved_settings_string(config);
+  assert(has_substring(saved, " -l1 CSW21"));
+  assert(has_substring(saved, " -bb 40"));
+  assert(has_substring(saved, " -hr false"));
+  assert(has_substring(saved, " -pegoutwidth 200"));
+  free(saved);
+  assert(config_get_num_threads(config) == 1);
+
+  // A version 2 file keeps -pegoutwidth, and a current one drops only the
+  // settings a file does not keep, such as plies and endgame plies.
+  assert_load_settings(config,
+                       "setoptions -fileversion 2 -pegoutwidth 100 -scensus "
+                       "false\nsetoptions -fileversion 3 -plies 3 -eplies 4 "
+                       "-cb 9",
+                       no_settings_warnings, 0);
+  saved = saved_settings_string(config);
+  assert(has_substring(saved, " -pegoutwidth 100"));
+  assert(has_substring(saved, " -cb 9"));
+  free(saved);
+  assert(config_get_plies(config) != 3);
+  assert(config_get_endgame_plies(config) != 4);
+
+  // An unknown setting is dropped with its values, a value that fails to
+  // load loses only its own setting, and a line that is not a set command
+  // is not run.
+  const char *const unknown_warnings[] = {
+      "ignored unknown setting -oldsetting 3 4", "ignored -bb 2h3: (error",
+      "ignored '7'",
+      "ignored a line that is not a set command: autoplay games 5"};
+  assert_load_settings(
+      config,
+      "setoptions -oldsetting 3 4 -bb 2h3 -cb 5 "
+      "-maxnumdplays 20\nsetoptions 7 -bb 45\nautoplay games 5",
+      unknown_warnings, 4);
+  saved = saved_settings_string(config);
+  assert(has_substring(saved, " -bb 45"));
+  assert(has_substring(saved, " -cb 5"));
+  assert(has_substring(saved, " -maxnumdplays 20"));
+  free(saved);
+
+  // The lexicon settings load together, after a trial: a missing lexicon
+  // leaves the lexicon, leaves and distribution as they were.
+  const char *const lexicon_warnings[] = {"ignored -ld english -l1 NOSUCHLEX"};
+  assert_load_settings(
+      config, "setoptions -ld english -l1 NOSUCHLEX -k1 CSW21 -hr true",
+      lexicon_warnings, 1);
+  saved = saved_settings_string(config);
+  assert(has_substring(saved, " -l1 CSW21"));
+  assert(has_substring(saved, " -k1 CSW21"));
+  assert(has_substring(saved, " -hr true"));
+  free(saved);
+
+  // A win percentage table that fails to load is not left named.
+  const char *const win_pct_warnings[] = {"ignored -winpct NOSUCHTABLE"};
+  assert_load_settings(config, "setoptions -winpct NOSUCHTABLE",
+                       win_pct_warnings, 1);
+  saved = saved_settings_string(config);
+  assert(!has_substring(saved, " -winpct "));
+  free(saved);
+
+  // Saved settings record the current version, and load without warnings.
+  saved = saved_settings_string(config);
+  assert(has_substring(saved, " -fileversion 3"));
+  assert_load_settings(config, saved, no_settings_warnings, 0);
+  free(saved);
+  assert_config_exec_status(config, "set -fileversion 3", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "set -fileversion 4",
+                            ERROR_STATUS_CONFIG_LOAD_INT_ARG_OUT_OF_BOUNDS);
+  config_destroy(config);
+}
+
+// Saved settings keep what holds for a whole game -- the lexica, the letter
+// distribution, the rules and the display -- and leave out what a command
+// tunes, such as plies and endgame plies, while the full settings keep both.
+static void test_config_saved_settings(void) {
+  Config *config = config_create_default_test();
+  assert_config_exec_status(
+      config,
+      "set -lex CSW21 -ld english -bb 40 -hr false -maxnumdplays 20 "
+      "-boardcolor none -plies 3 -eplies 4 -numplays 30 -threads 2 -it 500",
+      ERROR_STATUS_SUCCESS);
+  StringBuilder *saved = string_builder_create();
+  config_add_saved_settings_to_string_builder(config, saved);
+  const char *saved_str = string_builder_peek(saved);
+  const char *kept[] = {" -l1 CSW21",        " -l2 CSW21",       " -k1 CSW21",
+                        " -ld english",      " -bb 40",          " -hr false",
+                        " -maxnumdplays 20", " -boardcolor none"};
+  for (size_t kept_idx = 0; kept_idx < sizeof(kept) / sizeof(kept[0]);
+       kept_idx++) {
+    assert(strstr(saved_str, kept[kept_idx]) != NULL);
+  }
+  const char *dropped[] = {" -plies ",   " -eplies ",      " -numplays ",
+                           " -threads ", " -it ",          " -w1 ",
+                           " -seed ",    " -savesettings "};
+  for (size_t dropped_idx = 0;
+       dropped_idx < sizeof(dropped) / sizeof(dropped[0]); dropped_idx++) {
+    assert(strstr(saved_str, dropped[dropped_idx]) == NULL);
+  }
+  StringBuilder *all = string_builder_create();
+  config_add_settings_to_string_builder(config, all);
+  assert(strstr(string_builder_peek(all), " -plies 3") != NULL);
+  assert(strstr(string_builder_peek(all), " -eplies 4") != NULL);
+  string_builder_destroy(all);
+
+  // A fresh config loaded from the saved settings has the saved settings and
+  // the defaults of the rest.
+  Config *reloaded = config_create_default_test();
+  assert_config_exec_status(reloaded, saved_str, ERROR_STATUS_SUCCESS);
+  StringBuilder *reloaded_saved = string_builder_create();
+  config_add_saved_settings_to_string_builder(reloaded, reloaded_saved);
+  assert_strings_equal(string_builder_peek(reloaded_saved), saved_str);
+  string_builder_destroy(reloaded_saved);
+  Config *defaults = config_create_default_test();
+  assert(config_get_plies(config) == 3);
+  assert(config_get_endgame_plies(config) == 4);
+  assert(config_get_plies(reloaded) == config_get_plies(defaults));
+  assert(config_get_endgame_plies(reloaded) ==
+         config_get_endgame_plies(defaults));
+  config_destroy(defaults);
+  string_builder_destroy(saved);
+  config_destroy(reloaded);
+  config_destroy(config);
+}
+
+// -wmp, -rit and -wit take auto beside true and false, and a settings file
+// records auto as auto rather than what this machine's load decided.
+void test_config_table_auto_settings(void) {
+  Config *config = config_create_default_test();
+  assert_config_exec_status(config, "set -lex CSW21 -wmp auto -wit auto",
+                            ERROR_STATUS_SUCCESS);
+  StringBuilder *sb = string_builder_create();
+  config_add_settings_to_string_builder(config, sb);
+  assert(strstr(string_builder_peek(sb), " -w1 auto") != NULL);
+  assert(strstr(string_builder_peek(sb), " -w2 auto") != NULL);
+  assert(strstr(string_builder_peek(sb), " -wit1 auto") != NULL);
+  assert(strstr(string_builder_peek(sb), " -rit1 false") != NULL);
+  string_builder_destroy(sb);
+  assert_config_exec_status(config, "set -w2 true -wit false",
+                            ERROR_STATUS_SUCCESS);
+  sb = string_builder_create();
+  config_add_settings_to_string_builder(config, sb);
+  assert(strstr(string_builder_peek(sb), " -w1 auto") != NULL);
+  assert(strstr(string_builder_peek(sb), " -w2 true") != NULL);
+  assert(strstr(string_builder_peek(sb), " -wit1 false") != NULL);
+  string_builder_destroy(sb);
+  assert_config_exec_status(config, "set -wmp maybe",
+                            ERROR_STATUS_CONFIG_LOAD_MALFORMED_BOOL_ARG);
+  config_destroy(config);
+}
+
+// Copies a file byte for byte.
+static void copy_test_file(const char *from, const char *to) {
+  FILE *in = cfile_open(from, "rbe", false);
+  assert(in);
+  FILE *out = cfile_open(to, "wbe", false);
+  assert(out);
+  int byte = 0;
+  while ((byte = fgetc(in)) != EOF) {
+    (void)fputc(byte, out);
+  }
+  (void)fclose(in);
+  (void)fclose(out);
+}
+
+// Runs `command` on `config`, writing what it prints to `output` (`size`
+// bytes, terminated).
+static void exec_capturing_output(Config *config, const char *command,
+                                  char *output, size_t size) {
+  FILE *captured = tmpfile();
+  assert(captured);
+  io_set_stream_out(captured);
+  load_and_exec_config_or_die(config, command);
+  io_reset_stream_out();
+  const int seek_result = fseek(captured, 0, SEEK_SET);
+  assert(seek_result == 0);
+  const size_t length = fread(output, 1, size - 1, captured);
+  output[length] = '\0';
+  (void)fclose(captured);
+}
+
+// Where missing tables are built (data from `data fetch`), a lexicon's first
+// use builds its wordmap, word info table and rack info table, each with a
+// line naming it and the disk and memory it takes, and loads them; the next
+// use builds nothing.
+// Keeps the first `bytes` of a file: a table a build or a disk cut short.
+static void truncate_test_file(const char *path, size_t bytes) {
+  FILE *stream = cfile_open(path, "rbe", false);
+  assert(stream);
+  uint8_t *contents = malloc_or_die(bytes);
+  const size_t read_bytes = fread(contents, 1, bytes, stream);
+  assert(read_bytes == bytes);
+  (void)fclose(stream);
+  stream = cfile_open(path, "wbe", false);
+  assert(stream);
+  const size_t written = fwrite(contents, 1, bytes, stream);
+  assert(written == bytes);
+  (void)fclose(stream);
+  free(contents);
+}
+
+// From a table built on first use to the disk cap deleting another, and on to
+// tables that turn out damaged: auto gets through it all without an error, and
+// says each thing once.
+static void test_config_auto_tables_from_build_to_eviction(void) {
+  char *dir = test_platform_make_temporary_directory("magpie_eviction");
+  char *lexica = get_formatted_string("%s/lexica", dir);
+  assert(cfile_mkdir(lexica) == 0);
+  const char *lexicon = "CSW21_abeviction";
+  char *kwg = get_formatted_string("%s/%s.kwg", lexica, lexicon);
+  char *klv = get_formatted_string("%s/%s.klv2", lexica, lexicon);
+  copy_test_file("testdata/lexica/CSW21_ab.kwg", kwg);
+  copy_test_file("testdata/lexica/CSW21_ab.klv2", klv);
+  // A table an earlier run built, which this one does not use.
+  char *old_table = get_formatted_string("%s/CSW21_old.CSW21_old.rit", lexica);
+  copy_test_file("testdata/lexica/CSW21_ab.klv2", old_table);
+  char *manifest_path = get_formatted_string("%s/auto_tables.txt", dir);
+  contribute_tables_record_built(manifest_path, "rit", "CSW21_old.CSW21_old",
+                                 old_table);
+  char *data_paths = get_formatted_string("%s:%s", dir, DEFAULT_TEST_DATA_PATH);
+  const ConfigArgs args = {.data_paths = data_paths,
+                           .settings_filename = DEFAULT_TEST_SETTINGS_FILENAME,
+                           .use_wmp = true,
+                           .auto_tables = true,
+                           .build_missing_wordmaps = true,
+                           .auto_table_cap_bytes = 1};
+  ErrorStack *error_stack = error_stack_create();
+  Config *config = config_create(&args, error_stack);
+  assert(error_stack_is_empty(error_stack));
+  char *command = get_formatted_string(
+      "set -threads 1 -savesettings false -lex %s -ld english_ab", lexicon);
+  char output[8192];
+  exec_capturing_output(config, command, output, sizeof(output));
+  if (strstr(output, "skipped")) {
+    printf("config: skipped the eviction test: %s", output);
+  } else {
+    // Over the cap: the unused table goes, and those in use stay.
+    assert(strstr(output, "to keep them within their disk cap"));
+    assert(!cfile_access(old_table, CFILE_ACCESS_EXISTS));
+    char *wmp = get_formatted_string("%s/%s.wmp", lexica, lexicon);
+    char *rit = get_formatted_string("%s/%s.%s.rit", lexica, lexicon, lexicon);
+    assert(cfile_access(wmp, CFILE_ACCESS_EXISTS));
+    assert(cfile_access(rit, CFILE_ACCESS_EXISTS));
+
+    // A wordmap cut short is left out, and the rack info table that needs it
+    // cannot be built: each is said once, with no error, and not tried on
+    // the next command.
+    config_destroy(config);
+    const int removed = remove(rit);
+    assert(removed == 0);
+    (void)removed;
+    truncate_test_file(wmp, 100);
+    config = config_create(&args, error_stack);
+    assert(error_stack_is_empty(error_stack));
+    exec_capturing_output(config, command, output, sizeof(output));
+    assert(strstr(output, "playing without the wordmap"));
+    assert(strstr(output, "incomplete"));
+    assert(strstr(output, "without a rack info table"));
+    exec_capturing_output(config, "set -threads 1", output, sizeof(output));
+    assert(!strstr(output, "building"));
+    assert(!strstr(output, "without"));
+    free(rit);
+    free(wmp);
+  }
+  error_stack_destroy(error_stack);
+  config_destroy(config);
+  free(command);
+  free(data_paths);
+  free(manifest_path);
+  free(old_table);
+  free(klv);
+  free(kwg);
+  free(lexica);
+  test_platform_remove_directory_tree(dir);
+  free(dir);
+}
+
+// What auto leaves out for want of room it leaves out for both players, though
+// players sharing a lexicon are reported as one.
+static void test_config_auto_tables_bind_both_players(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -wmp auto -wit auto -rit auto -ttfraction 0.99");
+  const PlayersData *players_data = config_get_players_data(config);
+  const players_data_t types[3] = {PLAYERS_DATA_TYPE_WMP, PLAYERS_DATA_TYPE_WIT,
+                                   PLAYERS_DATA_TYPE_RIT};
+  for (int type_idx = 0; type_idx < 3; type_idx++) {
+    const bool first =
+        players_data_get_data(players_data, types[type_idx], 0) != NULL;
+    const bool second =
+        players_data_get_data(players_data, types[type_idx], 1) != NULL;
+    assert(first == second);
+  }
+  config_destroy(config);
+}
+
+static void test_config_builds_missing_tables_on_first_use(void) {
+  char *dir = test_platform_make_temporary_directory("magpie_first_use");
+  char *lexica = get_formatted_string("%s/lexica", dir);
+  assert(cfile_mkdir(lexica) == 0);
+  // A lexicon name no other data directory has tables for.
+  const char *lexicon = "CSW21_abfirstuse";
+  char *kwg = get_formatted_string("%s/%s.kwg", lexica, lexicon);
+  char *klv = get_formatted_string("%s/%s.klv2", lexica, lexicon);
+  copy_test_file("testdata/lexica/CSW21_ab.kwg", kwg);
+  copy_test_file("testdata/lexica/CSW21_ab.klv2", klv);
+  char *data_paths = get_formatted_string("%s:%s", dir, DEFAULT_TEST_DATA_PATH);
+  const ConfigArgs args = {.data_paths = data_paths,
+                           .settings_filename = DEFAULT_TEST_SETTINGS_FILENAME,
+                           .use_wmp = true,
+                           .auto_tables = true,
+                           .build_missing_wordmaps = true};
+  ErrorStack *error_stack = error_stack_create();
+  Config *config = config_create(&args, error_stack);
+  assert(error_stack_is_empty(error_stack));
+  error_stack_destroy(error_stack);
+  char *command = get_formatted_string(
+      "set -threads 1 -savesettings false -lex %s -ld english_ab", lexicon);
+
+  char output[4096];
+  exec_capturing_output(config, command, output, sizeof(output));
+
+  const PlayersData *players_data = config_get_players_data(config);
+  char *rit_name = get_formatted_string("%s.%s", lexicon, lexicon);
+  if (strstr(output, "skipped")) {
+    // A machine with less disk than the reserve the tables leave free, the
+    // larger of 10 GB and 1% of the disk. Any other skip is a failure.
+    int64_t free_bytes = 0;
+    int64_t total_bytes = 0;
+    assert(cfile_free_bytes(dir, &free_bytes));
+    assert(cfile_total_bytes(dir, &total_bytes));
+    const int64_t reserve_floor_bytes = 10000000000LL;
+    const int64_t reserve_bytes = total_bytes / 100 > reserve_floor_bytes
+                                      ? total_bytes / 100
+                                      : reserve_floor_bytes;
+    assert(free_bytes < reserve_bytes + reserve_floor_bytes);
+    printf("config: skipped the first-use build: %s", output);
+  } else {
+    const char *built[] = {"building the wordmap",
+                           "building the word info table",
+                           "building the rack info table"};
+    for (int line_idx = 0; line_idx < 3; line_idx++) {
+      const char *line = strstr(output, built[line_idx]);
+      assert(line);
+      assert(strstr(line, " on disk, and up to "));
+    }
+    assert(strstr(output, "using wordmap, using word info table, using rack "
+                          "info table"));
+    assert(strings_equal(
+        players_data_get_data_name(players_data, PLAYERS_DATA_TYPE_WMP, 0),
+        lexicon));
+    assert(strings_equal(
+        players_data_get_data_name(players_data, PLAYERS_DATA_TYPE_WIT, 0),
+        lexicon));
+    assert(strings_equal(
+        players_data_get_data_name(players_data, PLAYERS_DATA_TYPE_RIT, 0),
+        rit_name));
+    // Loaded again from disk by a new config: nothing is built.
+    config_destroy(config);
+    error_stack = error_stack_create();
+    config = config_create(&args, error_stack);
+    assert(error_stack_is_empty(error_stack));
+    error_stack_destroy(error_stack);
+    exec_capturing_output(config, command, output, sizeof(output));
+    assert(!strstr(output, "building"));
+    assert(strings_equal(
+        players_data_get_data_name(config_get_players_data(config),
+                                   PLAYERS_DATA_TYPE_RIT, 0),
+        rit_name));
+
+    // What was built is in the program's own manifest, the only tables it
+    // ever deletes, and not in contribute's.
+    char *manifest_path = get_formatted_string("%s/auto_tables.txt", dir);
+    ContributeTableManifest *manifest =
+        contribute_table_manifest_read(manifest_path);
+    assert(manifest->count == 3);
+    assert(contribute_table_manifest_touch(manifest, "wmp", lexicon, 1));
+    assert(contribute_table_manifest_touch(manifest, "wit", lexicon, 1));
+    assert(contribute_table_manifest_touch(manifest, "rit", rit_name, 1));
+    // Eviction can run from any directory, so each path stands on its own.
+    for (int entry_idx = 0; entry_idx < manifest->count; entry_idx++) {
+      const char *entry_path = manifest->entries[entry_idx].path;
+      char *absolute_path = cfile_absolute_path(entry_path);
+      assert(strings_equal(absolute_path, entry_path));
+      free(absolute_path);
+    }
+    contribute_table_manifest_destroy(manifest);
+    free(manifest_path);
+    char *contribute_manifest =
+        get_formatted_string("%s/%s", dir, CONTRIBUTE_TABLE_MANIFEST_FILENAME);
+    assert(!cfile_access(contribute_manifest, CFILE_ACCESS_EXISTS));
+    free(contribute_manifest);
+
+    // The rack info table records the lexicon and leaves it was built from.
+    // One that records others is dropped under auto, said in a line, and is
+    // an error under true.
+    char *rit_path = get_formatted_string("%s/%s.rit", lexica, rit_name);
+    FILE *rit_file = cfile_open(rit_path, "r+be", false);
+    assert(rit_file);
+    const int seek_result = fseek(rit_file, -8, SEEK_END);
+    assert(seek_result == 0);
+    const uint8_t other_leaves_hash[8] = {0x5a, 0x5a, 0x5a, 0x5a,
+                                          0x5a, 0x5a, 0x5a, 0x5a};
+    const size_t patched =
+        fwrite(other_leaves_hash, 1, sizeof(other_leaves_hash), rit_file);
+    assert(patched == sizeof(other_leaves_hash));
+    (void)fclose(rit_file);
+    free(rit_path);
+    config_destroy(config);
+    error_stack = error_stack_create();
+    config = config_create(&args, error_stack);
+    assert(error_stack_is_empty(error_stack));
+    error_stack_destroy(error_stack);
+    exec_capturing_output(config, command, output, sizeof(output));
+    assert(strstr(output, "playing without the rack info table"));
+    assert(!players_data_get_data_name(config_get_players_data(config),
+                                       PLAYERS_DATA_TYPE_RIT, 0));
+    assert_config_exec_status(config, "set -rit true",
+                              ERROR_STATUS_RIT_INPUTS_MISMATCH);
+    assert_config_exec_status(config, "set -rit auto", ERROR_STATUS_SUCCESS);
+    // It is said once, not on every command.
+    exec_capturing_output(config, "set -threads 1", output, sizeof(output));
+    assert(!strstr(output, "playing without"));
+
+    // A file that cannot be loaded is left out under auto the same way, and
+    // an error under true: an old or damaged table must not stop every
+    // command.
+    const char *tables[2] = {rit_name, lexicon};
+    const char *table_types[2] = {"rit", "wit"};
+    const char *table_lines[2] = {"playing without the rack info table",
+                                  "playing without the word info table"};
+    for (int table_idx = 0; table_idx < 2; table_idx++) {
+      char *table_path = get_formatted_string(
+          "%s/%s.%s", lexica, tables[table_idx], table_types[table_idx]);
+      FILE *table_file = cfile_open(table_path, "wbe", false);
+      assert(table_file);
+      const char garbage[] = "not a table";
+      const size_t written = fwrite(garbage, 1, sizeof(garbage), table_file);
+      assert(written == sizeof(garbage));
+      (void)fclose(table_file);
+      free(table_path);
+      config_destroy(config);
+      error_stack = error_stack_create();
+      config = config_create(&args, error_stack);
+      assert(error_stack_is_empty(error_stack));
+      error_stack_destroy(error_stack);
+      exec_capturing_output(config, command, output, sizeof(output));
+      assert(strstr(output, table_lines[table_idx]));
+      exec_capturing_output(config, "set -threads 1", output, sizeof(output));
+      assert(!strstr(output, "playing without"));
+    }
+    players_data = config_get_players_data(config);
+    assert(!players_data_get_data_name(players_data, PLAYERS_DATA_TYPE_RIT, 0));
+    assert(!players_data_get_data_name(players_data, PLAYERS_DATA_TYPE_WIT, 0));
+    assert(players_data_get_data_name(players_data, PLAYERS_DATA_TYPE_WMP, 0));
+
+    // A lexicon with no wordmap support says why it has no wordmap, and no
+    // rack info table, which is built from one, instead of naming a convert
+    // command that cannot build them.
+    const char *unsupported = "CSW21_ab_superfirstuse";
+    char *unsupported_kwg =
+        get_formatted_string("%s/%s.kwg", lexica, unsupported);
+    char *unsupported_klv =
+        get_formatted_string("%s/%s.klv2", lexica, unsupported);
+    copy_test_file("testdata/lexica/CSW21_ab.kwg", unsupported_kwg);
+    copy_test_file("testdata/lexica/CSW21_ab.klv2", unsupported_klv);
+    char *unsupported_command =
+        get_formatted_string("set -lex %s -ld english_ab -k1 %s -k2 %s",
+                             unsupported, unsupported, unsupported);
+    exec_capturing_output(config, unsupported_command, output, sizeof(output));
+    assert(strstr(output, "no wordmap (wordmaps do not support this board "
+                          "size)"));
+    assert(strstr(output, "no rack info table (it is built from a wordmap, "
+                          "and wordmaps do not support this board size)"));
+    assert(!strstr(output, "dawg2wordmap"));
+    assert(!strstr(output, "klvwmp2rit"));
+    free(unsupported_command);
+    free(unsupported_klv);
+    free(unsupported_kwg);
+  }
+  free(rit_name);
+  free(command);
+  config_destroy(config);
+  free(data_paths);
+  free(klv);
+  free(kwg);
+  free(lexica);
+  test_platform_remove_directory_tree(dir);
+  free(dir);
 }
 
 void test_config_exchange_blank(void) {
@@ -2559,22 +3552,680 @@ void test_config_utility_blend(void) {
   error_stack_destroy(error_stack);
 }
 
+// "shmoves" should still be able to show (and filter/limit into) the
+// move_list results of a "gen" command after a commit changes the
+// position: they're duplicated onto the GameEvent the commit created
+// (see config_save_live_results_to_game_event), and shown as a fallback
+// once nothing's live. The saved move_list is a real object, not a
+// frozen rendering, so ordinary "shmoves" filter args keep working
+// against it, and viewing it doesn't consume/clear it.
+void test_config_move_list_saved_to_game_event(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -wmp true -s1 equity -s2 equity -r1 all -r2 all "
+      "-numplays 15 -mode sync");
+  assert_config_exec_status(
+      config,
+      "cgp 15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 ABCDEFG/HIJKLM? "
+      "0/0 0",
+      ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  assert(move_list_get_count(config_get_move_list(config)) > 1);
+
+  // Committing changes the position and clears the live move list right
+  // away, same as always.
+  assert_config_exec_status(config, "com 1", ERROR_STATUS_SUCCESS);
+  assert(move_list_get_count(config_get_move_list(config)) == 0);
+
+  // The move_list that was live just before the commit is now saved on
+  // the GameEvent that commit created -- it belongs to the turn that was
+  // just decided (and the rack that turn was decided from), not to the
+  // new position that's on screen now.
+  const GameHistory *game_history = config_get_game_history(config);
+  const GameEvent *committed_event = game_history_get_event(
+      game_history, game_history_get_num_played_events(game_history) - 1);
+  const MoveList *saved_move_list = game_event_get_move_list(committed_event);
+  assert(saved_move_list && move_list_get_count(saved_move_list) > 1);
+  assert(!game_event_get_sim_results(committed_event));
+
+  // Right after the commit, nothing is live for the new on-turn player
+  // (nothing generated yet for their rack), and there's no future event to
+  // fall back to either, so shmoves correctly finds nothing to show.
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
+
+  // Navigating back to the position the committed move was actually chosen
+  // from finds its saved move_list, as a real object, so ordinary filter
+  // args (a max-count filter, here) still work against it...
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shmoves 1", ERROR_STATUS_SUCCESS);
+
+  // ...and viewing it doesn't consume/clear it, so a second (unfiltered)
+  // "shmoves" still shows it too.
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_SUCCESS);
+
+  config_destroy(config);
+}
+
+// A move committed by rank ("com 9") must resolve against whatever's
+// actually being shown right now, exactly like "shmoves" does: after
+// navigating back to a past position with nothing freshly generated, the
+// move at that rank should come from the position's own saved move_list
+// instead of failing with "no generated moves".
+void test_config_commit_by_index_uses_saved_move_list(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -wmp true -s1 equity -s2 equity -r1 all -r2 all "
+      "-numplays 15 -mode sync");
+  assert_config_exec_status(
+      config,
+      "cgp 15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 ABCDEFG/HIJKLM? "
+      "0/0 0",
+      ERROR_STATUS_SUCCESS);
+
+  // Turn 1: gen (many possible openings for ABCDEFG on an empty board),
+  // then commit a pass instead of one of the generated moves. The
+  // generated move_list -- not the pass that was actually played -- is
+  // what gets saved onto this turn's event.
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  const int num_turn_1_moves =
+      move_list_get_count(config_get_move_list(config));
+  assert(num_turn_1_moves >= 9);
+  // Pick a non-top rank so this can't pass by accident via some other
+  // "always commit rank 1" code path.
+  const int chosen_rank = 9;
+  Move chosen_move;
+  move_copy(&chosen_move,
+            move_list_get_move(config_get_move_list(config), chosen_rank - 1));
+  assert_config_exec_status(config, "com pass", ERROR_STATUS_SUCCESS);
+
+  // Right after committing, nothing is live and we're at the live
+  // frontier, so committing by index fails cleanly.
+  StringBuilder *commit_cmd_sb = string_builder_create();
+  string_builder_add_formatted_string(commit_cmd_sb, "com %d", chosen_rank);
+  char *commit_cmd = string_builder_dump_and_destroy(commit_cmd_sb, NULL);
+  assert_config_exec_status(config, commit_cmd,
+                            ERROR_STATUS_COMMIT_MOVE_INDEX_OUT_OF_RANGE);
+
+  // Navigate back to the position turn 1 was decided from (the start of
+  // the game): nothing is live here either, but its own saved move_list
+  // is available (the same one "shmoves" would fall back to).
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert(move_list_get_count(config_get_move_list(config)) == 0);
+
+  const Game *game = config_get_game(config);
+  const int player_on_turn = game_get_player_on_turn_index(game);
+  const Equity score_before =
+      player_get_score(game_get_player(game, player_on_turn));
+
+  // Committing by that same rank now commits the move from that saved
+  // list rather than failing with "no generated moves".
+  assert_config_exec_status(config, commit_cmd, ERROR_STATUS_SUCCESS);
+  const Equity score_after =
+      player_get_score(game_get_player(game, player_on_turn));
+  assert(score_after == score_before + move_get_score(&chosen_move));
+  free(commit_cmd);
+
+  config_destroy(config);
+}
+
+// The SimResults saved onto a GameEvent is a full deep copy (see
+// sim_results_duplicate), not just the move_list: it survives the live
+// sim_results being invalidated on commit, supports the usual shmoves
+// filter args, and is completely independent of (doesn't alias) the
+// live, now-invalid sim_results.
+void test_config_sim_results_saved_to_game_event(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -wmp true -s1 equity -s2 equity -r1 all -r2 all "
+      "-numplays 5 -mode sync");
+  assert_config_exec_status(
+      config,
+      "cgp 15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 ABCDEFG/HIJKLM? "
+      "0/0 0",
+      ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "sim -iterations 100",
+                            ERROR_STATUS_SUCCESS);
+  const SimResults *live_sim_results = config_get_sim_results(config);
+  assert(sim_results_get_valid_for_current_game_state(live_sim_results));
+  const int num_simmed_plays =
+      sim_results_get_number_of_plays(live_sim_results);
+  assert(num_simmed_plays > 1);
+
+  // Committing changes the position and invalidates the live sim_results
+  // right away, same as always; the object itself is untouched (its
+  // identity never changes), just marked invalid.
+  assert_config_exec_status(config, "com 1", ERROR_STATUS_SUCCESS);
+  assert(config_get_sim_results(config) == live_sim_results);
+  assert(!sim_results_get_valid_for_current_game_state(live_sim_results));
+
+  // The sim_results that were live and valid just before the commit are
+  // now saved (as an independent deep copy, not the same object) on the
+  // GameEvent that commit created -- again, the turn that was just
+  // decided, not the new position now on screen.
+  const GameHistory *game_history = config_get_game_history(config);
+  const GameEvent *committed_event = game_history_get_event(
+      game_history, game_history_get_num_played_events(game_history) - 1);
+  const SimResults *saved_sim_results =
+      game_event_get_sim_results(committed_event);
+  assert(saved_sim_results && saved_sim_results != live_sim_results);
+  assert(sim_results_get_number_of_plays(saved_sim_results) ==
+         num_simmed_plays);
+
+  // Right after the commit, nothing is live for the new on-turn player and
+  // there's no future event to fall back to, so shmoves finds nothing.
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
+
+  // Navigating back to the position the sim was actually run from finds
+  // the saved sim results, a real independent SimResults object, so an
+  // ordinary shmoves max-count filter still works against them.
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shmoves 1", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_SUCCESS);
+
+  config_destroy(config);
+}
+
+// A new game starts with no analysis. Left valid, the previous game's simmed
+// plays were committed by index onto the empty board (where the replay
+// rejected them as not connected to any tile), replayed by heatmap against
+// the new game's empty racks, and saved onto the new game's first turn.
+void test_config_new_game_drops_previous_analysis(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -wmp true -s1 equity -s2 equity -r1 all -r2 all "
+      "-numplays 5 -mode sync -useheatmap true -plies 2");
+  assert_config_exec_status(config, "newgame", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "t BARCHAN", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "rack DEGILNO", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "sim -iterations 100",
+                            ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "infer", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "heat 1", ERROR_STATUS_SUCCESS);
+
+  assert_config_exec_status(config, "newgame", ERROR_STATUS_SUCCESS);
+  assert(!sim_results_get_valid_for_current_game_state(
+      config_get_sim_results(config)));
+  assert(move_list_get_count(config_get_move_list(config)) == 0);
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
+  assert_config_exec_status(config, "heat 1", ERROR_STATUS_NO_HEAT_MAP_TO_SHOW);
+  assert_config_exec_status(config, "com 1",
+                            ERROR_STATUS_COMMIT_MOVE_INDEX_OUT_OF_RANGE);
+  assert_config_exec_status(config, "t", ERROR_STATUS_COMMIT_EMPTY_RACK);
+  assert_config_exec_status(config, "shinfer",
+                            ERROR_STATUS_NO_INFERENCE_TO_SHOW);
+
+  // The new game's first turn keeps only what was analysed for it.
+  assert_config_exec_status(config, "t BARCHAN", ERROR_STATUS_SUCCESS);
+  const GameEvent *first_event =
+      game_history_get_event(config_get_game_history(config), 0);
+  assert(!game_event_get_sim_results(first_event));
+  assert(!game_event_get_inference_results(first_event));
+  assert(!game_event_get_endgame_results(first_event));
+
+  config_destroy(config);
+}
+
+// A cgp position starts a new game history. Commits used to replay the
+// previous game's events, or an empty board, and reject the move as not
+// connected; the previous game's endgame results stayed valid, pointing at the
+// lexicon the cgp's -lex freed.
+// Started with set, cgp or load, magpie keeps running commands afterwards;
+// started with another command, it exits once that command finishes.
+static void test_config_continue_on_coldstart(void) {
+  Config *config = config_create_default_test();
+  ErrorStack *error_stack = error_stack_create();
+  const char *continuing_cmds[] = {"set -threads 2", "cgp " EMPTY_CGP,
+                                   "load " TEST_GCG_FILENAME};
+  for (int cmd_idx = 0; cmd_idx < 3; cmd_idx++) {
+    config_load_command(config, continuing_cmds[cmd_idx], error_stack);
+    assert(error_stack_is_empty(error_stack));
+    assert(config_continue_on_coldstart(config));
+  }
+  config_load_command(config, "shgame", error_stack);
+  assert(error_stack_is_empty(error_stack));
+  assert(!config_continue_on_coldstart(config));
+  error_stack_destroy(error_stack);
+  config_destroy(config);
+}
+
+void test_config_cgp_starts_new_history(void) {
+  Config *config = config_create_or_die("set -s1 score -s2 score -threads 2");
+  assert_config_exec_status(config, "load testdata/gcgs/success_standard.gcg",
+                            ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "goto end", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "endgame", ERROR_STATUS_SUCCESS);
+
+  assert_config_exec_status(
+      config,
+      "cgp 7C6D/7H4LAR/7I2P1ALA/7VOGUE1AG/6RERAN2M1/7S1BY2O1/8OY2Id1/"
+      "5JEUX3NEW/3C1U2O3A1E/3O1M6N1B/3ZIP2OAK1E2/2TI1sTIFLERS2/2WED5F1T2/"
+      "1HIDEOUT7/VEG1N2IDOL4 AEINRST/AEINRST 372/369 0 -lex CSW24",
+      ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shendgame",
+                            ERROR_STATUS_NO_ENDGAME_TO_SHOW);
+  const GameHistory *game_history = config_get_game_history(config);
+  assert(game_history_get_num_events(game_history) == 0);
+  assert(game_history_get_initial_cgp(game_history));
+
+  const Game *game = config_get_game(config);
+  const int tiles_before = board_get_tiles_played(game_get_board(game));
+  assert_config_exec_status(config, "t", ERROR_STATUS_SUCCESS);
+  assert(game_history_get_num_events(game_history) == 1);
+  assert(board_get_tiles_played(game_get_board(game)) > tiles_before);
+  assert(player_get_score(game_get_player(game, 0)) > int_to_equity(372));
+
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert(board_get_tiles_played(game_get_board(game)) == tiles_before);
+  assert(player_get_score(game_get_player(game, 0)) == int_to_equity(372));
+  assert(player_get_score(game_get_player(game, 1)) == int_to_equity(369));
+
+  config_destroy(config);
+}
+
+static void assert_game_borrows_current_kwgs(const Config *config,
+                                             const Game *game) {
+  const PlayersData *players_data = config_get_players_data(config);
+  for (int player_idx = 0; player_idx < 2; player_idx++) {
+    assert(player_get_kwg(game_get_player(game, player_idx)) ==
+           players_data_get_kwg(players_data, player_idx));
+  }
+}
+
+// Switching lexicon frees the one the live game and each endgame result's
+// start game borrow. Both are rebuilt against the new lexicon: heatmap and
+// shendgame used to replay moves through the freed one.
+void test_config_lexicon_change_rebuilds_games(void) {
+  Config *config = config_create_or_die(
+      "set -s1 score -s2 score -threads 2 -useheatmap true -plies 2");
+  assert_config_exec_status(config, "load testdata/gcgs/success_standard.gcg",
+                            ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "goto end", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "endgame", ERROR_STATUS_SUCCESS);
+  // Committing saves the endgame results onto the turn.
+  assert_config_exec_status(config, "t", ERROR_STATUS_SUCCESS);
+  const GameHistory *game_history = config_get_game_history(config);
+  const EndgameResults *saved_endgame_results =
+      game_event_get_endgame_results(game_history_get_event(
+          game_history, game_history_get_num_played_events(game_history) - 1));
+  assert(saved_endgame_results);
+  assert_config_exec_status(config, "goto 6", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "gsim -iterations 100",
+                            ERROR_STATUS_SUCCESS);
+
+  assert_config_exec_status(config, "set -lex NWL20", ERROR_STATUS_SUCCESS);
+  assert_game_borrows_current_kwgs(config, config_get_game(config));
+  assert_game_borrows_current_kwgs(
+      config,
+      endgame_results_get_start_game(config_get_endgame_results(config)));
+  assert_game_borrows_current_kwgs(
+      config, endgame_results_get_start_game(saved_endgame_results));
+  assert_config_exec_status(config, "heat 1", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shendgame", ERROR_STATUS_SUCCESS);
+
+  config_destroy(config);
+}
+
+static int config_endgame_value(Config *config) {
+  assert_config_exec_status(config, "endgame", ERROR_STATUS_SUCCESS);
+  return endgame_results_get_value(config_get_endgame_results(config),
+                                   ENDGAME_RESULT_BEST);
+}
+
+// The endgame TT keeps a solve's values for the next solve, under keys that
+// hash only the board, the racks and the player on turn. After set -lex, an
+// NWL23 solve of this position read back CSW21's values and returned 51, where
+// NWL23's value is 43. Every word on this board is valid in both lexica.
+void test_config_lexicon_change_clears_endgame_tt(void) {
+  Config *config = config_create_or_die("set -lex CSW21 -eplies 2 -threads 1");
+  assert_config_exec_status(
+      config,
+      "cgp "
+      "PISOLITH7/E14/r13E/I1MEW2F3H2C/ATENOLOL2NY2Z/G6A2AR1BE/U6VERBATIM/"
+      "A4UPO2EX1NA/6OR7/5WO8/4IRKSOmE1T2/5I1QUINOA2/5N1U4Y2/5G1A7/"
+      "GRICES1DELISTED ADDEJRT/FNV 536/474 0",
+      ERROR_STATUS_SUCCESS);
+  assert(config_endgame_value(config) == 47);
+  assert_config_exec_status(config, "set -lex NWL23", ERROR_STATUS_SUCCESS);
+  assert(config_endgame_value(config) == 43);
+  assert_config_exec_status(config, "set -lex CSW21", ERROR_STATUS_SUCCESS);
+  assert(config_endgame_value(config) == 47);
+  config_destroy(config);
+}
+
+// The bingo bonus is part of a play's score, and the endgame TT's keys don't
+// hash it. The player on turn here has only J and must pass, so the opponent's
+// bingo, O8 FEELING(S), comes one move below the root, inside the entries a
+// solve stores. After a solve with no bingo bonus, a solve with a bonus of 50
+// read those entries back and returned -82, where its value is -105.
+void test_config_bingo_bonus_change_clears_endgame_tt(void) {
+  Config *config =
+      config_create_or_die("set -lex NWL23 -eplies 2 -threads 1 -bb 0");
+  assert_config_exec_status(
+      config,
+      "cgp "
+      "2GRANTED5L/1XI5ABBOTCY/6FEG2WO1A/6EUOUAE2M/7O2D4/6OI2V1I2/1AN2MO3O1N2/"
+      "CH1QUIRT1DuDS2/HIOI2I3T1T2/3NAPE3R1A2/4UR4Y1R2/3WAI1Z7/4SLEEVEEn3/"
+      "5L1P7/7STARKENS J/EEFGILN 498/389 0",
+      ERROR_STATUS_SUCCESS);
+  assert(config_endgame_value(config) == -82);
+  assert_config_exec_status(config, "set -bb 50", ERROR_STATUS_SUCCESS);
+  assert(config_endgame_value(config) == -105);
+  assert_config_exec_status(config, "set -bb 0", ERROR_STATUS_SUCCESS);
+  assert(config_endgame_value(config) == -82);
+  config_destroy(config);
+}
+
+static char *write_test_gcg(const char *directory, const char *name,
+                            const char *contents) {
+  char *path = get_formatted_string("%s/%s", directory, name);
+  ErrorStack *error_stack = error_stack_create();
+  write_string_to_file(path, "w", contents, error_stack);
+  assert(error_stack_is_empty(error_stack));
+  error_stack_destroy(error_stack);
+  return path;
+}
+
+static void exec_with_path(Config *config, const char *command,
+                           const char *path, error_code_t expected_status) {
+  char *full_command = get_formatted_string("%s %s", command, path);
+  assert_config_exec_status(config, full_command, expected_status);
+  free(full_command);
+}
+
+// After a failed load, the game from before it is back, along with the
+// lexical data it and its saved endgame results borrow.
+static void assert_restored_standard_game(const Config *config,
+                                          int num_events) {
+  const PlayersData *players_data = config_get_players_data(config);
+  for (int player_idx = 0; player_idx < 2; player_idx++) {
+    assert(strings_equal(players_data_get_data_name(
+                             players_data, PLAYERS_DATA_TYPE_KWG, player_idx),
+                         "CSW21"));
+  }
+  assert(strings_equal(ld_get_name(config_get_ld(config)), "english"));
+  const GameHistory *game_history = config_get_game_history(config);
+  assert(game_history_get_num_events(game_history) == num_events);
+  assert_game_borrows_current_kwgs(config, config_get_game(config));
+  const EndgameResults *saved_endgame_results = game_event_get_endgame_results(
+      game_history_get_event(game_history, num_events - 1));
+  assert_game_borrows_current_kwgs(
+      config, endgame_results_get_start_game(saved_endgame_results));
+}
+
+// A GCG that names another lexicon or distribution loads it before its moves.
+// A failed load then restored the previous game and history still borrowing
+// the data the load had freed, and a load that changed the distribution kept
+// using a game whose bag was sized for the previous one.
+void test_config_load_replacing_lexical_data(void) {
+  char *directory =
+      test_platform_make_temporary_directory("magpie_load_lexical_data");
+  // Scored one point too high: fails once NWL20 is loaded.
+  char *nwl20_path =
+      write_test_gcg(directory, "nwl20.gcg",
+                     "#lexicon NWL20\n#player1 a a\n#player2 b b\n"
+                     ">a: AAENRSZ 8G ZA +22 22\n"
+                     ">b: ?CDEIRW 9E CRoWDIE +80 80\n");
+  // Misses the center square: fails once the French distribution is loaded.
+  char *bad_french_path =
+      write_test_gcg(directory, "bad_french.gcg",
+                     "#lexicon FRA20\n#tile-distribution french\n#player1 a a\n"
+                     "#player2 b b\n>a: ABCDEFG 8D BAC +99 99\n");
+  char *french_path = get_formatted_string("%s/french.gcg", directory);
+  Config *french_config =
+      config_create_or_die("set -lex FRA20 -s1 score -s2 score");
+  assert_config_exec_status(french_config, "newgame", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(french_config, "t ABCDEFG", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(french_config, "t EEIRSTU", ERROR_STATUS_SUCCESS);
+  exec_with_path(french_config, "ex", french_path, ERROR_STATUS_SUCCESS);
+  config_destroy(french_config);
+
+  Config *config = config_create_or_die("set -s1 score -s2 score -threads 2");
+  assert_config_exec_status(config, "load testdata/gcgs/success_standard.gcg",
+                            ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "goto end", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "endgame", ERROR_STATUS_SUCCESS);
+  // Committing saves the endgame results onto the turn.
+  assert_config_exec_status(config, "t", ERROR_STATUS_SUCCESS);
+  const int num_events =
+      game_history_get_num_events(config_get_game_history(config));
+
+  exec_with_path(config, "load", nwl20_path,
+                 ERROR_STATUS_GCG_PARSE_MOVE_SCORING_ERROR);
+  assert_restored_standard_game(config, num_events);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shendgame", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "next", ERROR_STATUS_SUCCESS);
+
+  exec_with_path(config, "load", bad_french_path,
+                 ERROR_STATUS_GCG_PARSE_MOVE_VALIDATION_ERROR);
+  assert_restored_standard_game(config, num_events);
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shendgame", ERROR_STATUS_SUCCESS);
+
+  exec_with_path(config, "load", french_path, ERROR_STATUS_SUCCESS);
+  assert(strings_equal(ld_get_name(config_get_ld(config)), "french"));
+  assert(game_history_get_num_events(config_get_game_history(config)) == 2);
+  assert_config_exec_status(config, "shgame", ERROR_STATUS_SUCCESS);
+
+  config_destroy(config);
+  free(french_path);
+  free(bad_french_path);
+  free(nwl20_path);
+  test_platform_remove_directory_tree(directory);
+  free(directory);
+}
+
+// The whole point of saving results per GameEvent rather than in a
+// single "last turn" slot: navigating game history backward/forward
+// shows the analysis that was actually done for whichever turn is about
+// to be played from the current position -- i.e. the turn whose rack
+// matches what's actually on screen -- not whatever was most recently
+// committed and not the turn that was just played to get here.
+void test_config_game_event_results_follow_navigation(void) {
+  // -sinfer false: this test is only about move_list/sim_results, and
+  // sim-with-inference (the default) can fail outright once a turn passes
+  // with no tiles played/exchanged, which "com 1" may do depending on
+  // what's in the generated move list.
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -wmp true -s1 equity -s2 equity -r1 all -r2 all "
+      "-numplays 15 -mode sync -sinfer false");
+  assert_config_exec_status(
+      config,
+      "cgp 15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 ABCDEFG/HIJKLM? "
+      "0/0 0",
+      ERROR_STATUS_SUCCESS);
+
+  // Turn 1: only "gen" (no sim) before committing.
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com 1", ERROR_STATUS_SUCCESS);
+
+  // Turn 2: "gen" then "sim" before committing.
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "sim -iterations 100",
+                            ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com pass", ERROR_STATUS_SUCCESS);
+
+  const GameHistory *game_history = config_get_game_history(config);
+  const GameEvent *event_1 = game_history_get_event(game_history, 0);
+  const GameEvent *event_2 = game_history_get_event(game_history, 1);
+  // Turn 1 only ever generated moves, so only a move_list was saved.
+  assert(game_event_get_move_list(event_1));
+  assert(!game_event_get_sim_results(event_1));
+  // Turn 2 simmed, so its sim_results were saved (in addition to its
+  // move_list).
+  assert(game_event_get_sim_results(event_2));
+
+  // Right after committing turn 2, we're at the live frontier (no turn 3
+  // recorded yet) with nothing freshly generated, so shmoves finds
+  // nothing -- turn 2's own results belong to the position it was
+  // decided from, not to the new position on screen now.
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
+
+  // Stepping back to the position turn 2 was actually decided from shows
+  // turn 2's (sim) results: that's the turn about to be played here.
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_SUCCESS);
+
+  // Stepping back once more, to the position turn 1 was decided from,
+  // shows turn 1's (plain move_list) results instead of turn 2's.
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_SUCCESS);
+
+  // "goto start" lands on that same position (before turn 1 was played),
+  // so it shows turn 1's results too, not nothing.
+  assert_config_exec_status(config, "goto start", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_SUCCESS);
+
+  // "goto end" returns to the live frontier, where there's nothing to
+  // fall back to again.
+  assert_config_exec_status(config, "goto end", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
+
+  // Turn 3: "gen" (no sim) before committing.
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com 1", ERROR_STATUS_SUCCESS);
+
+  // Turn 4: "gen" then a quick "sim" before committing. Only a couple of
+  // moves/iterations: this isn't testing anything about the sim itself,
+  // just that its saved results are still reachable after navigating more
+  // than 2 turns away in either direction.
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "sim -numplays 2 -iterations 2",
+                            ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com 1", ERROR_STATUS_SUCCESS);
+
+  // Turn 5: "gen" (no sim) before committing.
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com 1", ERROR_STATUS_SUCCESS);
+
+  // Turn 6: "gen" then another quick "sim" before committing.
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "sim -numplays 2 -iterations 2",
+                            ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com 1", ERROR_STATUS_SUCCESS);
+
+  const GameEvent *event_4 = game_history_get_event(game_history, 3);
+  assert(game_event_get_sim_results(event_4));
+
+  // Currently positioned at the live frontier, just after committing turn
+  // 6. "goto 3" jumps back to the position turn 4 was decided from (3
+  // turns already played, turn 4 next): turn 4's sim results are shown,
+  // matching the rack actually on screen at that position.
+  assert_config_exec_status(config, "goto 3", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_SUCCESS);
+
+  // From there, "goto end" jumps forward to the live frontier again,
+  // past turn 6 (the last recorded turn), where there's nothing to fall
+  // back to.
+  assert_config_exec_status(config, "goto end", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_NO_MOVES_TO_SHOW);
+
+  config_destroy(config);
+}
+
+// A sim that runs inference internally (-sinfer true) leaves
+// inference_results's own "valid for current game state" flag restored to
+// its pre-sim state, so a naive check of that flag alone would skip saving
+// the inference onto the GameEvent. config_save_live_results_to_game_event
+// also checks sim_used_valid_inference for exactly this case, so both the
+// sim_results and the inference_results it used end up saved on the same
+// GameEvent.
+void test_config_sim_with_inference_results_saved_to_game_event(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -wmp true -s1 equity -s2 equity -r1 all -r2 all "
+      "-numplays 2 -mode sync -sinfer true");
+  assert_config_exec_status(
+      config,
+      "cgp 15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 ABCDEFG/HIJKLM? "
+      "0/0 0",
+      ERROR_STATUS_SUCCESS);
+
+  // Turn 1: a played event must already exist in the history for a sim to
+  // use inference at all (it infers the opponent's leave from their move).
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com 1", ERROR_STATUS_SUCCESS);
+
+  // Turn 2: "gen" then a quick sim that runs inference internally.
+  assert_config_exec_status(config, "gen", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "sim -iterations 2", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "com 1", ERROR_STATUS_SUCCESS);
+
+  const GameHistory *game_history = config_get_game_history(config);
+  const GameEvent *event_2 = game_history_get_event(game_history, 1);
+  assert(game_event_get_sim_results(event_2));
+  assert(game_event_get_inference_results(event_2));
+
+  // Stepping back to the position turn 2 was decided from shows both:
+  // shmoves for the sim results, and shinfer falling back to the
+  // inference results saved alongside them.
+  assert_config_exec_status(config, "prev", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shmoves", ERROR_STATUS_SUCCESS);
+  assert_config_exec_status(config, "shinfer", ERROR_STATUS_SUCCESS);
+
+  config_destroy(config);
+}
+
+// Narrow glyphs replace only the ones a Windows console font lacks.
+void test_narrow_glyphs(void) {
+  GameStringOptions *gso = game_string_options_create_pretty();
+  game_string_options_use_narrow_glyphs(gso);
+  assert(gso->board_tile_glyphs == GAME_STRING_BOARD_TILE_GLYPHS_PRIMARY);
+  assert(gso->board_column_label == GAME_STRING_BOARD_COLUMN_LABEL_ASCII);
+  assert(gso->on_turn_marker == GAME_STRING_ON_TURN_MARKER_ASCII);
+  assert(gso->board_color == GAME_STRING_BOARD_COLOR_TRUECOLOR);
+  assert(gso->board_border == GAME_STRING_BOARD_BORDER_BOX_DRAWING);
+  assert(gso->on_turn_color == GAME_STRING_ON_TURN_COLOR_ANSI_GREEN);
+  assert(gso->on_turn_score_style == GAME_STRING_ON_TURN_SCORE_BOLD);
+  game_string_options_destroy(gso);
+}
+
 void test_config(void) {
   test_game_display();
+  test_narrow_glyphs();
   test_trie();
+  test_config_help();
   test_config_anno();
   test_config_anno_challenge();
   test_config_anno_endgame_rack();
   test_config_load_incomplete();
+  test_config_six_pass_empty_bag();
+  test_config_six_pass_partial_bag();
   test_config_challenge_rack();
   test_config_export();
   test_config_load_error_cases();
   test_config_load_success();
   test_config_exec_parse_args();
+  test_config_rack_and_gen();
+  test_config_sim_opp_rack_not_in_bag();
   test_config_lexical_data();
   test_config_wmp();
   test_config_note_move_interpolation();
   test_config_fg_required();
+  test_config_load_settings();
+  test_config_saved_settings();
+  test_config_table_auto_settings();
+  test_config_auto_tables_bind_both_players();
+  test_config_builds_missing_tables_on_first_use();
+  test_config_auto_tables_from_build_to_eviction();
   test_config_exchange_blank();
   test_config_utility_blend();
+  test_config_move_list_saved_to_game_event();
+  test_config_commit_by_index_uses_saved_move_list();
+  test_config_sim_results_saved_to_game_event();
+  test_config_new_game_drops_previous_analysis();
+  test_config_cgp_starts_new_history();
+  test_config_continue_on_coldstart();
+  test_config_lexicon_change_rebuilds_games();
+  test_config_lexicon_change_clears_endgame_tt();
+  test_config_bingo_bonus_change_clears_endgame_tt();
+  test_config_load_replacing_lexical_data();
+  test_config_game_event_results_follow_navigation();
+  test_config_sim_with_inference_results_saved_to_game_event();
 }

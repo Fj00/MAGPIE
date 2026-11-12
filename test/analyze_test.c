@@ -1,13 +1,14 @@
 #include "analyze_test.h"
 
+#include "../src/compat/cfile.h"
 #include "../src/impl/config.h"
 #include "../src/util/io_util.h"
 #include "../src/util/string_util.h"
+#include "test_platform.h"
 #include "test_util.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 
 static const char *SINGLE_GCG_PATH = "testdata/gcgs/success.gcg";
 static const char *SINGLE_REPORT_PATH = "testdata/gcgs/success_report.txt";
@@ -25,9 +26,7 @@ static const char *MINIMAL_GCG_HEADER = "#character-encoding UTF-8\n"
 // tests. Returns the directory path (caller must free). The file is removed by
 // the caller.
 static char *make_temp_gcg_dir(void) {
-  char tmp_template[] = "/tmp/magpie_analyze_XXXXXX";
-  char *tmp_dir = mkdtemp(tmp_template);
-  assert(tmp_dir != NULL);
+  char *tmp_dir = test_platform_make_temporary_directory("magpie_analyze_");
 
   const char *gcg_content = "#character-encoding UTF-8\n"
                             "#player1 Tim Tim\n"
@@ -40,17 +39,24 @@ static char *make_temp_gcg_dir(void) {
   assert(error_stack_is_empty(es));
   error_stack_destroy(es);
   free(gcg_path);
-  return string_duplicate(tmp_dir);
+  return tmp_dir;
 }
 
+// Removes everything analyzing the directory can leave in it -- the game, its
+// report, and the tournament summary a directory analysis writes -- and then
+// the directory. The removal is checked: a file this misses would otherwise
+// leave a directory behind on every run.
 static void remove_temp_gcg_dir(const char *dir_path) {
-  char *gcg_path = get_formatted_string("%s/test_game.gcg", dir_path);
-  char *report_path = get_formatted_string("%s/test_game_report.txt", dir_path);
-  (void)remove(gcg_path);
-  (void)remove(report_path);
-  free(gcg_path);
-  free(report_path);
-  (void)rmdir(dir_path);
+  const char *files[] = {"test_game.gcg", "test_game_report.txt",
+                         "tournament_summary.txt"};
+  for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+    char *path = get_formatted_string("%s/%s", dir_path, files[i]);
+    (void)remove(path);
+    free(path);
+  }
+  const int removed = cfile_rmdir(dir_path);
+  assert(removed == 0);
+  (void)removed;
 }
 
 // PATH D1: single GCG file as argument (CSV output, plies=0).
@@ -134,6 +140,58 @@ static void test_analyze_directory(void) {
   char *cmd = get_formatted_string("analyze %s", tmp_dir);
   assert_config_exec_status(config, cmd, ERROR_STATUS_SUCCESS);
   free(cmd);
+
+  // -mistakes defaults to false: no mistake fields in the trailer or
+  // tournament summary.
+  char *report_path = get_formatted_string("%s/test_game_report.txt", tmp_dir);
+  char *report = get_string_from_file_or_die(report_path);
+  assert(!has_substring(report, "small="));
+  free(report);
+  free(report_path);
+
+  char *summary_path =
+      get_formatted_string("%s/tournament_summary.txt", tmp_dir);
+  char *tournament_summary = get_string_from_file_or_die(summary_path);
+  assert(!has_substring(tournament_summary, "Mistakes:"));
+  assert(!has_substring(tournament_summary, "Average MI"));
+  free(tournament_summary);
+  (void)remove(summary_path);
+  free(summary_path);
+
+  remove_temp_gcg_dir(tmp_dir);
+  free(tmp_dir);
+  config_destroy(config);
+}
+
+// PATH B1 + -mistakes true: directory mode threads the mistake-grading
+// fields through the trailer and tournament summary end to end.
+static void test_analyze_directory_with_mistakes(void) {
+  Config *config =
+      config_create_or_die("set -lex CSW21 -plies 0 -mistakes true");
+  char *tmp_dir = make_temp_gcg_dir();
+  char *cmd = get_formatted_string("analyze %s", tmp_dir);
+  assert_config_exec_status(config, cmd, ERROR_STATUS_SUCCESS);
+  free(cmd);
+
+  // Both plays in the fixture GCG are optimal (single legal move each), so
+  // the trailer and tournament summary should report zero mistakes.
+  char *report_path = get_formatted_string("%s/test_game_report.txt", tmp_dir);
+  char *report = get_string_from_file_or_die(report_path);
+  assert(has_substring(report, "small=0 medium=0 large=0 mi=0.00"));
+  free(report);
+  free(report_path);
+
+  char *summary_path =
+      get_formatted_string("%s/tournament_summary.txt", tmp_dir);
+  char *tournament_summary = get_string_from_file_or_die(summary_path);
+  assert(has_substring(tournament_summary, "Mistakes: 0 small, 0 medium, 0 "
+                                           "large (MI 0.00)"));
+  assert(has_substring(tournament_summary, "Average MI per turn: 0.00"));
+  assert(has_substring(tournament_summary, "Average MI per game: 0.00"));
+  free(tournament_summary);
+  (void)remove(summary_path);
+  free(summary_path);
+
   remove_temp_gcg_dir(tmp_dir);
   free(tmp_dir);
   config_destroy(config);
@@ -146,6 +204,132 @@ static void test_analyze_directory_with_player(void) {
   char *cmd = get_formatted_string("analyze %s Tim", tmp_dir);
   assert_config_exec_status(config, cmd, ERROR_STATUS_SUCCESS);
   free(cmd);
+  remove_temp_gcg_dir(tmp_dir);
+  free(tmp_dir);
+  config_destroy(config);
+}
+
+// Reads <dir_path>/<filename> into a newly allocated string.
+static char *get_dir_file_string_or_die(const char *dir_path,
+                                        const char *filename) {
+  char *path = get_formatted_string("%s/%s", dir_path, filename);
+  char *content = get_string_from_file_or_die(path);
+  free(path);
+  return content;
+}
+
+// An unnamed directory run analyzes both players and writes a trailer line
+// for each. A later run naming one player reuses that report (it is not
+// rewritten) and counts only the named player: in the fixture GCG Tim's
+// play is optimal and Josh's DEFO loses 4.06 equity, so Tim's averages must
+// not include Josh's loss.
+static void test_analyze_directory_unnamed_then_named(void) {
+  Config *config = config_create_or_die("set -lex CSW21 -plies 0 -hr true");
+  char *tmp_dir = make_temp_gcg_dir();
+  char *cmd = get_formatted_string("analyze %s", tmp_dir);
+  assert_config_exec_status(config, cmd, ERROR_STATUS_SUCCESS);
+  free(cmd);
+
+  char *report = get_dir_file_string_or_die(tmp_dir, "test_game_report.txt");
+  assert(has_substring(report, "=== Analysis Complete: player=0 turns=1 "
+                               "wpl=0.00 eql=0.00 aeql=0.00 ==="));
+  assert(has_substring(report, "=== Analysis Complete: player=1 turns=1 "
+                               "wpl=0.00 eql=4.06 aeql=4.06 ==="));
+  char *tournament_summary =
+      get_dir_file_string_or_die(tmp_dir, "tournament_summary.txt");
+  assert(has_substring(tournament_summary,
+                       "=== Tournament Averages: Josh ===\nGames: 1\n"));
+  assert(has_substring(tournament_summary,
+                       "=== Tournament Averages: Tim ===\nGames: 1\n"));
+  assert(!has_substring(tournament_summary, "=== Tournament Averages ==="));
+  free(tournament_summary);
+
+  cmd = get_formatted_string("analyze %s Tim", tmp_dir);
+  assert_config_exec_status(config, cmd, ERROR_STATUS_SUCCESS);
+  free(cmd);
+
+  // Skipped: the report still holds the unnamed run's trailer for Josh.
+  char *report_after =
+      get_dir_file_string_or_die(tmp_dir, "test_game_report.txt");
+  assert(strings_equal(report, report_after));
+  free(report_after);
+  free(report);
+
+  tournament_summary =
+      get_dir_file_string_or_die(tmp_dir, "tournament_summary.txt");
+  assert(has_substring(tournament_summary, "=== Game Summary: Tim ==="));
+  assert(!has_substring(tournament_summary, "=== Game Summary: Josh ==="));
+  assert(has_substring(tournament_summary,
+                       "=== Tournament Averages: Tim ===\nGames: 1\n"
+                       "Turns: 1\n"));
+  assert(!has_substring(tournament_summary, "Tournament Averages: Josh"));
+  assert(has_substring(tournament_summary, "Average EqL per game: 0.00"));
+  assert(!has_substring(tournament_summary, "4.06"));
+  free(tournament_summary);
+
+  remove_temp_gcg_dir(tmp_dir);
+  free(tmp_dir);
+  config_destroy(config);
+}
+
+// A directory run naming one player writes a trailer line for that player
+// only, so a later unnamed run must re-analyze the game rather than count
+// one player's losses as the whole game's.
+static void test_analyze_directory_named_then_unnamed(void) {
+  Config *config = config_create_or_die("set -lex CSW21 -plies 0");
+  char *tmp_dir = make_temp_gcg_dir();
+  char *cmd = get_formatted_string("analyze %s Tim", tmp_dir);
+  assert_config_exec_status(config, cmd, ERROR_STATUS_SUCCESS);
+  free(cmd);
+
+  char *report = get_dir_file_string_or_die(tmp_dir, "test_game_report.txt");
+  assert(has_substring(report, "=== Analysis Complete: player=0 "));
+  assert(!has_substring(report, "=== Analysis Complete: player=1 "));
+  free(report);
+
+  cmd = get_formatted_string("analyze %s", tmp_dir);
+  assert_config_exec_status(config, cmd, ERROR_STATUS_SUCCESS);
+  free(cmd);
+
+  report = get_dir_file_string_or_die(tmp_dir, "test_game_report.txt");
+  assert(has_substring(report, "=== Analysis Complete: player=0 "));
+  assert(has_substring(report, "=== Analysis Complete: player=1 "));
+  free(report);
+  char *tournament_summary =
+      get_dir_file_string_or_die(tmp_dir, "tournament_summary.txt");
+  assert(has_substring(tournament_summary, "Tournament Averages: Tim"));
+  assert(has_substring(tournament_summary, "Tournament Averages: Josh"));
+  free(tournament_summary);
+
+  remove_temp_gcg_dir(tmp_dir);
+  free(tmp_dir);
+  config_destroy(config);
+}
+
+// A report with the single combined trailer written before trailers were
+// per player doesn't say which players it covers, so it is re-analyzed.
+static void test_analyze_directory_old_trailer(void) {
+  Config *config = config_create_or_die("set -lex CSW21 -plies 0");
+  char *tmp_dir = make_temp_gcg_dir();
+  char *report_path = get_formatted_string("%s/test_game_report.txt", tmp_dir);
+  ErrorStack *error_stack = error_stack_create();
+  write_string_to_file(report_path, "w",
+                       "\n=== Analysis Complete: turns=2 wpl=0.00 eql=4.06 "
+                       "aeql=4.06 ===\n",
+                       error_stack);
+  assert(error_stack_is_empty(error_stack));
+  error_stack_destroy(error_stack);
+
+  char *cmd = get_formatted_string("analyze %s Tim", tmp_dir);
+  assert_config_exec_status(config, cmd, ERROR_STATUS_SUCCESS);
+  free(cmd);
+
+  char *report = get_string_from_file_or_die(report_path);
+  assert(!has_substring(report, "=== Analysis Complete: turns="));
+  assert(has_substring(report, "=== Analysis Complete: player=0 turns=1 "));
+  free(report);
+  free(report_path);
+
   remove_temp_gcg_dir(tmp_dir);
   free(tmp_dir);
   config_destroy(config);
@@ -186,6 +370,47 @@ static void test_analyze_vertical_opening_transposable(void) {
   assert_config_exec_status(config, "analyze", ERROR_STATUS_SUCCESS);
   char *report = get_string_from_file_or_die(PLAYER_NAMES_REPORT_PATH);
   assert(has_substring(report, "H7 QI,-,0.00"));
+  // -mistakes defaults to false: no mistake_size/mistake_index CSV columns.
+  assert(!has_substring(report, "mistake_size"));
+  free(report);
+  remove_or_die(PLAYER_NAMES_REPORT_PATH);
+  config_destroy(config);
+}
+
+// -mistakes true: CSV gains mistake_size/mistake_index columns.
+static void test_analyze_mistakes_flag_csv(void) {
+  Config *config =
+      config_create_or_die("set -lex CSW21 -plies 0 -mistakes true");
+  load_game_history_with_gcg_string(config, MINIMAL_GCG_HEADER,
+                                    ">Tim: QIRESIT H7 QI +22 22\n");
+  (void)remove(PLAYER_NAMES_REPORT_PATH);
+  assert_config_exec_status(config, "analyze", ERROR_STATUS_SUCCESS);
+  char *report = get_string_from_file_or_die(PLAYER_NAMES_REPORT_PATH);
+  assert(has_substring(report,
+                       "turn,player,rack,actual,best,equity_lost,win_pct_lost,"
+                       "adjusted_equity_lost,mistake_size,mistake_index"));
+  // Optimal play (no mistake): mistake_size/mistake_index CSV columns are
+  // appended after win_pct_lost/adjusted_equity_lost.
+  assert(has_substring(report, "H7 QI,-,0.00,0.00,0.00,none,0.00"));
+  free(report);
+  remove_or_die(PLAYER_NAMES_REPORT_PATH);
+  config_destroy(config);
+}
+
+// -mistakes true, -hr true: Game Summary gains the MI column and a
+// "Mistakes: ..." line.
+static void test_analyze_mistakes_flag_human_readable(void) {
+  Config *config =
+      config_create_or_die("set -lex CSW21 -plies 0 -hr true -mistakes true");
+  load_game_history_with_gcg_string(config, MINIMAL_GCG_HEADER,
+                                    ">Tim: AEITW 8D WAITE +24 24\n"
+                                    ">Josh: DEEFINO 7C DEFO +22 22\n");
+  (void)remove(PLAYER_NAMES_REPORT_PATH);
+  assert_config_exec_status(config, "analyze", ERROR_STATUS_SUCCESS);
+  char *report = get_string_from_file_or_die(PLAYER_NAMES_REPORT_PATH);
+  assert(has_substring(report, "MI"));
+  assert(has_substring(report, "Mistakes: 0 small, 0 medium, 0 large (MI "
+                               "0.00)"));
   free(report);
   remove_or_die(PLAYER_NAMES_REPORT_PATH);
   config_destroy(config);
@@ -199,18 +424,27 @@ void test_analyze(void) {
   test_analyze_player_filter_partial_match();
   test_analyze_gcg_and_player();
   test_analyze_directory();
+  test_analyze_directory_with_mistakes();
   test_analyze_directory_with_player();
+  test_analyze_directory_unnamed_then_named();
+  test_analyze_directory_named_then_unnamed();
+  test_analyze_directory_old_trailer();
   test_analyze_no_lexicon();
   test_analyze_no_game();
   test_analyze_unknown_player();
   test_analyze_vertical_opening_transposable();
+  test_analyze_mistakes_flag_csv();
+  test_analyze_mistakes_flag_human_readable();
 }
 
 // Slow test: plies=2 simulation on a real GCG. Invoked only when explicitly
-// requested (e.g., ./bin/magpie_test analyze_sim).
+// requested (e.g., ./bin/magpie_test analyze_sim). The game's pre-endgame
+// turn (1 in the bag) gets a PEG time limit: untimed, analyze solves it
+// completely, which on one thread takes minutes, and far longer under the
+// sanitizers.
 void test_analyze_sim(void) {
   Config *config = config_create_or_die(
-      "set -lex CSW21 -plies 2 -hr true -iter 50 -numplays 5");
+      "set -lex CSW21 -plies 2 -hr true -iter 50 -numplays 5 -pegtlim 5");
   assert_config_exec_status(config, "analyze testdata/gcgs/success.gcg",
                             ERROR_STATUS_SUCCESS);
   config_destroy(config);

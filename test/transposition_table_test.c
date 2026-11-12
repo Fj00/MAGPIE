@@ -1,16 +1,123 @@
+#include "transposition_table_test.h"
+
+#include "../src/compat/memory_info.h"
+#include "../src/def/board_defs.h"
+#include "../src/def/rack_defs.h"
 #include "../src/ent/transposition_table.h"
+#include "../src/ent/xoshiro.h"
+#include "../src/ent/zobrist.h"
+#include "../src/impl/peg_memory.h"
+#include "../src/util/io_util.h"
 #include <assert.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+// A large table is zeroed in slices on several threads. Three slices and a
+// remainder that is not a whole slice must leave every byte zero, and a table
+// zeroed this way starts empty.
+static void test_transposition_table_parallel_zero(void) {
+  const size_t bytes = (3 * (size_t)TT_ZERO_MIN_SLICE_BYTES) + 47;
+  unsigned char *buffer = malloc_or_die(bytes);
+  memset(buffer, 0xAB, bytes);
+  tt_zero_table(buffer, bytes, 3);
+  const unsigned char zeros[4096] = {0};
+  for (size_t offset = 0; offset < bytes; offset += sizeof(zeros)) {
+    const size_t span =
+        bytes - offset < sizeof(zeros) ? bytes - offset : sizeof(zeros);
+    assert(memcmp(buffer + offset, zeros, span) == 0);
+  }
+  free(buffer);
+
+  TranspositionTable *tt =
+      transposition_table_create_with_threads(0, TT_MIN_SIZE_POWER, 4);
+  assert(tt->size_power_of_2 == TT_MIN_SIZE_POWER);
+  const uint64_t num_elems = (uint64_t)1 << tt->size_power_of_2;
+  for (uint64_t elem_idx = 0; elem_idx < num_elems; elem_idx += 4099) {
+    assert(atomic_load(&tt->table[elem_idx * 2]) == 0);
+    assert(atomic_load(&tt->table[(elem_idx * 2) + 1]) == 0);
+  }
+  assert(atomic_load(&tt->table[(num_elems * 2) - 1]) == 0);
+  assert(!ttentry_valid(transposition_table_lookup(tt, 0x123456789ULL)));
+  transposition_table_destroy(tt);
+}
 
 void test_transposition_table(void) {
-  // Passing 0 clamps to the platform minimum: 2^24 native, 2^21 WASM.
+  test_transposition_table_parallel_zero();
+  const uint64_t zobrist_bytes =
+      sizeof(Zobrist) + prng_allocation_size() +
+      ((uint64_t)BOARD_DIM * BOARD_DIM * sizeof(uint64_t *)) +
+      ((uint64_t)BOARD_DIM * BOARD_DIM * ZOBRIST_MAX_LETTERS * 2 *
+       sizeof(uint64_t)) +
+      (2ULL * ZOBRIST_MAX_LETTERS * sizeof(uint64_t *)) +
+      (2ULL * ZOBRIST_MAX_LETTERS * (RACK_SIZE + 1) * sizeof(uint64_t));
+  assert(zobrist_allocation_size() == zobrist_bytes);
+  // PEG workers share one endgame table: the per-worker fraction scaled by the
+  // largest power of two not above the worker count. One worker keeps its own.
+  for (int workers = 1; workers <= 40; workers++) {
+    int largest_power_of_two = 1;
+    while (largest_power_of_two * 2 <= workers) {
+      largest_power_of_two *= 2;
+    }
+    const double shared_fraction = peg_memory_shared_fraction(0.01, workers);
+    assert(shared_fraction == 0.01 * largest_power_of_two);
+    assert(shared_fraction <= 0.01 * workers);
+    (void)shared_fraction;
+  }
+  assert(peg_memory_shared_fraction(0.05, 1) == 0.05);
+  if (search_memory_is_bounded()) {
+    const uint64_t budget_base = get_search_memory_budget_base();
+    assert(budget_base == 256ULL * 1024 * 1024);
+    // Deep PEG sizes its shared endgame table from a table per worker plus the
+    // helper. Check actual allocations, including ABDADA storage, at every
+    // supported count: the per-worker tables fit the budget together, and the
+    // shared table has no more entries than they would.
+    for (int budget_mb = 16; budget_mb <= 32; budget_mb *= 2) {
+      const int capacity = peg_memory_max_tables((double)budget_mb / 256);
+      assert(capacity >= 33);
+      double worker_fraction = 0;
+      const bool over_budget = peg_memory_worker_fraction(
+          (double)budget_mb / 256, capacity + 1, &worker_fraction);
+      assert(!over_budget);
+      (void)over_budget;
+      for (int workers = 1; workers <= capacity; workers++) {
+        const bool fits = peg_memory_worker_fraction((double)budget_mb / 256,
+                                                     workers, &worker_fraction);
+        assert(fits);
+        (void)fits;
+        TranspositionTable *worker_tt = transposition_table_create_with_minimum(
+            worker_fraction, PEG_TT_MIN_SIZE_POWER);
+        const uint64_t bytes =
+            ((uint64_t)TTENTRY_SIZE_BYTES << worker_tt->size_power_of_2) +
+            NPROC_SIZE * sizeof(atomic_uchar) + sizeof(TranspositionTable) +
+            zobrist_bytes;
+        assert(bytes * workers <= (uint64_t)budget_mb * 1024 * 1024);
+        TranspositionTable *shared_tt = transposition_table_create_with_minimum(
+            peg_memory_shared_fraction(worker_fraction, workers),
+            PEG_TT_MIN_SIZE_POWER);
+        assert(((uint64_t)1 << shared_tt->size_power_of_2) <=
+               ((uint64_t)workers << worker_tt->size_power_of_2));
+        assert(shared_tt->size_power_of_2 >= worker_tt->size_power_of_2);
+        transposition_table_destroy(shared_tt);
+        transposition_table_destroy(worker_tt);
+      }
+      TranspositionTable *endgame_tt =
+          transposition_table_create((double)budget_mb / 256);
+      assert(((uint64_t)TTENTRY_SIZE_BYTES << endgame_tt->size_power_of_2) ==
+             (uint64_t)budget_mb * 1024 * 1024);
+      transposition_table_destroy(endgame_tt);
+    }
+  }
+  // Passing 0 clamps to the platform minimum.
   TranspositionTable *tt = transposition_table_create(0);
   assert(tt->size_power_of_2 == TT_MIN_SIZE_POWER);
 
-  // Use a hash < 2^61 so all stored bits survive the round-trip on both
-  // native (size_power=24, 0 bits lost) and WASM (size_power=21, 3 bits lost).
-  const uint64_t base_hash = 1234567890123456789ULL;
+  // The top bits are set so this hash would be lost if the stored bits were
+  // reconstructed and compared in full: only 40 hash bits are stored, so
+  // small tables (WASM, size_power=21) drop the top bits of the hash.
+  const uint64_t base_hash = 0xF234567890ABCDEFULL;
 
   TTEntry entry;
   ttentry_reset(&entry);
@@ -44,6 +151,54 @@ void test_transposition_table(void) {
   assert(te2.tiny_move == 0);
   assert(atomic_load(&tt->t2_collisions) == 1);
   assert(atomic_load(&tt->lookups) == 3);
+
+  // Entries whose hashes share a bucket but differ in the stored bits coexist,
+  // up to the bucket size.
+  const uint64_t bucket_bits = 0x5A5A5AULL & tt->bucket_mask;
+  uint64_t bucket_hashes[TT_BUCKET_SIZE + 1];
+  for (int i = 0; i <= TT_BUCKET_SIZE; i++) {
+    bucket_hashes[i] = ((uint64_t)(i + 1) << tt->index_bits) | bucket_bits;
+  }
+  for (int i = 0; i < TT_BUCKET_SIZE; i++) {
+    TTEntry e;
+    ttentry_reset(&e);
+    e.score = (int16_t)i;
+    e.flag_and_depth = (uint8_t)((TT_EXACT << 6) + 5 * (i + 1));
+    transposition_table_store(tt, bucket_hashes[i], e);
+  }
+  for (int i = 0; i < TT_BUCKET_SIZE; i++) {
+    const TTEntry e = transposition_table_lookup(tt, bucket_hashes[i]);
+    assert(ttentry_valid(e));
+    assert(ttentry_score(e) == i);
+    assert(ttentry_depth(e) == 5 * (i + 1));
+  }
+
+  // Storing the same position again replaces its entry in place.
+  TTEntry same;
+  ttentry_reset(&same);
+  same.score = 99;
+  same.flag_and_depth = (TT_LOWER << 6) + 1;
+  transposition_table_store(tt, bucket_hashes[1], same);
+  const TTEntry same_lu = transposition_table_lookup(tt, bucket_hashes[1]);
+  assert(ttentry_score(same_lu) == 99);
+  assert(ttentry_depth(same_lu) == 1);
+  assert(ttentry_valid(transposition_table_lookup(tt, bucket_hashes[0])));
+
+  // A new position in a full bucket evicts the shallowest entry (now the one
+  // that was just overwritten with depth 1) and keeps the deeper ones.
+  TTEntry extra;
+  ttentry_reset(&extra);
+  extra.score = 77;
+  extra.flag_and_depth = (TT_EXACT << 6) + 30;
+  transposition_table_store(tt, bucket_hashes[TT_BUCKET_SIZE], extra);
+  assert(ttentry_score(transposition_table_lookup(
+             tt, bucket_hashes[TT_BUCKET_SIZE])) == 77);
+  assert(!ttentry_valid(transposition_table_lookup(tt, bucket_hashes[1])));
+  for (int i = 0; i < TT_BUCKET_SIZE; i++) {
+    if (i != 1) {
+      assert(ttentry_valid(transposition_table_lookup(tt, bucket_hashes[i])));
+    }
+  }
 
   transposition_table_destroy(tt);
 }

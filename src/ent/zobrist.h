@@ -26,6 +26,18 @@ typedef struct Zobrist {
   int board_dim;
 } Zobrist;
 
+// Includes every separately allocated array and the PRNG, not just pointers.
+static inline size_t zobrist_allocation_size(void) {
+  const size_t squares = (size_t)BOARD_DIM * BOARD_DIM;
+  const size_t board_bytes =
+      squares * (sizeof(uint64_t *) +
+                 ((size_t)ZOBRIST_MAX_LETTERS * 2 * sizeof(uint64_t)));
+  const size_t rack_bytes =
+      (size_t)2 * ZOBRIST_MAX_LETTERS *
+      (sizeof(uint64_t *) + ((RACK_SIZE + 1) * sizeof(uint64_t)));
+  return sizeof(Zobrist) + prng_allocation_size() + board_bytes + rack_bytes;
+}
+
 static Zobrist *zobrist_create(uint64_t seed) {
   Zobrist *z = malloc_or_die(sizeof(Zobrist));
   z->prng = prng_create(seed);
@@ -123,10 +135,13 @@ zobrist_calculate_hash(const Zobrist *z, const Board *game_board,
   return key;
 }
 
-inline static uint64_t zobrist_add_move(const Zobrist *z, uint64_t key,
-                                        const Move *move, const Rack *move_rack,
-                                        bool was_our_move, int scoreless_turns,
-                                        int last_scoreless_turns) {
+// move_rack is the mover's rack: what is left of it after the move, or, with
+// rack_holds_move, the rack before the move, the tiles it plays included.
+inline static uint64_t
+zobrist_add_move_impl(const Zobrist *z, uint64_t key, const Move *move,
+                      const Rack *move_rack, bool rack_holds_move,
+                      bool was_our_move, int scoreless_turns,
+                      int last_scoreless_turns) {
   // Add a move to the Zobrist hash.
 
   // For every letter in the move (assume it's only a tile placement or
@@ -139,11 +154,6 @@ inline static uint64_t zobrist_add_move(const Zobrist *z, uint64_t key,
     rack_table = z->their_rack_table;
   }
   if (move->move_type != GAME_EVENT_PASS) {
-    // create placeholder rack to keep track of what our rack would be
-    // before we made the play.
-    MachineLetter placeholder_rack[ZOBRIST_MAX_LETTERS];
-    memset(placeholder_rack, 0, ZOBRIST_MAX_LETTERS);
-
     int row = move_get_row_start(move);
     int col = move_get_col_start(move);
     bool vertical = move_get_dir(move) == BOARD_VERTICAL_DIRECTION;
@@ -161,26 +171,46 @@ inline static uint64_t zobrist_add_move(const Zobrist *z, uint64_t key,
         board_tile = get_unblanked_machine_letter(tile) + ZOBRIST_MAX_LETTERS;
       }
       key ^= z->pos_table[new_row * BOARD_DIM + new_col][board_tile];
-      // Build up placeholder rack.
-      int tile_idx = get_is_blanked(tile) ? 0 : tile;
-      placeholder_rack[tile_idx]++;
     }
-    // move_rack contains the left-over tiles
-    for (int idx = 0; idx < move_rack->dist_size; idx++) {
-      for (int j = 0; j < move_rack->array[idx]; j++) {
-        placeholder_rack[idx]++;
-      }
-    }
-    // now "play" all the tiles in the placeholder rack
+    // move_rack contains the left-over tiles. Playing the copies of a tile
+    // one at a time, from the leftover count plus the copies played down to
+    // the leftover count, XORs the rack table at every count in between
+    // twice, so only the first and last remain. Each tile is handled at its
+    // first copy in the move.
     for (int idx = 0; idx < move->tiles_length; idx++) {
       MachineLetter tile = move->tiles[idx];
       if (tile == PLAYED_THROUGH_MARKER) {
         continue;
       }
       int tile_idx = get_is_blanked(tile) ? 0 : tile;
-      key ^= rack_table[tile_idx][placeholder_rack[tile_idx]];
-      placeholder_rack[tile_idx]--;
-      key ^= rack_table[tile_idx][placeholder_rack[tile_idx]];
+      bool seen = false;
+      for (int earlier_idx = 0; earlier_idx < idx; earlier_idx++) {
+        MachineLetter earlier = move->tiles[earlier_idx];
+        if (earlier != PLAYED_THROUGH_MARKER &&
+            (get_is_blanked(earlier) ? 0 : earlier) == tile_idx) {
+          seen = true;
+          break;
+        }
+      }
+      if (seen) {
+        continue;
+      }
+      int copies = 1;
+      for (int later_idx = idx + 1; later_idx < move->tiles_length;
+           later_idx++) {
+        MachineLetter later = move->tiles[later_idx];
+        if (later != PLAYED_THROUGH_MARKER &&
+            (get_is_blanked(later) ? 0 : later) == tile_idx) {
+          copies++;
+        }
+      }
+      int leftover = move_rack->array[tile_idx];
+      if (rack_holds_move) {
+        leftover -= copies;
+        assert(leftover >= 0);
+      }
+      key ^= rack_table[tile_idx][leftover + copies];
+      key ^= rack_table[tile_idx][leftover];
     }
   }
 
@@ -193,6 +223,27 @@ inline static uint64_t zobrist_add_move(const Zobrist *z, uint64_t key,
   key ^= z->their_turn;
 
   return key;
+}
+
+// move_rack is what the move leaves of the mover's rack.
+inline static uint64_t zobrist_add_move(const Zobrist *z, uint64_t key,
+                                        const Move *move, const Rack *move_rack,
+                                        bool was_our_move, int scoreless_turns,
+                                        int last_scoreless_turns) {
+  return zobrist_add_move_impl(z, key, move, move_rack, false, was_our_move,
+                               scoreless_turns, last_scoreless_turns);
+}
+
+// zobrist_add_move for a move not played yet: rack_before_move is the mover's
+// rack with the move's tiles still on it, and scoreless_turns the count the
+// move will leave.
+inline static uint64_t
+zobrist_add_unplayed_move(const Zobrist *z, uint64_t key, const Move *move,
+                          const Rack *rack_before_move, bool was_our_move,
+                          int scoreless_turns, int last_scoreless_turns) {
+  return zobrist_add_move_impl(z, key, move, rack_before_move, true,
+                               was_our_move, scoreless_turns,
+                               last_scoreless_turns);
 }
 
 #endif

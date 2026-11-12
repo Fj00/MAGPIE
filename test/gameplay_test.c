@@ -1,7 +1,11 @@
+#include "gameplay_test.h"
+
 #include "../src/def/board_defs.h"
 #include "../src/def/equity_defs.h"
 #include "../src/def/game_defs.h"
 #include "../src/def/game_history_defs.h"
+#include "../src/def/gameplay_defs.h"
+#include "../src/def/letter_distribution_defs.h"
 #include "../src/def/move_defs.h"
 #include "../src/def/rack_defs.h"
 #include "../src/ent/bag.h"
@@ -17,12 +21,16 @@
 #include "../src/impl/config.h"
 #include "../src/impl/gameplay.h"
 #include "../src/impl/move_gen.h"
+#include "../src/impl/rack_draw.h"
 #include "../src/util/io_util.h"
 #include "test_constants.h"
 #include "test_util.h"
 #include <assert.h>
+#include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 void return_racks_to_bag(const Game *game) {
@@ -577,6 +585,42 @@ void test_playmove(void) {
   config_destroy(config);
 }
 
+// With a known tile, the rest of the rack is a random draw from the other
+// unseen tiles, whichever end of the bag the player draws from: over many
+// seeds, the number of further copies of the known letter matches its
+// expectation.
+static void test_set_random_rack_fill_is_random(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -s1 equity -s2 equity -r1 all -r2 all -numplays 1");
+  Game *game = config_game_create(config);
+  const LetterDistribution *ld = game_get_ld(game);
+  Rack *known_rack = rack_create(ld_get_size(ld));
+  rack_set_to_string(ld, known_rack, "E");
+  const MachineLetter e = ld_hl_to_ml(ld, "E");
+  // CSW21 has 12 Es: after the known one, 11 among the other 99 tiles, 6 of
+  // which are drawn.
+  const double expected = 6.0 * 11.0 / 99.0;
+  const int trials = 20000;
+  for (int player_index = 0; player_index < 2; player_index++) {
+    double total = 0.0;
+    for (int trial = 0; trial < trials; trial++) {
+      game_reset(game);
+      game_seed(game, (uint64_t)trial + 1);
+      set_random_rack(game, player_index, known_rack);
+      const Rack *rack = player_get_rack(game_get_player(game, player_index));
+      total += rack_get_letter(rack, e) - 1;
+      return_rack_to_bag(game, player_index);
+    }
+    // The standard error of the mean is about 0.0021; the bug this guards
+    // against moved it by 0.15 or more.
+    const double mean = total / trials;
+    assert(fabs(mean - expected) < 0.02);
+  }
+  rack_destroy(known_rack);
+  game_destroy(game);
+  config_destroy(config);
+}
+
 void test_set_random_rack(void) {
   Config *config = config_create_or_die(
       "set -lex CSW21 -s1 equity -s2 equity -r1 all -r2 all -numplays 1");
@@ -794,12 +838,36 @@ void test_moves_are_similar(void) {
   "5DREKS1F3/8YELL3/4ABASER1U3/4GYM3ZO3/WAITE5OR2J/10OI2A/3QUOIT1PINNER/"      \
   "4RENEGADE2P CDIOST?/AIINOOU 450/392 0"
 
+// The board's cross-sets and cross scores must equal a full recompute.
+static void assert_cross_sets_match_full_recompute(const Game *game) {
+  const Board *board = game_get_board(game);
+  Game *fresh = game_duplicate(game);
+  game_gen_all_cross_sets(fresh);
+  const Board *fresh_board = game_get_board(fresh);
+  for (int r = 0; r < BOARD_DIM; r++) {
+    for (int c = 0; c < BOARD_DIM; c++) {
+      for (int d = 0; d < 2; d++) {
+        assert(board_get_cross_set(board, r, c, d, 0) ==
+               board_get_cross_set(fresh_board, r, c, d, 0));
+        assert(board_get_cross_set(board, r, c, d, 1) ==
+               board_get_cross_set(fresh_board, r, c, d, 1));
+        for (int ci = 0; ci < 2; ci++) {
+          assert(board_get_cross_score(board, r, c, d, ci) ==
+                 board_get_cross_score(fresh_board, r, c, d, ci));
+        }
+      }
+    }
+  }
+  game_destroy(fresh);
+}
+
 // Round-trip invariant the endgame solver relies on instead of recomputing
 // cross-sets after unplay: play_move_incremental, then the lazy
 // update_cross_set_for_move_from_undo a descendant node performs before move
 // generation, then unplay_move_incremental must restore the board (letters,
 // cross sets, cross scores, extension sets, anchors, flags) byte-for-byte.
-static void assert_incremental_play_roundtrip(Game *game) {
+static void assert_incremental_play_roundtrip(Game *game,
+                                              bool require_both_directions) {
   game_gen_all_cross_sets(game);
   Board *board = game_get_board(game);
   board_set_cross_sets_valid(board, true);
@@ -815,7 +883,6 @@ static void assert_incremental_play_roundtrip(Game *game) {
       .override_kwg = NULL,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
   generate_moves(&args);
   SortedMoveList *sml = sorted_move_list_create(move_list);
@@ -834,22 +901,7 @@ static void assert_incremental_play_roundtrip(Game *game) {
     // with NO subsequent lazy update. The old deferred behavior left them
     // invalid/stale, which let the endgame playout generate invalid words.
     assert(board_get_cross_sets_valid(board));
-    {
-      Game *fresh = game_duplicate(game);
-      game_gen_all_cross_sets(fresh);
-      const Board *fresh_board = game_get_board(fresh);
-      for (int r = 0; r < BOARD_DIM; r++) {
-        for (int c = 0; c < BOARD_DIM; c++) {
-          for (int d = 0; d < 2; d++) {
-            assert(board_get_cross_set(board, r, c, d, 0) ==
-                   board_get_cross_set(fresh_board, r, c, d, 0));
-            assert(board_get_cross_set(board, r, c, d, 1) ==
-                   board_get_cross_set(fresh_board, r, c, d, 1));
-          }
-        }
-      }
-      game_destroy(fresh);
-    }
+    assert_cross_sets_match_full_recompute(game);
     // Mirror the endgame solver's descendant node: bring cross-sets up to
     // date from the parent's undo before (hypothetical) move generation.
     if (undo.move_tiles_length > 0) {
@@ -858,6 +910,7 @@ static void assert_incremental_play_roundtrip(Game *game) {
     }
     unplay_move_incremental(game, &undo);
 
+    // NOLINTNEXTLINE(bugprone-suspicious-memory-comparison,cert-exp42-c,cert-flp37-c)
     assert(memcmp(board->squares, snapshot_board->squares,
                   sizeof(board->squares)) == 0);
     assert(board_get_cross_sets_valid(board) ==
@@ -874,14 +927,18 @@ static void assert_incremental_play_roundtrip(Game *game) {
     }
   }
   // The position must exercise both branches of the transposed lazy update.
-  assert(tested_vertical > 0);
-  assert(tested_horizontal > 0);
+  assert(tested_vertical + tested_horizontal > 0);
+  if (require_both_directions) {
+    assert(tested_vertical > 0);
+    assert(tested_horizontal > 0);
+  }
 
   // A pass round-trips too (no tiles: nothing to update, flags restored).
   Move pass;
   move_set_as_pass(&pass);
   play_move_incremental(&pass, game, &undo);
   unplay_move_incremental(game, &undo);
+  // NOLINTNEXTLINE(bugprone-suspicious-memory-comparison,cert-exp42-c,cert-flp37-c)
   assert(memcmp(board->squares, snapshot_board->squares,
                 sizeof(board->squares)) == 0);
   assert(game_get_consecutive_scoreless_turns(game) ==
@@ -892,12 +949,185 @@ static void assert_incremental_play_roundtrip(Game *game) {
   game_destroy(snapshot);
 }
 
+// Generates every move for the player on turn, sorted best first. The moves
+// live in move_list, which the caller destroys after the sorted list.
+static SortedMoveList *generate_sorted_moves(Game *game, MoveList *move_list) {
+  const MoveGenArgs args = {
+      .game = game,
+      .move_list = move_list,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .override_kwg = NULL,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+  };
+  generate_moves(&args);
+  return sorted_move_list_create(move_list);
+}
+
+// Whether `move` places at most two tiles and keeps at least one on the
+// mover's rack, so a short schedule of such moves never ends the game.
+static bool is_short_tile_placement(const Move *move, int rack_size) {
+  if (move_get_type(move) != GAME_EVENT_TILE_PLACEMENT_MOVE) {
+    return false;
+  }
+  const int tiles_played = move_get_tiles_played(move);
+  if (tiles_played > 2) {
+    return false;
+  }
+  return tiles_played < rack_size;
+}
+
+// The step-th short tile placement (wrapping), or NULL if there is none.
+static const Move *pick_short_tile_placement(const SortedMoveList *sml,
+                                             const Game *game, int step) {
+  const Rack *rack = player_get_rack(
+      game_get_player(game, game_get_player_on_turn_index(game)));
+  const int rack_size = rack_get_total_letters(rack);
+  int num_candidates = 0;
+  for (int move_idx = 0; move_idx < sml->count; move_idx++) {
+    if (is_short_tile_placement(sml->moves[move_idx], rack_size)) {
+      num_candidates++;
+    }
+  }
+  if (num_candidates == 0) {
+    return NULL;
+  }
+  int target = (step * 7) % num_candidates;
+  for (int move_idx = 0; move_idx < sml->count; move_idx++) {
+    const Move *move = sml->moves[move_idx];
+    if (is_short_tile_placement(move, rack_size)) {
+      if (target == 0) {
+        return move;
+      }
+      target--;
+    }
+  }
+  return NULL;
+}
+
+// The schedule of assert_deferred_play_matches_eager. Each step plays a tile
+// placement, or a pass where step_is_pass says so, and the steps marked in
+// step_updates then apply the deferred updates. The pass's undo receives the
+// updates of the tile placement before it.
+enum { DEFERRED_PLAY_NUM_STEPS = 6 };
+static const bool deferred_play_step_is_pass[DEFERRED_PLAY_NUM_STEPS] = {
+    false, false, false, true, false, false};
+static const bool deferred_play_step_updates[DEFERRED_PLAY_NUM_STEPS] = {
+    false, true, false, true, false, true};
+
+// The endgame solver plays moves with play_move_incremental_deferred and,
+// only when something reads the board, applies the deferred anchor and
+// cross-set updates of every move still on it, saving them into the most
+// recent move's undo. After each such update the board must hold the
+// cross-sets of a full recompute and the anchors of an eagerly updated board,
+// and generate exactly its moves. Unplaying must restore every earlier board
+// byte-for-byte, deferred updates included.
+static void assert_deferred_play_matches_eager(Game *game) {
+  game_gen_all_cross_sets(game);
+  Board *board = game_get_board(game);
+  board_set_cross_sets_valid(board, true);
+  Game *eager = game_duplicate(game);
+  const Board *eager_board = game_get_board(eager);
+
+  MoveUndo *undos = malloc_or_die(sizeof(MoveUndo) * DEFERRED_PLAY_NUM_STEPS);
+  MoveUndo *eager_undos =
+      malloc_or_die(sizeof(MoveUndo) * DEFERRED_PLAY_NUM_STEPS);
+  Game *snapshots[DEFERRED_PLAY_NUM_STEPS];
+  int first_deferred_at_play[DEFERRED_PLAY_NUM_STEPS];
+  int first_deferred = 0;
+  // Large enough to hold every move, so the comparison covers them all.
+  MoveList *move_list = move_list_create(100000);
+  MoveList *eager_move_list = move_list_create(100000);
+  Move pass;
+  move_set_as_pass(&pass);
+
+  int num_steps = 0;
+  for (int step = 0; step < DEFERRED_PLAY_NUM_STEPS; step++) {
+    SortedMoveList *eager_moves = generate_sorted_moves(eager, eager_move_list);
+    const Move *move =
+        deferred_play_step_is_pass[step]
+            ? &pass
+            : pick_short_tile_placement(eager_moves, eager, step);
+    if (move == NULL) {
+      sorted_move_list_destroy(eager_moves);
+      break;
+    }
+    snapshots[step] = game_duplicate(game);
+    first_deferred_at_play[step] = first_deferred;
+    play_move_incremental_deferred(move, game, &undos[step]);
+    play_move_incremental(move, eager, &eager_undos[step]);
+    sorted_move_list_destroy(eager_moves);
+    num_steps++;
+    if (!deferred_play_step_updates[step]) {
+      continue;
+    }
+    for (int deferred = first_deferred; deferred <= step; deferred++) {
+      if (undos[deferred].move_tiles_length > 0) {
+        update_deferred_move_into_undo(&undos[deferred], &undos[step], game);
+      }
+    }
+    first_deferred = step + 1;
+    board_set_cross_sets_valid(board, true);
+
+    assert_cross_sets_match_full_recompute(game);
+    for (int row = 0; row < BOARD_DIM; row++) {
+      for (int col = 0; col < BOARD_DIM; col++) {
+        for (int dir = 0; dir < 2; dir++) {
+          assert(board_get_anchor(board, row, col, dir) ==
+                 board_get_anchor(eager_board, row, col, dir));
+        }
+      }
+    }
+    assert(memcmp(board->number_of_row_anchors,
+                  eager_board->number_of_row_anchors,
+                  sizeof(board->number_of_row_anchors)) == 0);
+    SortedMoveList *deferred_moves = generate_sorted_moves(game, move_list);
+    eager_moves = generate_sorted_moves(eager, eager_move_list);
+    assert(deferred_moves->count == eager_moves->count);
+    for (int move_idx = 0; move_idx < eager_moves->count; move_idx++) {
+      assert(compare_moves_without_equity(deferred_moves->moves[move_idx],
+                                          eager_moves->moves[move_idx],
+                                          true) == -1);
+    }
+    sorted_move_list_destroy(deferred_moves);
+    sorted_move_list_destroy(eager_moves);
+  }
+  // Every step must find a move, so updates cover several moves and a pass.
+  assert(num_steps == DEFERRED_PLAY_NUM_STEPS);
+
+  for (int step = num_steps - 1; step >= 0; step--) {
+    first_deferred = first_deferred_at_play[step];
+    unplay_move_incremental(game, &undos[step]);
+    unplay_move_incremental(eager, &eager_undos[step]);
+    const Board *snapshot = game_get_board(snapshots[step]);
+    // NOLINTNEXTLINE(bugprone-suspicious-memory-comparison,cert-exp42-c,cert-flp37-c)
+    assert(memcmp(board->squares, snapshot->squares, sizeof(board->squares)) ==
+           0);
+    assert(memcmp(board->number_of_row_anchors, snapshot->number_of_row_anchors,
+                  sizeof(board->number_of_row_anchors)) == 0);
+    assert(board_get_cross_sets_valid(board) ==
+           board_get_cross_sets_valid(snapshot));
+    assert(board_get_tiles_played(board) == board_get_tiles_played(snapshot));
+    game_destroy(snapshots[step]);
+  }
+  assert(first_deferred == 0);
+
+  move_list_destroy(eager_move_list);
+  move_list_destroy(move_list);
+  free(eager_undos);
+  free(undos);
+  game_destroy(eager);
+}
+
 void test_incremental_cross_set_undo(void) {
   // Shared-KWG (single lexicon): only cross index 0 is maintained.
   Config *config = config_create_or_die("set -lex CSW21 -s1 score -s2 score");
   Game *game = config_game_create(config);
   load_cgp_or_die(game, INCREMENTAL_ROUNDTRIP_ENDGAME_CGP);
-  assert_incremental_play_roundtrip(game);
+  assert_incremental_play_roundtrip(game, true);
+  load_cgp_or_die(game, INCREMENTAL_ROUNDTRIP_ENDGAME_CGP);
+  assert_deferred_play_matches_eager(game);
   game_destroy(game);
   config_destroy(config);
 
@@ -907,9 +1137,122 @@ void test_incremental_cross_set_undo(void) {
       config_create_or_die("set -l1 CSW21 -l2 NWL20 -s1 score -s2 score");
   Game *dual_game = config_game_create(dual_config);
   load_cgp_or_die(dual_game, INCREMENTAL_ROUNDTRIP_ENDGAME_CGP);
-  assert_incremental_play_roundtrip(dual_game);
+  assert_incremental_play_roundtrip(dual_game, true);
+  load_cgp_or_die(dual_game, INCREMENTAL_ROUNDTRIP_ENDGAME_CGP);
+  assert_deferred_play_matches_eager(dual_game);
   game_destroy(dual_game);
   config_destroy(dual_config);
+
+  Config *wordsmog_config = config_create_or_die(
+      "set -lex CSW21_alpha -wmp false -var wordsmog -s1 score -s2 score");
+  Game *wordsmog_game = config_game_create(wordsmog_config);
+  load_cgp_or_die(wordsmog_game, INCREMENTAL_ROUNDTRIP_ENDGAME_CGP);
+  // The bounded top-score list can contain only horizontal Wordsmog plays.
+  // Both directions' cross fields are still compared after every play.
+  assert_incremental_play_roundtrip(wordsmog_game, false);
+  game_destroy(wordsmog_game);
+  config_destroy(wordsmog_config);
+}
+
+// Regression test: get_top_move_for_player_on_turn (used by autoplay's
+// static, non-simming play) must sort/select moves using the move_sort_type
+// configured on the player on turn, instead of always using MOVE_SORT_EQUITY
+// like get_top_equity_move does. With rack "DEKNRTY" on an empty board, the
+// top-scoring play and the top-equity play both score 36 but leave different
+// racks behind, so this rack distinguishes the two sort types: a move
+// selected by MOVE_SORT_SCORE has no leave value applied (its equity equals
+// its raw score), while the move selected by MOVE_SORT_EQUITY has a higher
+// equity than its score because it also accounts for leave value.
+void test_get_top_move_for_player_on_turn_respects_sort_type(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -s1 equity -s2 equity -r1 all -r2 all -numplays 1");
+  Game *game = config_game_create(config);
+  Player *player0 = game_get_player(game, 0);
+  MoveList *move_list = move_list_create(1000);
+
+  draw_rack_string_from_bag(game, 0, "DEKNRTY");
+
+  player_set_move_sort_type(player0, MOVE_SORT_SCORE);
+  const Move *score_move =
+      get_top_move_for_player_on_turn(game, move_list, false);
+  assert(equity_to_int(move_get_score(score_move)) == 36);
+  // The move chosen by score has no leave value applied, so its equity
+  // exactly equals its score.
+  assert(move_get_score(score_move) == move_get_equity(score_move));
+
+  player_set_move_sort_type(player0, MOVE_SORT_EQUITY);
+  const Move *equity_move =
+      get_top_move_for_player_on_turn(game, move_list, false);
+  assert(equity_to_int(move_get_score(equity_move)) == 36);
+  // The move chosen by equity leaves a better rack behind, so its equity is
+  // strictly higher than its raw score.
+  assert(move_get_equity(equity_move) > move_get_score(equity_move));
+
+  // The two sort types must choose different moves.
+  assert(compare_moves_without_equity(score_move, equity_move, true) != 0);
+
+  move_list_destroy(move_list);
+  game_destroy(game);
+  config_destroy(config);
+}
+
+// get_top_move_for_player_on_turn with record_all, as autoplay calls it when
+// positions are captured, must play the same move as without it and leave the
+// recorded moves ranked best-first. Recording every move leaves the list a
+// min-heap, and reading its first element played the *worst* move -- a pass
+// -- on every turn of every capture job's games.
+static void test_get_top_move_for_player_on_turn_records_all_ranked(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -wmp false -s1 equity -s2 equity -r1 best -r2 best");
+  Game *game = config_game_create(config);
+  MoveList *move_list = move_list_create(1000);
+  draw_rack_string_from_bag(game, 0, "DEKNRTY");
+
+  const Move *best = get_top_move_for_player_on_turn(game, move_list, false);
+  Move played;
+  move_copy(&played, best);
+  assert(move_get_type(&played) != GAME_EVENT_PASS);
+
+  // Equal equity rather than the same move: two plays can tie (an opening
+  // placement and its mirror), and the two record types break ties
+  // differently.
+  const Move *top = get_top_move_for_player_on_turn(game, move_list, true);
+  assert(move_get_equity(top) == move_get_equity(&played));
+  const int count = move_list_get_count(move_list);
+  assert(count > 1);
+  for (int i = 1; i < count; i++) {
+    assert(move_get_equity(move_list_get_move(move_list, i - 1)) >=
+           move_get_equity(move_list_get_move(move_list, i)));
+  }
+  assert(move_get_type(move_list_get_move(move_list, count - 1)) ==
+         GAME_EVENT_PASS);
+
+  move_list_destroy(move_list);
+  game_destroy(game);
+  config_destroy(config);
+}
+
+// A server-sent opening rack is drawn with draw_rack_string_from_bag. A
+// lower-case letter in it was counted outside the rack's array and crashed the
+// worker, release build included; it is refused as malformed, and nothing is
+// drawn.
+static void test_a_designated_letter_is_not_a_drawable_rack(void) {
+  Config *config = config_create_or_die("set -lex CSW21 -wmp false");
+  Game *game = config_game_create(config);
+  const Bag *bag = game_get_bag(game);
+  const int in_bag = bag_get_letters(bag);
+
+  assert(draw_rack_string_from_bag(game, 0, "aEINST?") ==
+         DRAW_RACK_STRING_MALFORMED);
+  assert(draw_rack_string_from_bag(game, 0, "AEINSTz") ==
+         DRAW_RACK_STRING_MALFORMED);
+  assert(rack_is_empty(player_get_rack(game_get_player(game, 0))));
+  assert(bag_get_letters(bag) == in_bag);
+
+  assert(draw_rack_string_from_bag(game, 0, "AEINST?") == 7);
+
+  game_destroy(game);
+  config_destroy(config);
 }
 
 void test_gameplay(void) {
@@ -920,8 +1263,12 @@ void test_gameplay(void) {
   test_six_passes_game();
   test_standard_game();
   test_set_random_rack();
+  test_set_random_rack_fill_is_random();
   test_backups();
   test_leave_record();
   test_moves_are_similar();
   test_incremental_cross_set_undo();
+  test_get_top_move_for_player_on_turn_respects_sort_type();
+  test_get_top_move_for_player_on_turn_records_all_ranked();
+  test_a_designated_letter_is_not_a_drawable_rack();
 }

@@ -1,5 +1,6 @@
 #include "rack_test.h"
 
+#include "../src/def/letter_distribution_defs.h"
 #include "../src/ent/encoded_rack.h"
 #include "../src/ent/letter_distribution.h"
 #include "../src/ent/rack.h"
@@ -28,6 +29,18 @@ void test_rack_main(void) {
   assert_rack_score(ld, rack_to_update, 7);
   rack_set_to_string(ld, rack_to_update, "AABBEWW");
   assert_rack_score(ld, rack_to_update, 17);
+
+  // "." is an alias for "?" (blank tile) in rack strings.
+  Rack *rack_with_question_mark = rack_create(ld_size);
+  Rack *rack_with_dot = rack_create(ld_size);
+  rack_set_to_string(ld, rack_with_question_mark, "?QWERTY");
+  rack_set_to_string(ld, rack_with_dot, ".QWERTY");
+  assert(racks_are_equal(rack_with_question_mark, rack_with_dot));
+  rack_set_to_string(ld, rack_with_question_mark, "AB??CD");
+  rack_set_to_string(ld, rack_with_dot, "AB..CD");
+  assert(racks_are_equal(rack_with_question_mark, rack_with_dot));
+  rack_destroy(rack_with_question_mark);
+  rack_destroy(rack_with_dot);
 
   // Test subtraction
   rack_set_to_string(ld, rack_to_update, "ABCDEFG");
@@ -261,7 +274,34 @@ void test_encoded_rack(void) {
   config_destroy(config);
 }
 
+// A rack of undrawn tiles has no designated blanks. A lower-case letter, one
+// to ld_str_to_mls, was counted at a machine letter past the end of the
+// rack's array (a stack-buffer-overflow under ASan from `convert
+// rackequity2klv`, forced racks, and a server-sent opening rack, which crashed
+// the release worker); now the string is refused and the rack left empty.
+static void test_an_undrawn_rack_refuses_designated_blanks(void) {
+  Config *config = config_create_or_die("set -lex NWL20");
+  const LetterDistribution *ld = config_get_ld(config);
+  Rack *rack = rack_create(ld_get_size(ld));
+
+  const int blank_first = rack_set_to_string(ld, rack, "?AEINST");
+  assert(blank_first == 7);
+  assert(rack_get_total_letters(rack) == 7);
+  assert(rack_get_letter(rack, BLANK_MACHINE_LETTER) == 1);
+
+  const int blank_last = rack_set_to_string(ld, rack, "aEINST?");
+  assert(blank_last == -1);
+  assert(rack_get_total_letters(rack) == 0);
+  const int lower_case = rack_set_to_string(ld, rack, "AEINSTz");
+  assert(lower_case == -1);
+  assert(rack_get_total_letters(rack) == 0);
+
+  rack_destroy(rack);
+  config_destroy(config);
+}
+
 void test_rack(void) {
   test_rack_main();
+  test_an_undrawn_rack_refuses_designated_blanks();
   test_encoded_rack();
 }

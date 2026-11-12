@@ -1,17 +1,33 @@
 #include "players_data.h"
 
+#include "../def/bit_rack_defs.h"
+#include "../def/equity_defs.h"
+#include "../def/letter_distribution_defs.h"
 #include "../def/move_defs.h"
 #include "../def/players_data_defs.h"
+#include "../def/rack_defs.h"
 #include "../util/io_util.h"
 #include "../util/string_util.h"
+#include "bit_rack.h"
+#include "equity.h"
 #include "klv.h"
 #include "kwg.h"
+#include "pat.h"
+#include "pat_file.h"
+#include "rack.h"
 #include "rack_info_table.h"
 #include "wmp.h"
+#include "word_info_table.h"
+#include <stdint.h>
 #include <stdlib.h>
 
-static const char *const players_data_type_names[] = {"kwg", "klv", "wordmap",
-                                                      "rack info table"};
+static const char *const players_data_type_names[] = {
+    "kwg",
+    "klv",
+    "wordmap",
+    "rack info table",
+    "word info table",
+    "positional adjustment table"};
 
 // The PlayersData struct holds all of the
 // information that can be set during configuration.
@@ -23,6 +39,18 @@ struct PlayersData {
   bool use_when_available[(NUMBER_OF_DATA * 2)];
   move_sort_t move_sort_types[2];
   move_record_t move_record_types[2];
+  // How each player uses its PAT weights (see the pat* options in config.c).
+  // Which loaded PAT classes to suppress in the player's own move
+  // generation (see PAT_CLASS_MASK_ALL); 0 means none, i.e. every class the
+  // weights have.
+  uint32_t pat_disabled_classes_masks[2];
+  // Whether the player's own move generation (static play and the candidate
+  // list a sim starts from) leaves PAT out.
+  bool pat_candidates_disabled[2];
+  // The same two settings for the rollouts of the player's sims.
+  bool pat_rollout_disabled[2];
+  uint32_t pat_rollout_disabled_classes_masks[2];
+  // The largest PAT adjustment a move of the player's can get.
 };
 
 #define DEFAULT_MOVE_SORT_TYPE MOVE_SORT_EQUITY
@@ -53,6 +81,48 @@ void players_data_set_move_record_type(PlayersData *players_data,
 move_record_t players_data_get_move_record_type(const PlayersData *players_data,
                                                 int player_index) {
   return players_data->move_record_types[player_index];
+}
+
+void players_data_set_pat_disabled_classes_mask(PlayersData *players_data,
+                                                int player_index,
+                                                uint32_t mask) {
+  players_data->pat_disabled_classes_masks[player_index] = mask;
+}
+
+uint32_t
+players_data_get_pat_disabled_classes_mask(const PlayersData *players_data,
+                                           int player_index) {
+  return players_data->pat_disabled_classes_masks[player_index];
+}
+
+void players_data_set_pat_candidates_disabled(PlayersData *players_data,
+                                              int player_index, bool disabled) {
+  players_data->pat_candidates_disabled[player_index] = disabled;
+}
+
+bool players_data_get_pat_candidates_disabled(const PlayersData *players_data,
+                                              int player_index) {
+  return players_data->pat_candidates_disabled[player_index];
+}
+
+void players_data_set_pat_rollout_disabled(PlayersData *players_data,
+                                           int player_index, bool disabled) {
+  players_data->pat_rollout_disabled[player_index] = disabled;
+}
+
+bool players_data_get_pat_rollout_disabled(const PlayersData *players_data,
+                                           int player_index) {
+  return players_data->pat_rollout_disabled[player_index];
+}
+
+void players_data_set_pat_rollout_disabled_classes_mask(
+    PlayersData *players_data, int player_index, uint32_t mask) {
+  players_data->pat_rollout_disabled_classes_masks[player_index] = mask;
+}
+
+uint32_t players_data_get_pat_rollout_disabled_classes_mask(
+    const PlayersData *players_data, int player_index) {
+  return players_data->pat_rollout_disabled_classes_masks[player_index];
 }
 
 bool players_data_get_is_shared(const PlayersData *players_data,
@@ -111,6 +181,18 @@ RackInfoTable *players_data_get_rack_info_table(const PlayersData *players_data,
       players_data, PLAYERS_DATA_TYPE_RIT, player_index);
 }
 
+WordInfoTable *players_data_get_word_info_table(const PlayersData *players_data,
+                                                int player_index) {
+  return (WordInfoTable *)players_data_get_data(
+      players_data, PLAYERS_DATA_TYPE_WIT, player_index);
+}
+
+PATWeights *players_data_get_pat(const PlayersData *players_data,
+                                 int player_index) {
+  return (PATWeights *)players_data_get_data(
+      players_data, PLAYERS_DATA_TYPE_PAT, player_index);
+}
+
 void players_data_set_data(PlayersData *players_data,
                            players_data_t players_data_type, int player_index,
                            void *data) {
@@ -118,7 +200,11 @@ void players_data_set_data(PlayersData *players_data,
   int data_index =
       players_data_get_player_data_index(players_data_type, player_index);
   players_data->data[data_index] = data;
-  players_data->use_when_available[data_index] = !!data;
+  // Loaded data is in use. No data leaves the setting as it was: a lexicon
+  // with no wordmap must not turn the wordmap off for the next lexicon.
+  if (data) {
+    players_data->use_when_available[data_index] = true;
+  }
 }
 
 void *players_data_create_data(players_data_t players_data_type,
@@ -140,6 +226,12 @@ void *players_data_create_data(players_data_t players_data_type,
     break;
   case PLAYERS_DATA_TYPE_RIT:
     data = rack_info_table_create(data_paths, data_name, use_mmap, error_stack);
+    break;
+  case PLAYERS_DATA_TYPE_WIT:
+    data = word_info_table_create(data_paths, data_name, error_stack);
+    break;
+  case PLAYERS_DATA_TYPE_PAT:
+    data = pat_create(data_paths, data_name, error_stack);
     break;
   case NUMBER_OF_DATA:
     log_fatal("cannot create invalid players data type");
@@ -166,6 +258,12 @@ void players_data_destroy_data(PlayersData *players_data,
       break;
     case PLAYERS_DATA_TYPE_RIT:
       rack_info_table_destroy(players_data->data[data_index]);
+      break;
+    case PLAYERS_DATA_TYPE_WIT:
+      word_info_table_destroy(players_data->data[data_index]);
+      break;
+    case PLAYERS_DATA_TYPE_PAT:
+      pat_destroy(players_data->data[data_index]);
       break;
     case NUMBER_OF_DATA:
       log_fatal("cannot destroy invalid players data type");
@@ -211,6 +309,12 @@ const char *players_data_get_data_name(const PlayersData *players_data,
     case PLAYERS_DATA_TYPE_RIT:
       data_name = rack_info_table_get_name(players_data->data[data_index]);
       break;
+    case PLAYERS_DATA_TYPE_WIT:
+      data_name = word_info_table_get_name(players_data->data[data_index]);
+      break;
+    case PLAYERS_DATA_TYPE_PAT:
+      data_name = pat_get_name(players_data->data[data_index]);
+      break;
     case NUMBER_OF_DATA:
       log_fatal("cannot destroy invalid players data type");
       break;
@@ -230,10 +334,14 @@ PlayersData *players_data_create(bool use_wmp) {
       bool default_use = true;
       if (data_index == PLAYERS_DATA_TYPE_WMP) {
         default_use = use_wmp;
-      } else if (data_index == PLAYERS_DATA_TYPE_RIT) {
-        // RIT files are opt-in: callers must explicitly enable them with
-        // -rit true (or -rit1/-rit2) since they are large and may not
-        // exist for every lexicon.
+      } else if (data_index == PLAYERS_DATA_TYPE_RIT ||
+                 data_index == PLAYERS_DATA_TYPE_WIT ||
+                 data_index == PLAYERS_DATA_TYPE_PAT) {
+        // RIT and WIT files are opt-in: callers must explicitly enable them
+        // with -rit/-wit (or the per-player variants) since they are built by
+        // a convert command and may not exist for every lexicon. PAT
+        // weights are likewise opt-in: they load only when named explicitly
+        // with -pat (or -pat1/-pat2).
         default_use = false;
       }
       players_data_set_use_when_available(players_data, data_index,
@@ -243,6 +351,12 @@ PlayersData *players_data_create(bool use_wmp) {
                                     DEFAULT_MOVE_SORT_TYPE);
     players_data_set_move_record_type(players_data, player_index,
                                       DEFAULT_MOVE_RECORD_TYPE);
+    players_data_set_pat_disabled_classes_mask(players_data, player_index, 0);
+    players_data_set_pat_candidates_disabled(players_data, player_index, false);
+    players_data_set_pat_rollout_disabled(players_data, player_index, false);
+    players_data_set_pat_rollout_disabled_classes_mask(
+        players_data, player_index,
+        PAT_CLASS_MASK_ALL & ~PAT_CLASS_MASK_ROLLOUT_DEFAULT);
   }
   return players_data;
 }
@@ -266,7 +380,9 @@ void players_data_destroy(PlayersData *players_data) {
 
 bool players_data_type_is_nullable(players_data_t players_data_type) {
   return players_data_type == PLAYERS_DATA_TYPE_WMP ||
-         players_data_type == PLAYERS_DATA_TYPE_RIT;
+         players_data_type == PLAYERS_DATA_TYPE_RIT ||
+         players_data_type == PLAYERS_DATA_TYPE_WIT ||
+         players_data_type == PLAYERS_DATA_TYPE_PAT;
 }
 
 void players_data_set(PlayersData *players_data,
@@ -317,6 +433,15 @@ void players_data_set(PlayersData *players_data,
             players_data_type, data_paths, input_data_names[player_index],
             use_mmap, error_stack);
         if (!error_stack_is_empty(error_stack)) {
+          // Player 0's new data has no slot yet: pass it through theirs.
+          if (player_index == 1 && existing_data_indexes[0] < 0) {
+            const int data_index =
+                players_data_get_player_data_index(players_data_type, 0);
+            void *existing_data = players_data->data[data_index];
+            players_data->data[data_index] = data_pointers[0];
+            players_data_destroy_data(players_data, players_data_type, 0);
+            players_data->data[data_index] = existing_data;
+          }
           return;
         }
         data_pointers[player_index] = generic_players_data;
@@ -344,7 +469,134 @@ void players_data_set(PlayersData *players_data,
                              new_data_is_shared);
 }
 
+void players_data_evict(PlayersData *players_data,
+                        players_data_t players_data_type) {
+  const bool data_is_shared =
+      players_data_get_is_shared(players_data, players_data_type);
+  for (int player_index = 0; player_index < 2; player_index++) {
+    const int data_index =
+        players_data_get_player_data_index(players_data_type, player_index);
+    if (player_index == 0 || !data_is_shared) {
+      players_data_destroy_data(players_data, players_data_type, player_index);
+    }
+    players_data->data[data_index] = NULL;
+  }
+  players_data_set_is_shared(players_data, players_data_type, false);
+}
+
 // Destroys and recreates the existing data for both players.
+// A word info table describes the words of the KWG it was built from. Pair
+// each player's table with that player's KWG by hash, so a stale or mismatched
+// .wit fails to load rather than silently pruning legal plays. Tables built
+// from a bare word list carry no hash and are not checked.
+bool players_data_wit_matches_kwg(const PlayersData *players_data,
+                                  int player_index) {
+  const WordInfoTable *wit =
+      players_data_get_word_info_table(players_data, player_index);
+  const KWG *kwg = players_data_get_kwg(players_data, player_index);
+  if (wit == NULL || kwg == NULL) {
+    return true;
+  }
+  const uint64_t wit_kwg_hash = word_info_table_get_kwg_hash(wit);
+  return wit_kwg_hash == 0 || wit_kwg_hash == kwg_get_hash(kwg);
+}
+
+void players_data_validate_word_info_tables(const PlayersData *players_data,
+                                            ErrorStack *error_stack) {
+  for (int player_index = 0; player_index < 2; player_index++) {
+    if (players_data_wit_matches_kwg(players_data, player_index)) {
+      continue;
+    }
+    const WordInfoTable *wit =
+        players_data_get_word_info_table(players_data, player_index);
+    const KWG *kwg = players_data_get_kwg(players_data, player_index);
+    error_stack_push(
+        error_stack, ERROR_STATUS_WIT_KWG_MISMATCH,
+        get_formatted_string(
+            "word info table '%s' was not built from kwg '%s' (player %d); "
+            "delete the .wit file and rebuild it with 'convert kwg2wit %s'\n",
+            word_info_table_get_name(wit), kwg_get_name(kwg), player_index + 1,
+            word_info_table_get_name(wit)));
+    return;
+  }
+}
+
+bool players_data_rit_matches_inputs(const PlayersData *players_data,
+                                     int player_index) {
+  const RackInfoTable *rit =
+      players_data_get_rack_info_table(players_data, player_index);
+  if (rit == NULL) {
+    return true;
+  }
+  const KWG *kwg = players_data_get_kwg(players_data, player_index);
+  const KLV *klv = players_data_get_klv(players_data, player_index);
+  const bool kwg_matches =
+      rit->kwg_hash == 0 || kwg == NULL || rit->kwg_hash == kwg_get_hash(kwg);
+  const bool klv_matches =
+      rit->klv_hash == 0 || klv == NULL || rit->klv_hash == klv_get_hash(klv);
+  return kwg_matches && klv_matches;
+}
+
+enum { RACK_INFO_TABLE_LEAVE_CHECK_ENTRIES = 1024 };
+
+// Whether the entry's best leave of one tile and of RACK_SIZE - 1 tiles are
+// the ones the KLV gives its rack.
+static bool rack_info_table_entry_matches_klv(const RackInfoTableEntry *entry,
+                                              const KLV *klv) {
+  const BitRack bit_rack = rack_info_table_entry_read_bit_rack(entry);
+  Rack full_rack;
+  rack_set_dist_size_and_reset(&full_rack, BIT_RACK_MAX_ALPHABET_SIZE);
+  for (int ml = 0; ml < BIT_RACK_MAX_ALPHABET_SIZE; ml++) {
+    rack_add_letters(&full_rack, (MachineLetter)ml,
+                     (int)bit_rack_get_letter(&bit_rack, ml));
+  }
+  Rack single;
+  rack_set_dist_size_and_reset(&single, BIT_RACK_MAX_ALPHABET_SIZE);
+  Equity best_single = EQUITY_INITIAL_VALUE;
+  Equity best_all_but_one = EQUITY_INITIAL_VALUE;
+  for (int ml = 0; ml < BIT_RACK_MAX_ALPHABET_SIZE; ml++) {
+    if (rack_get_letter(&full_rack, ml) == 0) {
+      continue;
+    }
+    rack_add_letter(&single, (MachineLetter)ml);
+    const Equity single_value = klv_get_leave_value(klv, &single);
+    rack_take_letter(&single, (MachineLetter)ml);
+    if (single_value > best_single) {
+      best_single = single_value;
+    }
+    rack_take_letter(&full_rack, (MachineLetter)ml);
+    const Equity all_but_one_value = klv_get_leave_value(klv, &full_rack);
+    rack_add_letter(&full_rack, (MachineLetter)ml);
+    if (all_but_one_value > best_all_but_one) {
+      best_all_but_one = all_but_one_value;
+    }
+  }
+  const Equity *best_leaves = rack_info_table_entry_get_best_leaves(entry);
+  return best_leaves[1] == best_single &&
+         best_leaves[RACK_SIZE - 1] == best_all_but_one;
+}
+
+bool players_data_rit_matches_klv(const PlayersData *players_data,
+                                  int player_index) {
+  const RackInfoTable *rit =
+      players_data_get_rack_info_table(players_data, player_index);
+  const KLV *klv = players_data_get_klv(players_data, player_index);
+  if (rit == NULL || klv == NULL || rit->num_entries == 0) {
+    return true;
+  }
+  // Two different leave tables disagree on the best leaves of almost every
+  // rack.
+  const uint32_t stride =
+      rit->num_entries / RACK_INFO_TABLE_LEAVE_CHECK_ENTRIES + 1;
+  for (uint32_t entry_index = 0; entry_index < rit->num_entries;
+       entry_index += stride) {
+    if (!rack_info_table_entry_matches_klv(&rit->entries[entry_index], klv)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void players_data_reload(PlayersData *players_data,
                          players_data_t players_data_type,
                          const char *data_paths, ErrorStack *error_stack) {
@@ -385,5 +637,9 @@ void players_data_reload(PlayersData *players_data,
       players_data_set_data(players_data, players_data_type, player_index,
                             recreated_data[player_index]);
     }
+  }
+  if (players_data_type == PLAYERS_DATA_TYPE_WIT ||
+      players_data_type == PLAYERS_DATA_TYPE_KWG) {
+    players_data_validate_word_info_tables(players_data, error_stack);
   }
 }

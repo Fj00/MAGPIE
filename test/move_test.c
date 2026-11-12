@@ -1,3 +1,5 @@
+#include "move_test.h"
+
 #include "../src/def/board_defs.h"
 #include "../src/def/equity_defs.h"
 #include "../src/def/game_history_defs.h"
@@ -9,6 +11,11 @@
 
 // NOLINTNEXTLINE
 _Static_assert(sizeof(SmallMove) == 16, "SmallMove must be 16 bytes");
+
+enum {
+  // Enough appends to double a one-slot small move list seven times.
+  SMALL_MOVE_LIST_GROWTH_MOVES = 100,
+};
 
 void test_move_resize(void) {
   MoveList *ml = move_list_create(3);
@@ -140,9 +147,90 @@ void test_move_set_as_pass(void) {
   move_destroy(m);
 }
 
+static void test_small_move_list_reuse(void) {
+  const int capacities[] = {0, 1, 3, 64};
+  for (unsigned capacity_idx = 0;
+       capacity_idx < sizeof(capacities) / sizeof(capacities[0]);
+       capacity_idx++) {
+    const int capacity = capacities[capacity_idx];
+    MoveList *list = move_list_create_small(capacity);
+    for (int round = 0; round < 3; round++) {
+      small_move_list_reset(list);
+      for (int move_idx = 0; move_idx < capacity; move_idx++) {
+        small_move_set_as_pass(list->spare_small_move);
+        list->spare_small_move->metadata.score = (round * capacity) + move_idx;
+        move_list_insert_spare_small_move(list);
+      }
+      assert(list->count == capacity);
+      // Ordering and reuse can move the original spare into any live slot.
+      for (int move_idx = 0; move_idx < capacity; move_idx++) {
+        assert(small_move_get_score(list->small_moves[move_idx]) ==
+               (round * capacity) + move_idx);
+        assert(list->small_moves[move_idx] != list->spare_small_move);
+        for (int other_idx = move_idx + 1; other_idx < capacity; other_idx++) {
+          assert(list->small_moves[move_idx] != list->small_moves[other_idx]);
+        }
+      }
+      if (capacity > 1) {
+        SmallMove *last = list->small_moves[capacity - 1];
+        list->small_moves[capacity - 1] = list->small_moves[0];
+        list->small_moves[0] = last;
+      }
+    }
+    small_move_list_destroy(list);
+  }
+}
+
+static void test_small_move_list_growth(void) {
+  const int capacities[] = {0, 1, 3};
+  for (unsigned capacity_idx = 0;
+       capacity_idx < sizeof(capacities) / sizeof(capacities[0]);
+       capacity_idx++) {
+    MoveList *list = move_list_create_small(capacities[capacity_idx]);
+    int expected_scores[SMALL_MOVE_LIST_GROWTH_MOVES];
+    for (int round = 0; round < 2; round++) {
+      small_move_list_reset(list);
+      for (int move_idx = 0; move_idx < SMALL_MOVE_LIST_GROWTH_MOVES;
+           move_idx++) {
+        const int score = (round * SMALL_MOVE_LIST_GROWTH_MOVES) + move_idx;
+        small_move_set_as_pass(list->spare_small_move);
+        list->spare_small_move->metadata.score = score;
+        move_list_insert_spare_small_move(list);
+        expected_scores[move_idx] = score;
+        // Reorder slots as move ordering does, so growth sees permuted slots.
+        if (move_idx % 2 == 1) {
+          SmallMove *swap = list->small_moves[move_idx];
+          list->small_moves[move_idx] = list->small_moves[move_idx - 1];
+          list->small_moves[move_idx - 1] = swap;
+          expected_scores[move_idx] = expected_scores[move_idx - 1];
+          expected_scores[move_idx - 1] = score;
+        }
+      }
+      assert(list->count == SMALL_MOVE_LIST_GROWTH_MOVES);
+      assert(list->capacity >= SMALL_MOVE_LIST_GROWTH_MOVES);
+      for (int move_idx = 0; move_idx < SMALL_MOVE_LIST_GROWTH_MOVES;
+           move_idx++) {
+        assert(small_move_get_score(list->small_moves[move_idx]) ==
+               expected_scores[move_idx]);
+      }
+      // Every slot and the spare must still own a distinct move.
+      for (int move_idx = 0; move_idx < list->capacity; move_idx++) {
+        assert(list->small_moves[move_idx] != list->spare_small_move);
+        for (int other_idx = move_idx + 1; other_idx < list->capacity;
+             other_idx++) {
+          assert(list->small_moves[move_idx] != list->small_moves[other_idx]);
+        }
+      }
+    }
+    small_move_list_destroy(list);
+  }
+}
+
 void test_move(void) {
   // The majority of the move and move list functionalities
   // are tested in movegen tests.
+  test_small_move_list_reuse();
+  test_small_move_list_growth();
   test_move_resize();
   test_move_compare();
   test_move_set_as_pass();

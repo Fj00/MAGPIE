@@ -1,9 +1,9 @@
 #include "peg_pess_test.h"
 
 #include "../src/compat/cpthread.h"
+#include "../src/compat/cpthread_defs.h"
 #include "../src/compat/ctime.h"
 #include "../src/def/board_defs.h"
-#include "../src/def/cpthread_defs.h"
 #include "../src/def/equity_defs.h"
 #include "../src/def/game_defs.h"
 #include "../src/def/game_history_defs.h"
@@ -378,10 +378,10 @@ static PegPessOut peg_pess_base_case(PegPessSolver *s) {
       .skip_word_pruning = s->skip_word_pruning,
       .soft_time_limit = s->endgame_time,
       .hard_time_limit = s->endgame_time,
-      // Strict mid-search interruption: soft/hard_time_limit only gate between
-      // IDS depth iterations, so a single pathological iteration can run
-      // unbounded. external_deadline_ns is checked inside alpha-beta, giving a
-      // hard wall-clock cap per solve.
+      // Strict mid-search interruption: hard_time_limit lets the first IDS
+      // depth finish, so a single pathological iteration can run unbounded.
+      // external_deadline_ns also stops that one, giving a hard wall-clock cap
+      // per solve.
       .external_deadline_ns =
           s->endgame_time > 0.0
               ? ctimer_monotonic_ns() + (int64_t)(s->endgame_time * 1.0e9)
@@ -765,7 +765,6 @@ static PegPessOut peg_pess_nested_solve(PegPessSolver *s, const MoveList *ml,
           .override_kwg = NULL,
           .eq_margin_movegen = 0,
           .target_equity = EQUITY_MAX_VALUE,
-          .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
       };
       generate_moves(&est_ga);
       int64_t top = INT64_MIN;
@@ -940,7 +939,6 @@ static PegPessOut peg_pess_recursive_solve(PegPessSolver *s) {
       .override_kwg = NULL,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
   generate_moves(&ga);
   const int n_moves = move_list_get_count(ml);
@@ -1294,7 +1292,6 @@ static int peg_pess_compute_opp_top_score(const Game *base_game,
       .override_kwg = NULL,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
   generate_moves(&ga);
   int top = 0;

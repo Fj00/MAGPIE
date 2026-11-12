@@ -104,6 +104,162 @@
  */
 
 #include "linenoise.h"
+
+#if defined(_WIN32)
+
+/* MAGPIE's Windows line input. The console's own line editing (cooked mode)
+ * already gives arrow-key history, F7 and editing, so instead of porting the
+ * raw-mode editor below, a console is read a line at a time with ReadConsoleW
+ * and converted to UTF-8 (fgets on a console can return NULs for non-ASCII
+ * input on older Windows). Anything else (a file, a pipe) is read with
+ * fgets. */
+
+#include <io.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <windows.h>
+
+#define LINENOISE_MAX_LINE 4096
+
+char *linenoiseEditMore = "If you see this, you are misusing the API.";
+static FILE *stream_in = NULL;
+static FILE *stream_out = NULL;
+
+void linenoise_set_stream_in(FILE *stream) { stream_in = stream; }
+void linenoise_set_stream_out(FILE *stream) { stream_out = stream; }
+
+static FILE *linenoise_stream_in(void) { return stream_in ? stream_in : stdin; }
+static FILE *linenoise_stream_out(void) {
+  return stream_out ? stream_out : stdout;
+}
+
+/* Appends `length` bytes to a growing line. */
+static int append_bytes(char **line, size_t *length, size_t *capacity,
+                        const char *bytes, size_t count) {
+  if (*length + count + 1 > *capacity) {
+    size_t grown = *capacity ? *capacity : 128;
+    while (*length + count + 1 > grown) {
+      grown *= 2;
+    }
+    char *resized = realloc(*line, grown);
+    if (!resized) {
+      return -1;
+    }
+    *line = resized;
+    *capacity = grown;
+  }
+  memcpy(*line + *length, bytes, count);
+  *length += count;
+  (*line)[*length] = '\0';
+  return 0;
+}
+
+static void strip_line_end(char *line, size_t *length) {
+  while (*length > 0 &&
+         (line[*length - 1] == '\n' || line[*length - 1] == '\r')) {
+    line[--*length] = '\0';
+  }
+}
+
+static char *read_console_line(HANDLE console) {
+  char *line = NULL;
+  size_t length = 0;
+  size_t capacity = 0;
+  wchar_t wide[512];
+  int ended = 0;
+  while (!ended) {
+    DWORD count = 0;
+    if (!ReadConsoleW(console, wide, (DWORD)(sizeof(wide) / sizeof(wide[0])),
+                      &count, NULL) ||
+        count == 0) {
+      break;
+    }
+    ended = wide[count - 1] == L'\n';
+    char narrow[sizeof(wide) / sizeof(wide[0]) * 4];
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, (int)count, narrow,
+                                          (int)sizeof(narrow), NULL, NULL);
+    if (bytes <= 0 || append_bytes(&line, &length, &capacity, narrow,
+                                   (size_t)bytes) != 0) {
+      free(line);
+      return NULL;
+    }
+  }
+  /* Ctrl+Z at the start of a line is the console's end of input. */
+  if (!line || line[0] == '\x1a') {
+    free(line);
+    return NULL;
+  }
+  strip_line_end(line, &length);
+  return line;
+}
+
+static char *read_stream_line(FILE *stream) {
+  char *line = NULL;
+  size_t length = 0;
+  size_t capacity = 0;
+  char chunk[LINENOISE_MAX_LINE];
+  while (fgets(chunk, (int)sizeof(chunk), stream)) {
+    const size_t count = strlen(chunk);
+    if (append_bytes(&line, &length, &capacity, chunk, count) != 0) {
+      free(line);
+      return NULL;
+    }
+    if (count > 0 && chunk[count - 1] == '\n') {
+      break;
+    }
+  }
+  if (!line) {
+    return NULL;
+  }
+  strip_line_end(line, &length);
+  return line;
+}
+
+char *linenoise(const char *prompt) {
+  FILE *in = linenoise_stream_in();
+  const intptr_t handle = _get_osfhandle(_fileno(in));
+  DWORD mode;
+  if (handle != -1 && GetConsoleMode((HANDLE)handle, &mode)) {
+    FILE *out = linenoise_stream_out();
+    fputs(prompt, out);
+    fflush(out);
+    return read_console_line((HANDLE)handle);
+  }
+  /* As on POSIX, no prompt when input is not a terminal. */
+  return read_stream_line(in);
+}
+
+char *linenoise_read_plain_line(FILE *stream) {
+  const intptr_t handle = _get_osfhandle(_fileno(stream));
+  DWORD mode;
+  if (handle != -1 && GetConsoleMode((HANDLE)handle, &mode)) {
+    return read_console_line((HANDLE)handle);
+  }
+  return read_stream_line(stream);
+}
+
+void linenoiseFree(void *ptr) {
+  if (ptr == linenoiseEditMore) {
+    return;
+  }
+  free(ptr);
+}
+
+/* The console keeps its own history of the lines typed into it. */
+int linenoiseHistoryAdd(const char *line) {
+  (void)line;
+  return 1;
+}
+
+int linenoiseHistorySetMaxLen(int len) {
+  (void)len;
+  return 1;
+}
+
+#else
+#include "../util/io_util.h"
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -181,6 +337,10 @@ FILE *linenoise_get_stream_out(void) {
 
 int linenoise_get_in_fileno(void) { return fileno(linenoise_get_stream_in()); }
 
+char *linenoise_read_plain_line(FILE *stream) {
+  return read_line_from_stream(stream);
+}
+
 int linenoise_get_out_fileno(void) {
   return fileno(linenoise_get_stream_out());
 }
@@ -245,14 +405,18 @@ static int isUnsupportedTerm(void) {
 static int enableRawMode(int fd) {
   struct termios raw;
 
-  if (!isatty(linenoise_get_in_fileno()))
-    goto fatal;
+  if (!isatty(linenoise_get_in_fileno())) {
+    errno = ENOTTY;
+    return -1;
+  }
   if (!atexit_registered) {
     atexit(linenoiseAtExit);
     atexit_registered = 1;
   }
-  if (tcgetattr(fd, &orig_termios) == -1)
-    goto fatal;
+  if (tcgetattr(fd, &orig_termios) == -1) {
+    errno = ENOTTY;
+    return -1;
+  }
 
   raw = orig_termios; /* modify the original mode */
   /* input modes: no break, no CR to NL, no parity check, no strip char,
@@ -271,14 +435,12 @@ static int enableRawMode(int fd) {
   raw.c_cc[VTIME] = 0; /* 1 byte, no timer */
 
   /* put terminal in raw mode after flushing */
-  if (tcsetattr(fd, TCSAFLUSH, &raw) < 0)
-    goto fatal;
+  if (tcsetattr(fd, TCSAFLUSH, &raw) < 0) {
+    errno = ENOTTY;
+    return -1;
+  }
   rawmode = 1;
   return 0;
-
-fatal:
-  errno = ENOTTY;
-  return -1;
 }
 
 static void disableRawMode(int fd) {
@@ -328,15 +490,18 @@ static int getColumns(int ifd, int ofd) {
 
     /* Get the initial position so we can restore it later. */
     start = getCursorPosition(ifd, ofd);
-    if (start == -1)
-      goto failed;
+    if (start == -1) {
+      return 80;
+    }
 
     /* Go to right margin and get position. */
-    if (write(ofd, "\x1b[999C", 6) != 6)
-      goto failed;
+    if (write(ofd, "\x1b[999C", 6) != 6) {
+      return 80;
+    }
     cols = getCursorPosition(ifd, ofd);
-    if (cols == -1)
-      goto failed;
+    if (cols == -1) {
+      return 80;
+    }
 
     /* Restore position. */
     if (cols > start) {
@@ -350,9 +515,6 @@ static int getColumns(int ifd, int ofd) {
   } else {
     return ws.ws_col;
   }
-
-failed:
-  return 80;
 }
 
 /* Clear the screen. Used to handle ctrl+l */
@@ -1436,3 +1598,5 @@ int linenoiseHistoryLoad(const char *filename) {
   fclose(fp);
   return 0;
 }
+
+#endif

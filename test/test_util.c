@@ -1,10 +1,15 @@
 #include "test_util.h"
 
+#include "../src/compat/cpthread.h"
+#include "../src/compat/cpthread_defs.h"
+#include "../src/compat/ctime.h"
 #include "../src/def/board_defs.h"
 #include "../src/def/cross_set_defs.h"
 #include "../src/def/equity_defs.h"
+#include "../src/def/inference_defs.h"
 #include "../src/def/letter_distribution_defs.h"
 #include "../src/def/move_defs.h"
+#include "../src/def/rack_defs.h"
 #include "../src/def/thread_control_defs.h"
 #include "../src/ent/anchor.h"
 #include "../src/ent/bag.h"
@@ -17,6 +22,7 @@
 #include "../src/ent/equity.h"
 #include "../src/ent/game.h"
 #include "../src/ent/game_history.h"
+#include "../src/ent/inference_results.h"
 #include "../src/ent/klv.h"
 #include "../src/ent/klv_csv.h"
 #include "../src/ent/kwg.h"
@@ -33,37 +39,66 @@
 #include "../src/impl/config.h"
 #include "../src/impl/gameplay.h"
 #include "../src/impl/move_gen.h"
+#include "../src/impl/move_gen_base.h"
+#include "../src/impl/rack_draw.h"
 #include "../src/impl/simmer.h"
 #include "../src/impl/wmp_move_gen.h"
 #include "../src/str/game_string.h"
 #include "../src/str/move_string.h"
 #include "../src/str/rack_string.h"
 #include "../src/util/io_util.h"
+#include "../src/util/stable_sort.h"
 #include "../src/util/string_util.h"
 #include "test_constants.h"
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <math.h>
-#include <setjmp.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #define TEST_EPSILON 1e-6
-
-// Global variable for the timeout function.
-jmp_buf env;
 
 void assert_equal_at_equity_resolution(double a, double b) {
   assert(double_to_equity(a) == double_to_equity(b));
 }
 
 bool within_epsilon(double a, double b) { return fabs(a - b) < TEST_EPSILON; }
+
+void assert_inference_results_equal(InferenceResults *results_a,
+                                    InferenceResults *results_b, int ld_size) {
+  for (int type_idx = 0; type_idx < NUMBER_OF_INFER_TYPES; type_idx++) {
+    const inference_stat_t inference_stat_type = (inference_stat_t)type_idx;
+    const Stat *stat_a =
+        inference_results_get_equity_values(results_a, inference_stat_type);
+    const Stat *stat_b =
+        inference_results_get_equity_values(results_b, inference_stat_type);
+    assert(stat_get_num_samples(stat_a) == stat_get_num_samples(stat_b));
+    assert(stat_get_num_unique_samples(stat_a) ==
+           stat_get_num_unique_samples(stat_b));
+    if (stat_get_num_samples(stat_a) > 0) {
+      assert(within_epsilon(stat_get_mean(stat_a), stat_get_mean(stat_b)));
+    }
+    for (int ml = 0; ml < ld_size; ml++) {
+      for (int num_letters = 1; num_letters <= RACK_SIZE; num_letters++) {
+        for (int subtotal_idx = 0; subtotal_idx < NUMBER_OF_INFERENCE_SUBTOTALS;
+             subtotal_idx++) {
+          const inference_subtotal_t subtotal_type =
+              (inference_subtotal_t)subtotal_idx;
+          assert(inference_results_get_subtotal(results_a, inference_stat_type,
+                                                (MachineLetter)ml, num_letters,
+                                                subtotal_type) ==
+                 inference_results_get_subtotal(results_b, inference_stat_type,
+                                                (MachineLetter)ml, num_letters,
+                                                subtotal_type));
+        }
+      }
+    }
+  }
+}
 
 // This test function only works for single-char alphabets
 void set_row(const Game *game, const int row, const char *row_content) {
@@ -124,36 +159,48 @@ void load_and_exec_config_or_die(Config *config, const char *cmd) {
   printf("seed: %" PRIu64 "\n", config_get_seed(config));
 }
 
-void timeout_handler(int __attribute__((unused)) signum) {
-  // Long jump back to the main function if the alarm triggers
-  longjmp(env, 1);
+// What load_and_exec_config_or_die_timed's watchdog thread watches.
+typedef struct Watchdog {
+  cpthread_mutex_t mutex;
+  cpthread_cond_t finished_cond;
+  bool finished;
+  const char *cmd;
+  int seconds;
+} Watchdog;
+
+// Waits for the guarded command to finish, ending the process if it has not
+// within its time limit.
+static void *watchdog_run(void *uncasted_watchdog) {
+  Watchdog *watchdog = (Watchdog *)uncasted_watchdog;
+  TimeSpec deadline;
+  ctimer_clock_gettime_realtime(&deadline);
+  deadline.tv_sec += watchdog->seconds;
+  cpthread_mutex_lock(&watchdog->mutex);
+  while (!watchdog->finished) {
+    if (!cpthread_cond_timedwait(&watchdog->finished_cond, &watchdog->mutex,
+                                 &deadline) &&
+        !watchdog->finished) {
+      log_fatal("'%s' did not finish within %d seconds", watchdog->cmd,
+                watchdog->seconds);
+    }
+  }
+  cpthread_mutex_unlock(&watchdog->mutex);
+  return NULL;
 }
 
-bool load_and_exec_config_or_die_timed(Config *config, const char *cmd,
+void load_and_exec_config_or_die_timed(Config *config, const char *cmd,
                                        int seconds) {
-  // Set up the signal handler
-  sig_t prev = signal(SIGALRM, timeout_handler);
-  if (prev == SIG_ERR) {
-    abort();
-  }
-  // Set a time limit
-  alarm(seconds);
-
-  // Save the environment for long jump
-  if (setjmp(env) == 0) {
-    // If setjmp returns 0, continue execution
-
-    // Call the original function
-    load_and_exec_config_or_die(config, cmd);
-
-    // Disable the alarm
-    alarm(0);
-
-    // If the function completes within the time limit, return true
-    return true;
-  }
-  // If longjmp is called, the function exceeded the time limit
-  return false;
+  Watchdog watchdog = {.finished = false, .cmd = cmd, .seconds = seconds};
+  cpthread_mutex_init(&watchdog.mutex);
+  cpthread_cond_init(&watchdog.finished_cond);
+  cpthread_t watchdog_thread;
+  cpthread_create(&watchdog_thread, watchdog_run, &watchdog);
+  load_and_exec_config_or_die(config, cmd);
+  cpthread_mutex_lock(&watchdog.mutex);
+  watchdog.finished = true;
+  cpthread_cond_signal(&watchdog.finished_cond);
+  cpthread_mutex_unlock(&watchdog.mutex);
+  cpthread_join(watchdog_thread);
 }
 
 char *cross_set_to_string(const LetterDistribution *ld, uint64_t input) {
@@ -163,8 +210,7 @@ char *cross_set_to_string(const LetterDistribution *ld, uint64_t input) {
       string_builder_add_string(css_builder, ld_ml_to_hl(ld, i));
     }
   }
-  char *result = string_builder_dump(css_builder, NULL);
-  string_builder_destroy(css_builder);
+  char *result = string_builder_dump_and_destroy(css_builder, NULL);
   return result;
 }
 
@@ -283,7 +329,7 @@ int compare_moves_for_sml(const void *a, const void *b) {
 
 // Function to sort the moves in the SortedMoveList
 void resort_sorted_move_list_by_score(SortedMoveList *sml) {
-  qsort(sml->moves, sml->count, sizeof(Move *), compare_moves_for_sml);
+  stable_sort(sml->moves, sml->count, sizeof(Move *), compare_moves_for_sml);
 }
 
 // Empties the passed in move list and returns a SortedMoveList
@@ -375,7 +421,6 @@ void play_top_n_equity_move(Game *game, int n) {
       .override_kwg = NULL,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   generate_moves(&args);
@@ -498,8 +543,7 @@ void assert_racks_equal(const LetterDistribution *ld, const Rack *r1,
   char *r1_str = string_builder_dump(sb, NULL);
   string_builder_clear(sb);
   string_builder_add_rack(sb, r2, ld, false);
-  char *r2_str = string_builder_dump(sb, NULL);
-  string_builder_destroy(sb);
+  char *r2_str = string_builder_dump_and_destroy(sb, NULL);
   assert_strings_equal(r1_str, r2_str);
   free(r1_str);
   free(r2_str);
@@ -509,8 +553,7 @@ void assert_rack_equals_string(const LetterDistribution *ld, const Rack *r1,
                                const char *r2_str) {
   StringBuilder *sb = string_builder_create();
   string_builder_add_rack(sb, r1, ld, false);
-  char *r1_str = string_builder_dump(sb, NULL);
-  string_builder_destroy(sb);
+  char *r1_str = string_builder_dump_and_destroy(sb, NULL);
   assert_strings_equal(r1_str, r2_str);
   free(r1_str);
 }
@@ -661,8 +704,6 @@ void delete_file(const char *filename) {
   }
 }
 
-void delete_fifo(const char *fifo_name) { unlink(fifo_name); }
-
 // Board layout test helpers
 
 void assert_board_layout_error(const char *data_paths,
@@ -728,7 +769,6 @@ void assert_validated_and_generated_moves(Game *game, const char *rack_string,
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   const int player_index = game_get_player_on_turn_index(game);
@@ -1020,7 +1060,6 @@ void generate_anchors_for_test(Game *game) {
       .override_kwg = NULL,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
   gen_load_position(gen, &args);
   gen_look_up_leaves_and_record_exchanges(gen);
@@ -1173,4 +1212,20 @@ error_code_t get_config_exec_status(Config *config, const char *cmd) {
   error_code = error_stack_top(error_stack);
   error_stack_destroy(error_stack);
   return error_code;
+}
+
+// Cuts the opponent's rack out of a fixture line ("<board> AB/CD ..." becomes
+// "<board> AB/ ...") in place.
+// cppcheck-suppress constParameterPointer
+void strip_cgp_opp_rack(char *line) {
+  char *space = strchr(line, ' ');
+  if (space == NULL) {
+    return;
+  }
+  char *slash = strchr(space + 1, '/');
+  char *end = slash ? strchr(slash, ' ') : NULL;
+  if (slash == NULL || end == NULL) {
+    return;
+  }
+  memmove(slash + 1, end, strlen(end) + 1);
 }

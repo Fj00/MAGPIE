@@ -1,34 +1,51 @@
+#include "../src/compat/cterm.h"
 #include "../src/def/board_defs.h"
 #include "../src/impl/exec.h"
 #include "../src/util/io_util.h"
+#include "../src/util/string_util.h"
 #include "alias_method_test.h"
 #include "alphabet_test.h"
 #include "analyze_test.h"
+#include "autoplay_solvers_test.h"
 #include "autoplay_test.h"
 #include "bag_test.h"
+#include "bai_sched_test.h"
 #include "bai_test.h"
 #include "bai_utility_test.h"
 #include "benchmark_endgame_test.h"
 #include "benchmark_peg_test.h"
+#include "best_small_test.h"
 #include "bit_rack_test.h"
 #include "board_layout_default_test.h"
 #include "board_layout_super_test.h"
 #include "board_test.h"
+#include "browser_game_test.h"
+#include "builder_hash_test.h"
+#include "census_rollout_test.h"
+#include "census_test.h"
 #include "cgp_test.h"
 #include "checkpoint_test.h"
+#include "cmd_api_test.h"
 #include "command_test.h"
+#include "compat_test.h"
 #include "config_test.h"
+#include "contribute_tables_test.h"
+#include "contribute_test.h"
 #include "convert_test.h"
 #include "create_data_test.h"
 #include "cross_set_test.h"
+#include "data_fetch_test.h"
 #include "dawg_packed_test.h"
+#include "embedding_lifecycle_test.h"
 #include "endgame_test.h"
 #include "equity_adjustment_test.h"
 #include "equity_test.h"
 #include "game_test.h"
 #include "gameplay_test.h"
 #include "gcg_test.h"
+#include "gzip_reader_test.h"
 #include "heat_map_test.h"
+#include "history_replay_test.h"
 #include "infer_cmp_test.h"
 #include "infer_test.h"
 #include "klv_test.h"
@@ -41,32 +58,59 @@
 #include "math_util_test.h"
 #include "move_gen_test.h"
 #include "move_test.h"
+#include "movegen_budget_test.h"
+#include "pat_eval_test.h"
+#include "pat_features_test.h"
+#include "pat_file_test.h"
+#include "pat_lexicon_test.h"
+#include "pat_opening_sim_test.h"
+#include "pat_test.h"
+#include "pat_utility_test.h"
+#include "path_move_lists_test.h"
+#include "peg_cascade_bench_test.h"
+#include "peg_embedding_test.h"
 #include "peg_oracle_test.h"
 #include "peg_pess_test.h"
 #include "peg_poll_test.h"
 #include "peg_pool_test.h"
+#include "peg_speed_bench_test.h"
 #include "peg_test.h"
+#include "peg_validate_test.h"
 #include "play_chooser_test.h"
 #include "players_data_test.h"
+#include "position_lengths_test.h"
 #include "rack_info_table_test.h"
 #include "rack_list_test.h"
 #include "rack_test.h"
 #include "random_variable_test.h"
 #include "shadow_test.h"
 #include "sim_benchmark_test.h"
+#include "sim_det_sweep_test.h"
+#include "sim_quality_test.h"
+#include "sim_regret_test.h"
 #include "sim_test.h"
+#include "stable_sort_test.h"
 #include "stats_test.h"
 #include "string_util_test.h"
+#include "table_bench_test.h"
+#include "threats_test.h"
 #include "transposition_table_test.h"
 #include "validated_move_test.h"
 #include "vmodel_picks_test.h"
 #include "vmodel_test.h"
 #include "win_pct_test.h"
+#include "wit_cache_test.h"
+#include "wit_upgrade_test.h"
 #include "wmp_maker_test.h"
 #include "wmp_move_gen_test.h"
 #include "wmp_test.h"
+#include "woadwage_test.h"
+#include "word_info_table_test.h"
+#include "word_map_embedding_test.h"
+#include "word_plus_floater_maker_test.h"
 #include "word_prune_test.h"
 #include "word_test.h"
+#include "xs_test.h"
 #include "zobrist_test.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,7 +124,10 @@ typedef struct {
 } TestEntry;
 
 static TestEntry test_table[] = {
+    {"xs", test_xs},
+    {"xsinterop", test_xs_interop},
     {"config", test_config},
+    {"movebudget", test_movegen_budget},
     {"players", test_players_data},
     {"string", test_string_util},
     {"alpha", test_alphabet},
@@ -88,6 +135,11 @@ static TestEntry test_table[] = {
     {"l", test_leaves},
     {"leavemap", test_leave_map},
     {"rit", test_rack_info_table},
+    {"wit", test_word_info_table},
+    {"wpfmaker", test_word_plus_floater_maker},
+    {"positionlengths", test_position_lengths},
+    {"witcache", test_wit_cache},
+    {"witsweep", test_wit_equivalence_sweep},
     {"kwg", test_kwg_alpha},
     {"bag", test_bag},
     {"rack", test_rack},
@@ -100,6 +152,8 @@ static TestEntry test_table[] = {
     {"vm", test_validated_move},
     {"shadow", test_shadow},
     {"movegen", test_move_gen},
+    {"threats", test_threats},
+    {"bestsmall", test_best_small},
     {"eq", test_equity},
     {"eqadj", test_equity_adjustments},
     {"gameplay", test_gameplay},
@@ -110,21 +164,38 @@ static TestEntry test_table[] = {
     {"hm", test_heat_map},
     {"sim", test_sim},
     {"math", test_math_util},
+    {"stablesort", test_stable_sort},
+    {"compat", test_compat},
+    {"gzipreader", test_gzip_reader},
+    {"datafetch", test_data_fetch},
     {"bai", test_bai},
     {"baiutil", test_bai_utility},
     {"command", test_command},
+    {"embedding", test_embedding_lifecycle},
+    {"fileproxy", test_fileproxy_cache},
+    {"historyreplay", test_history_replay},
+    {"peg_embedding", test_peg_embedding},
+    {"wordmapapi", test_word_map_embedding},
+    {"cmdapi", test_cmd_api},
+    {"browsergame", test_browser_game},
     {"gcg", test_gcg},
     {"analyze", test_analyze},
     {"autoplay", test_autoplay},
+    {"apsolvers", test_autoplay_solvers},
+    {"contribute", test_contribute},
     {"words", test_words},
+    {"woadwage", test_woadwage},
     {"wordprune", test_word_prune},
     {"kwgmaker", test_kwg_maker},
     {"cgp", test_cgp},
+    {"census", test_census},
+    {"censusrollout", test_census_rollout},
     {"rl", test_rack_list},
     {"rlfr", test_rack_list_forced_racks},
     {"ch", test_checkpoint},
     {"klv", test_klv},
     {"cv", test_convert},
+    {"builderhash", test_builder_hash},
     {"cd", test_create_data},
     {"wmp", test_wmp},
     {"wmpmaker", test_wmp_maker},
@@ -133,7 +204,18 @@ static TestEntry test_table[] = {
     {"vmodel", test_vmodel},
     {"vmodel_verify", test_vmodel_verify},
     {"vmodel_picks", test_vmodel_picks},
+    {"pat", test_pat},
+    {"patwmp", test_pat_wmp_parity},
+    {"patfile", test_pat_file},
+    {"patlexicon", test_pat_lexicon},
+    {"patutility", test_pat_utility},
+    {"patfeatures", test_pat_features},
+    {"pateval", test_pat_eval},
+    {"winpctcoverage", test_win_pct_coverage},
+    {"winpctstate", test_win_pct_state},
+    {"winpctrecord", test_win_pct_record},
     {"endgame", test_endgame},
+    {"endgamepause", test_endgame_pause},
     {"endgameoutplay", test_endgame_outplay_zobrist_overflow},
     {"endgamefirstwin", test_endgame_first_win_sign},
     {"eldar_v", test_eldar_v_stick},
@@ -150,16 +232,38 @@ static TestEntry test_table[] = {
 
 // Tests that only run when explicitly requested (not included in run_all)
 static TestEntry on_demand_test_table[] = {
+    {"xsdata", test_xs_data},
+    {"pathmovelists", test_path_move_lists},
+    {"egincremental", test_incremental_movegen_identical},
+    {"pegcascade", test_peg_cascade_bench},
+    {"pegvalidate", test_peg_validate},
+    {"egdepth", test_endgame_depth_bench},
+    {"pegspeedbench1", test_peg_speed_bench_1},
+    {"pegspeedbench2", test_peg_speed_bench_2},
+    {"positionloaded", test_position_lengths_loaded},
+    {"witdiff", test_wit_cache_differential},
+    {"witcopy", test_wit_cache_copy},
+    {"witundo", test_wit_cache_undo},
+    {"witconfig", test_wit_cache_config},
+    {"peginterrupt", test_peg_interrupted_candidate_outcomes},
+    {"pegstatus", test_peg_status_output},
+    {"playchooserfixed", test_play_chooser_fixed_short_budget},
     {"analyze_sim", test_analyze_sim},
+    {"simdetigp", test_autoplay_sim_determinism_igp},
+    {"simdetsweep", test_sim_determinism_sweep},
     {"ap_default", test_autoplay_default},
     {"ap_wmp", test_autoplay_wmp_correctness},
     {"ap_rest", test_autoplay_remaining},
+    {"ap_pent", test_autoplay_pentanomial},
     {"endgame_wasm", test_endgame_wasm},
     {"endgameinject", test_endgame_dynamic_worker_injection},
+    {"egttpvbound", test_endgame_tt_pv_bound_repeat},
+    {"egpassdepth", test_endgame_pass_transposition_depth},
     {"viamover", test_via_mover_must_bingo_every_depth},
     {"viaopp", test_via_opp_must_block_every_depth},
     {"viastress", test_via_interrupted_reasonable_under_time_pressure},
     {"infercmp", test_infer_cmp},
+    {"censusrolloutbench", test_census_rollout_bench},
     {"genstuck", test_generate_stuck_cgps},
     {"gennonstuck", test_generate_nonstuck_cgps},
     {"gennonstuck2", test_generate_nonstuck_cgps2},
@@ -173,6 +277,7 @@ static TestEntry on_demand_test_table[] = {
     {"benchns3v3", test_benchmark_nonstuck_3v3},
     {"egcompare", test_endgame_compare},
     {"egspeedbench", test_endgame_speed_bench},
+    {"egrootbench", test_endgame_root_bench},
     {"egplayout", test_endgame_playout_bench},
     {"egmove1", test_endgame_move1},
     {"multipv", test_multi_pv},
@@ -184,7 +289,14 @@ static TestEntry on_demand_test_table[] = {
     {"kue", test_kue},
     {"monsterq", test_monster_q},
     {"simbench", test_sim_benchmark},
+    {"baisched", test_bai_sched},
+    {"simquality", test_sim_quality},
+    {"simregretref", test_sim_regret_reference},
+    {"simregret", test_sim_regret},
+    {"pcbench", test_play_chooser_benchmark},
     {"ap_rit", test_autoplay_rit_correctness},
+    {"tablebench", test_table_bench},
+    {"contributetables", test_contribute_tables},
     // Pre-endgame (PEG) solver
     {"peg1pb", test_peg_1bag_pass_best},
     {"peg1onyx", test_peg_1bag_onyx},
@@ -214,6 +326,10 @@ void run_all(void) {
 }
 
 void run_test(const char *subtest) {
+  if (has_prefix("xsdata:", subtest)) {
+    test_xs_data_paths(subtest + strlen("xsdata:"));
+    return;
+  }
   for (int i = 0; test_table[i].name != NULL; ++i) {
     if (strcmp(subtest, test_table[i].name) == 0) {
       test_table[i].func();
@@ -227,15 +343,33 @@ void run_test(const char *subtest) {
       return;
     }
   }
+  if (has_prefix("pattablecheck:", subtest)) {
+    pat_run_through_table_check(subtest + strlen("pattablecheck:"));
+    return;
+  }
+  if (has_prefix("patopeningsim:", subtest)) {
+    pat_opening_sim_run_spec(subtest + strlen("patopeningsim:"));
+    return;
+  }
+  if (has_prefix("egspeedbench:", subtest)) {
+    endgame_speed_bench_run_spec(subtest + strlen("egspeedbench:"));
+    return;
+  }
   log_fatal("unrecognized test: %s\n", subtest);
 }
 
 void run_all_super(void) {
+  test_wit_upgrade();
+  test_position_lengths();
   test_bit_rack();
   test_board_layout_super();
+  test_pat_rollout_default_classes();
+  test_browser_game();
 }
 
 int main(int argc, char *argv[]) {
+  cterm_init();
+  cterm_disable_error_dialogs();
   log_set_level(LOG_WARN);
 
   // NOLINTNEXTLINE(misc-redundant-expression)
@@ -248,12 +382,25 @@ int main(int argc, char *argv[]) {
       }
     }
   } else if (BOARD_DIM == DEFAULT_SUPER_BOARD_DIM) {
-    if (argc > 1) {
-      log_warn("Ignoring test arguments when testing default super board "
-               "dimensions of %d.",
-               DEFAULT_SUPER_BOARD_DIM);
+    // The super suite is the default; a parameterized on-demand test
+    // (a "<name>:<spec>" argument, e.g. patopeningsim:CSW24:<pat>:300)
+    // runs on this board instead, so the board-dependent tooling is
+    // available under the 21x21 build.
+    bool ran_on_demand = false;
+    for (int i = 1; i < argc; i++) {
+      if (strchr(argv[i], ':') != NULL) {
+        run_test(argv[i]);
+        ran_on_demand = true;
+      }
     }
-    run_all_super();
+    if (!ran_on_demand) {
+      if (argc > 1) {
+        log_warn("Ignoring test arguments when testing default super board "
+                 "dimensions of %d.",
+                 DEFAULT_SUPER_BOARD_DIM);
+      }
+      run_all_super();
+    }
   } else {
     log_fatal(
         "Testing with unsupported board dimension of %d. Only %d and %d are "

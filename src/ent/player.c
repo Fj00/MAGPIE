@@ -6,10 +6,14 @@
 #include "klv.h"
 #include "kwg.h"
 #include "letter_distribution.h"
+#include "pat.h"
 #include "players_data.h"
 #include "rack.h"
 #include "rack_info_table.h"
 #include "wmp.h"
+#include "word_info_table.h"
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 struct Player {
@@ -26,6 +30,13 @@ struct Player {
   const KLV *klv;
   const WMP *wmp;
   const RackInfoTable *rack_info_table;
+  const WordInfoTable *word_info_table;
+  const PATWeights *pat;
+  // How this player's move generation uses pat: loaded from PlayersData,
+  // and switched to the simming player's rollout settings inside a sim's
+  // rollouts (see player_set_pat_usage).
+  bool pat_disabled;
+  uint32_t pat_disabled_classes_mask;
 };
 
 void player_reset(Player *player) {
@@ -44,6 +55,13 @@ void player_update(const PlayersData *players_data, Player *player) {
   player->wmp = players_data_get_wmp(players_data, player->index);
   player->rack_info_table =
       players_data_get_rack_info_table(players_data, player->index);
+  player->word_info_table =
+      players_data_get_word_info_table(players_data, player->index);
+  player->pat = players_data_get_pat(players_data, player->index);
+  player->pat_disabled =
+      players_data_get_pat_candidates_disabled(players_data, player->index);
+  player->pat_disabled_classes_mask =
+      players_data_get_pat_disabled_classes_mask(players_data, player->index);
 }
 
 Player *player_create(const PlayersData *players_data,
@@ -53,7 +71,6 @@ Player *player_create(const PlayersData *players_data,
   player->score = 0;
   player->rack = rack_create(ld_get_size(ld));
   player->known_rack_from_phonies = rack_create(ld_get_size(ld));
-
   player_update(players_data, player);
 
   return player;
@@ -72,6 +89,10 @@ Player *player_duplicate(const Player *player) {
   new_player->klv = player->klv;
   new_player->wmp = player->wmp;
   new_player->rack_info_table = player->rack_info_table;
+  new_player->word_info_table = player->word_info_table;
+  new_player->pat = player->pat;
+  new_player->pat_disabled = player->pat_disabled;
+  new_player->pat_disabled_classes_mask = player->pat_disabled_classes_mask;
   return new_player;
 }
 
@@ -86,6 +107,10 @@ void player_copy(Player *dst, const Player *src) {
   dst->klv = src->klv;
   dst->wmp = src->wmp;
   dst->rack_info_table = src->rack_info_table;
+  dst->word_info_table = src->word_info_table;
+  dst->pat = src->pat;
+  dst->pat_disabled = src->pat_disabled;
+  dst->pat_disabled_classes_mask = src->pat_disabled_classes_mask;
 }
 
 void player_destroy(Player *player) {
@@ -125,7 +150,31 @@ const RackInfoTable *player_get_rack_info_table(const Player *player) {
   return player->rack_info_table;
 }
 
+const WordInfoTable *player_get_word_info_table(const Player *player) {
+  return player->word_info_table;
+}
+
+const PATWeights *player_get_pat(const Player *player) { return player->pat; }
+
+uint32_t player_get_pat_disabled_classes_mask(const Player *player) {
+  return player->pat_disabled_classes_mask;
+}
+
+bool player_get_pat_disabled(const Player *player) {
+  return player->pat_disabled;
+}
+
 void player_set_score(Player *player, Equity score) { player->score = score; }
+
+void player_set_pat(Player *player, const PATWeights *pat) {
+  player->pat = pat;
+}
+
+void player_set_pat_usage(Player *player, bool disabled,
+                          uint32_t disabled_classes_mask) {
+  player->pat_disabled = disabled;
+  player->pat_disabled_classes_mask = disabled_classes_mask;
+}
 
 void player_add_to_score(Player *player, Equity score) {
   player->score += score;

@@ -31,6 +31,7 @@ uint64_t string_to_cross_set(const LetterDistribution *ld, const char *letters);
 char *cross_set_to_string(const LetterDistribution *ld, uint64_t input);
 void play_top_n_equity_move(Game *game, int n);
 SortedMoveList *sorted_move_list_create(MoveList *ml);
+void assert_moves_are_equal(const Move *m1, const Move *m2);
 void sorted_move_list_destroy(SortedMoveList *sorted_move_list);
 void print_move_list(const Board *board, const LetterDistribution *ld,
                      const SortedMoveList *sml, int move_list_length);
@@ -39,6 +40,10 @@ void sort_and_print_move_list(const Board *board, const LetterDistribution *ld,
 void resort_sorted_move_list_by_score(SortedMoveList *sml);
 void assert_equal_at_equity_resolution(double a, double b);
 bool within_epsilon(double a, double b);
+// Asserts that two inferences recorded the same racks, leaves and exchanged
+// tiles: the same sample counts, means and letter subtotals for every type.
+void assert_inference_results_equal(InferenceResults *results_a,
+                                    InferenceResults *results_b, int ld_size);
 int count_newlines(const char *str);
 bool equal_rack(const Rack *expected_rack, const Rack *actual_rack);
 void assert_strings_equal(const char *str1, const char *str2);
@@ -53,17 +58,19 @@ void assert_move(const Game *game, const MoveList *move_list,
 void assert_bags_are_equal(const Bag *b1, const Bag *b2);
 void assert_boards_are_equal(Board *b1, Board *b2);
 void assert_games_are_equal(const Game *g1, const Game *g2, bool check_scores);
+void assert_moves_are_equal(const Move *m1, const Move *m2);
 void print_game(const Game *game, const MoveList *move_list);
 void print_cgp(const Game *game);
 void print_english_rack(const Rack *rack);
 void print_rack(const Rack *rack, const LetterDistribution *ld);
 void load_cgp_or_die(Game *game, const char *cgp);
 void load_and_exec_config_or_die(Config *config, const char *cmd);
-bool load_and_exec_config_or_die_timed(Config *config, const char *cmd,
+// Runs `cmd` as load_and_exec_config_or_die does, ending the process if it
+// takes longer than `seconds`.
+void load_and_exec_config_or_die_timed(Config *config, const char *cmd,
                                        int seconds);
 char *get_test_filename(const char *filename);
 void delete_file(const char *filename);
-void delete_fifo(const char *fifo_name);
 Config *config_create_or_die(const char *cmd);
 Config *config_create_default_test(void);
 WMP *wmp_create_or_die(const char *data_paths, const char *wmp_name);
@@ -142,5 +149,9 @@ void load_game_history_with_gcg(Config *config, const char *gcg_file);
 void assert_config_exec_status(Config *config, const char *cmd,
                                error_code_t expected_error_code);
 error_code_t get_config_exec_status(Config *config, const char *cmd);
+
+// Cuts the opponent's rack out of a CGP line ("<board> AB/CD ..." becomes
+// "<board> AB/ ...") in place, so a solve sees what the player sees.
+void strip_cgp_opp_rack(char *line);
 
 #endif

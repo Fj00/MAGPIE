@@ -1,7 +1,6 @@
 #include "play_chooser_test.h"
 
 #include "../src/compat/ctime.h"
-#include "../src/def/config_defs.h"
 #include "../src/def/game_defs.h"
 #include "../src/def/game_history_defs.h"
 #include "../src/def/peg_defs.h"
@@ -29,6 +28,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 static void test_game_timer(void) {
@@ -62,6 +62,67 @@ static void test_game_timer(void) {
   game_timer_end_turn(&game_timer);
   assert(game_timer_is_expired(&game_timer, 0));
   assert(!game_timer_is_expired(&game_timer, 1));
+  assert(game_timer_get_overtime_seconds(&game_timer, 0) > 0.0);
+  assert(game_timer_get_overtime_seconds(&game_timer, 1) == 0.0);
+
+  game_timer_reset_for_players(&game_timer, 0.01, 0.0);
+  assert(!game_timer_is_untimed(&game_timer));
+  assert(!game_timer_player_is_untimed(&game_timer, 0));
+  assert(game_timer_player_is_untimed(&game_timer, 1));
+  assert(game_timer_get_seconds_remaining(&game_timer, 0) == 0.01);
+  assert(isinf(game_timer_get_seconds_remaining(&game_timer, 1)));
+}
+
+static void test_play_chooser_clock_budget(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -s1 equity -s2 equity -r1 all -r2 all -threads 1");
+  load_and_exec_config_or_die(
+      config, "cgp 15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 "
+              "AEINRST/DEILNOR 0/0 0 -lex CSW21;");
+  const Game *game = config_get_game(config);
+  const int player_on_turn_index = game_get_player_on_turn_index(game);
+  GameTimer game_timer;
+  game_timer_reset(&game_timer, 1.0);
+  PlayChooserStrategy strategy = {
+      .pre_endgame_eval = PLAY_CHOOSER_EVAL_STATIC,
+      .endgame_eval = PLAY_CHOOSER_EVAL_STATIC,
+      .game_timer = &game_timer,
+      .overtime_period_seconds = 60.0,
+  };
+
+  // The main clock is split across the estimated remaining plays, with a
+  // reserve rather than a forced minimum that can overspend the clock.
+  const double initial_budget =
+      play_chooser_get_seconds_for_move(&strategy, game);
+  assert(initial_budget >= 0.05 && initial_budget < 0.1);
+
+  // Once flag fall starts the first penalty period, its remaining paid-for
+  // time can be budgeted. Near the next boundary, search stops so static move
+  // generation has enough reserve not to start another penalty period.
+  GameTimer first_overtime_timer = game_timer;
+  first_overtime_timer.seconds_used[player_on_turn_index] = 1.0;
+  strategy.game_timer = &first_overtime_timer;
+  assert(play_chooser_get_seconds_for_move(&strategy, game) > 1.0);
+  GameTimer next_period_boundary_timer = game_timer;
+  next_period_boundary_timer.seconds_used[player_on_turn_index] = 60.9;
+  strategy.game_timer = &next_period_boundary_timer;
+  assert(play_chooser_get_seconds_for_move(&strategy, game) == 0.0);
+
+  // If another period has already started, budget within that period rather
+  // than continuing an unbounded overrun.
+  GameTimer second_overtime_timer = game_timer;
+  second_overtime_timer.seconds_used[player_on_turn_index] = 61.001;
+  strategy.game_timer = &second_overtime_timer;
+  assert(play_chooser_get_seconds_for_move(&strategy, game) > 1.0);
+
+  // Callers without an overtime policy fall back to static after flag fall.
+  strategy.overtime_period_seconds = 0.0;
+  assert(play_chooser_get_seconds_for_move(&strategy, game) == 0.0);
+
+  // An explicit per-move budget remains independent of the game clock.
+  strategy.fixed_seconds_per_move = 0.125;
+  assert(play_chooser_get_seconds_for_move(&strategy, game) == 0.125);
+  config_destroy(config);
 }
 
 static void drain_bag(const Game *game) {
@@ -69,6 +130,50 @@ static void drain_bag(const Game *game) {
   while (!bag_is_empty(bag)) {
     bag_draw_random_letter(bag, 0);
   }
+}
+
+// An explicit sub-second endgame budget must reach the solver even when the
+// game clock has expired. Static play scores 13 with QA(T); a two-ply search
+// spends A and E for 6 instead, denying the opponent's immediate Z(AT)I
+// outplay. The search stops at two plies, a few milliseconds here, so half a
+// second leaves room for a busy machine without slowing an idle one.
+void test_play_chooser_fixed_short_budget(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -s1 equity -s2 equity -r1 all -r2 all -threads 1");
+  load_and_exec_config_or_die(
+      config, "cgp 15/15/15/15/15/15/15/7AT6/15/15/15/15/15/15/15 "
+              "AEQ/IZ 0/0 0 -lex CSW21;");
+  Game *game = config_get_game(config);
+  drain_bag(game);
+  GameTimer game_timer;
+  game_timer_reset(&game_timer, 1.0);
+  game_timer.seconds_used[game_get_player_on_turn_index(game)] = 1.0;
+  PlayChooserStrategy strategy = {
+      .pre_endgame_eval = PLAY_CHOOSER_EVAL_STATIC,
+      .endgame_eval = PLAY_CHOOSER_EVAL_ENDGAME,
+      .endgame_plies = 2,
+      .game_timer = &game_timer,
+      .num_threads = 1,
+  };
+  ErrorStack *error_stack = error_stack_create();
+  PlayChooser *clock_chooser = play_chooser_create(&strategy);
+  Move static_move;
+  play_chooser_choose_move(clock_chooser, game, &static_move, error_stack);
+  assert(error_stack_is_empty(error_stack));
+  assert(move_get_tiles_played(&static_move) == 2);
+  assert_move_score(&static_move, 13);
+  play_chooser_destroy(clock_chooser);
+
+  strategy.fixed_seconds_per_move = 0.5;
+  PlayChooser *fixed_chooser = play_chooser_create(&strategy);
+  Move searched_move;
+  play_chooser_choose_move(fixed_chooser, game, &searched_move, error_stack);
+  assert(error_stack_is_empty(error_stack));
+  assert(move_get_tiles_played(&searched_move) == 2);
+  assert_move_score(&searched_move, 6);
+  play_chooser_destroy(fixed_chooser);
+  error_stack_destroy(error_stack);
+  config_destroy(config);
 }
 
 // The opponent holds AABDDET, whose only bingo is the triple-triple
@@ -282,7 +387,7 @@ static void test_keep_phony_for_triple_triple(void) {
   game_timer_reset(&game_timer, 24.0);
   game_timer_start_turn(&game_timer, 1);
   WinPct *win_pcts =
-      win_pct_create(DEFAULT_TEST_DATA_PATH, DEFAULT_WIN_PCT, error_stack);
+      win_pct_create(DEFAULT_TEST_DATA_PATH, "winpct_english", error_stack);
   assert(error_stack_is_empty(error_stack));
   const PlayChooserStrategy sim_strategy = {
       .pre_endgame_eval = PLAY_CHOOSER_EVAL_SIM,
@@ -319,15 +424,121 @@ static void test_keep_phony_for_triple_triple(void) {
 static const char *const SEALED_CLUSTER_ROWS =
     "15/15/15/15/5VMV7/6Y8/15/15/15/15/15/15/15/15/15";
 
+// The verdicts below come from the solves, not from the clock: every solve
+// stops at a depth these one- and two-tile endgames finish well within, and
+// the time limits are far beyond it. Under a budget a busy machine can spend
+// before a solve is done (setting it up counts), the decision challenges by
+// default, which is not what these tests are about.
 static const PlayChooserStrategy ENDGAME_CHALLENGE_STRATEGY = {
     .pre_endgame_eval = PLAY_CHOOSER_EVAL_STATIC,
     .endgame_eval = PLAY_CHOOSER_EVAL_ENDGAME,
-    .fixed_seconds_per_move = 5.0,
+    .endgame_plies = 8,
+    .fixed_seconds_per_move = 60.0,
     .enable_challenges = true,
-    .challenge_decision_seconds = 4.0,
+    .challenge_decision_seconds = 60.0,
     .num_threads = 2,
     .seed = 42,
 };
+
+static const char *
+challenge_order_name(play_chooser_challenge_order_t challenge_order) {
+  switch (challenge_order) {
+  case PLAY_CHOOSER_CHALLENGE_ORDER_CONCURRENT:
+    return "concurrent";
+  case PLAY_CHOOSER_CHALLENGE_ORDER_KEEP_FIRST:
+    return "keep first";
+  case PLAY_CHOOSER_CHALLENGE_ORDER_CHALLENGE_FIRST:
+    return "challenge first";
+  }
+  return "unknown order";
+}
+
+// Asserts a challenge verdict. A wrong one is printed first, with how the
+// decision was reached, so a failure says which path it took. A tie
+// challenges, and a branch resolved by a null window reports a bound, so a
+// challenge verdict only needs the challenge value to be at least the keep
+// value.
+static void assert_challenge_verdict(const char *context,
+                                     const ChallengeDecision *decision,
+                                     bool should_challenge) {
+  const bool values_agree =
+      should_challenge ? decision->challenge_value >= decision->keep_value
+                       : decision->keep_value > decision->challenge_value;
+  if (!decision->move_is_phony ||
+      decision->should_challenge != should_challenge || !values_agree) {
+    (void)fprintf(stderr,
+                  "%s: expected to %s, got phony=%d challenge=%d "
+                  "keep_value=%.1f challenge_value=%.1f keep_exact=%d "
+                  "keep_valid=%d challenge_exact=%d challenge_valid=%d "
+                  "resolve_completed=%d\n",
+                  context, should_challenge ? "challenge" : "keep",
+                  (int)decision->move_is_phony, (int)decision->should_challenge,
+                  decision->keep_value, decision->challenge_value,
+                  (int)decision->keep_exact, (int)decision->keep_valid,
+                  (int)decision->challenge_exact,
+                  (int)decision->challenge_valid,
+                  (int)decision->resolve_completed);
+  }
+  assert(decision->move_is_phony);
+  assert(decision->should_challenge == should_challenge);
+  assert(values_agree);
+}
+
+// An endgame verdict on a phony must not depend on which branch finishes
+// first, on the thread count, or on the score. The outcome of an endgame is
+// set by the board and the racks, so shifting the score shifts both
+// branches' values alike. Decides the phony every way: each branch solved
+// first, both concurrently, with one and two threads, and with the
+// chooser's score moved up and down by 100.
+static void assert_endgame_challenge_verdict_every_way(const Game *game,
+                                                       const Move *phony_move,
+                                                       bool should_challenge) {
+  static const play_chooser_challenge_order_t challenge_orders[] = {
+      PLAY_CHOOSER_CHALLENGE_ORDER_CONCURRENT,
+      PLAY_CHOOSER_CHALLENGE_ORDER_KEEP_FIRST,
+      PLAY_CHOOSER_CHALLENGE_ORDER_CHALLENGE_FIRST,
+  };
+  static const int thread_counts[] = {1, 2};
+  static const int score_shifts[] = {0, 100, -100};
+  const int num_challenge_orders =
+      (int)(sizeof(challenge_orders) / sizeof(challenge_orders[0]));
+  const int num_thread_counts =
+      (int)(sizeof(thread_counts) / sizeof(thread_counts[0]));
+  const int num_score_shifts =
+      (int)(sizeof(score_shifts) / sizeof(score_shifts[0]));
+  ErrorStack *error_stack = error_stack_create();
+  for (int order_idx = 0; order_idx < num_challenge_orders; order_idx++) {
+    for (int thread_idx = 0; thread_idx < num_thread_counts; thread_idx++) {
+      PlayChooserStrategy strategy = ENDGAME_CHALLENGE_STRATEGY;
+      strategy.challenge_order = challenge_orders[order_idx];
+      strategy.num_threads = thread_counts[thread_idx];
+      // One chooser for every score: its transposition table holds values
+      // relative to the current spread, so the shifted positions share it.
+      PlayChooser *play_chooser = play_chooser_create(&strategy);
+      for (int shift_idx = 0; shift_idx < num_score_shifts; shift_idx++) {
+        Game *shifted_game = game_duplicate(game);
+        // The chooser is the player not on turn: the phony is the opponent's.
+        const int chooser_index =
+            1 - game_get_player_on_turn_index(shifted_game);
+        player_add_to_score(game_get_player(shifted_game, chooser_index),
+                            int_to_equity(score_shifts[shift_idx]));
+        ChallengeDecision decision;
+        play_chooser_decide_challenge(play_chooser, shifted_game, phony_move,
+                                      &decision, error_stack);
+        assert(error_stack_is_empty(error_stack));
+        char *context = get_formatted_string(
+            "%s, %d thread(s), chooser's score %+d",
+            challenge_order_name(challenge_orders[order_idx]),
+            thread_counts[thread_idx], score_shifts[shift_idx]);
+        assert_challenge_verdict(context, &decision, should_challenge);
+        free(context);
+        game_destroy(shifted_game);
+      }
+      play_chooser_destroy(play_chooser);
+    }
+  }
+  error_stack_destroy(error_stack);
+}
 
 // Endgame keep: the chooser holds TRANQ, and the only way to ever play
 // the Q is through the opponent's phony. The opponent plays G4 I(MY) —
@@ -356,15 +567,14 @@ static void test_endgame_keep_phony_for_only_q_play(void) {
   assert(validated_moves_is_phony(vms, 0));
   const Move *phony_move = validated_moves_get_move(vms, 0);
   assert(equity_to_int(move_get_score(phony_move)) == 8);
+  assert_endgame_challenge_verdict_every_way(game, phony_move, false);
 
   PlayChooser *play_chooser = play_chooser_create(&ENDGAME_CHALLENGE_STRATEGY);
   ChallengeDecision decision;
   play_chooser_decide_challenge(play_chooser, game, phony_move, &decision,
                                 error_stack);
   assert(error_stack_is_empty(error_stack));
-  assert(decision.move_is_phony);
-  assert(!decision.should_challenge);
-  assert(decision.keep_value > decision.challenge_value);
+  assert_challenge_verdict("keep for the only Q play", &decision, false);
 
   // Counterfactual: had the chooser challenged the I off, its best play
   // would be a small dump (ARMY or VANT-class plays through the cluster)
@@ -426,15 +636,14 @@ static void test_endgame_challenge_off_phony(void) {
   assert(validated_moves_is_phony(vms, 0));
   const Move *phony_move = validated_moves_get_move(vms, 0);
   assert(equity_to_int(move_get_score(phony_move)) == 17);
+  assert_endgame_challenge_verdict_every_way(game, phony_move, true);
 
   PlayChooser *play_chooser = play_chooser_create(&ENDGAME_CHALLENGE_STRATEGY);
   ChallengeDecision decision;
   play_chooser_decide_challenge(play_chooser, game, phony_move, &decision,
                                 error_stack);
   assert(error_stack_is_empty(error_stack));
-  assert(decision.move_is_phony);
-  assert(decision.should_challenge);
-  assert(decision.challenge_value > decision.keep_value);
+  assert_challenge_verdict("challenge off the phony", &decision, true);
 
   // Apply the challenge; the chooser goes out with (V)AT against the
   // opponent's stranded 26-point rack.
@@ -480,15 +689,14 @@ static void test_endgame_keep_phony_to_deny_better_replay(void) {
   assert(validated_moves_is_phony(vms, 0));
   const Move *phony_move = validated_moves_get_move(vms, 0);
   assert(equity_to_int(move_get_score(phony_move)) == 17);
+  assert_endgame_challenge_verdict_every_way(game, phony_move, false);
 
   PlayChooser *play_chooser = play_chooser_create(&ENDGAME_CHALLENGE_STRATEGY);
   ChallengeDecision decision;
   play_chooser_decide_challenge(play_chooser, game, phony_move, &decision,
                                 error_stack);
   assert(error_stack_is_empty(error_stack));
-  assert(decision.move_is_phony);
-  assert(!decision.should_challenge);
-  assert(decision.keep_value > decision.challenge_value);
+  assert_challenge_verdict("keep to deny a better replay", &decision, false);
 
   // Sanity check the threat the chooser is avoiding: if the phony were
   // challenged off, the opponent's best reply would be the 42-point
@@ -516,9 +724,8 @@ static void test_endgame_keep_phony_to_deny_better_replay(void) {
 
 // Solve game to the full requested plies with a single thread, optionally
 // with a fixed [window_alpha, window_beta] search window, and return the
-// reported value. The scores in the test position are equal, so the
-// reported value (a spread delta) and the window units (final spread)
-// coincide.
+// reported value. The window is in final-spread units, and the reported
+// value is the change from the current spread.
 static int32_t solve_endgame_with_window(Game *game, EndgameCtx **endgame_ctx,
                                          EndgameResults *endgame_results,
                                          bool use_window, int32_t window_alpha,
@@ -551,15 +758,22 @@ static int32_t solve_endgame_with_window(Game *game, EndgameCtx **endgame_ctx,
 }
 
 // Verify the fixed-window solve semantics that the challenge decider's
-// null-window resolve relies on: against the exact value V of a
-// position, a [V, V+1] window must fail low (the position does not beat
-// V) and a [V-1, V] window must fail high (it does beat V-1).
-static void test_endgame_initial_window(void) {
+// null-window resolve relies on: against the exact final spread F of a
+// position, a [F, F+1] window must fail low (the position does not beat
+// F) and a [F-1, F] window must fail high (it does beat F-1). The decider
+// puts the window around the other branch's final spread, so the window
+// must be in final-spread units: with the player on turn behind by 50, F
+// is the reported value minus 50.
+static void check_endgame_initial_window(const char *scores,
+                                         int32_t on_turn_spread) {
   Config *config = config_create_or_die(
       "set -lex CSW21 -s1 equity -s2 equity -r1 all -r2 all -threads 1");
-  load_and_exec_config_or_die(
-      config, "cgp 15/7A7/15/15/5VMV7/6Y8/15/15/15/15/15/15/15/15/15 "
-              "ZC/QC 300/300 0 -lex CSW21;");
+  char *cgp_command = get_formatted_string(
+      "cgp 15/7A7/15/15/5VMV7/6Y8/15/15/15/15/15/15/15/15/15 ZC/QC %s 0 "
+      "-lex CSW21;",
+      scores);
+  load_and_exec_config_or_die(config, cgp_command);
+  free(cgp_command);
   Game *game = config_get_game(config);
   drain_bag(game);
 
@@ -567,16 +781,24 @@ static void test_endgame_initial_window(void) {
   EndgameResults *endgame_results = endgame_results_create();
   const int32_t exact_value = solve_endgame_with_window(
       game, &endgame_ctx, endgame_results, false, 0, 0);
-  const int32_t at_value = solve_endgame_with_window(
-      game, &endgame_ctx, endgame_results, true, exact_value, exact_value + 1);
+  const int32_t final_spread = on_turn_spread + exact_value;
+  const int32_t at_value =
+      solve_endgame_with_window(game, &endgame_ctx, endgame_results, true,
+                                final_spread, final_spread + 1);
   assert(at_value <= exact_value);
-  const int32_t below_value = solve_endgame_with_window(
-      game, &endgame_ctx, endgame_results, true, exact_value - 1, exact_value);
+  const int32_t below_value =
+      solve_endgame_with_window(game, &endgame_ctx, endgame_results, true,
+                                final_spread - 1, final_spread);
   assert(below_value >= exact_value);
 
   endgame_results_destroy(endgame_results);
   endgame_ctx_destroy(endgame_ctx);
   config_destroy(config);
+}
+
+static void test_endgame_initial_window(void) {
+  check_endgame_initial_window("300/300", 0);
+  check_endgame_initial_window("250/300", -50);
 }
 
 // Pre-endgame challenge decisions driven by the PEG solver. In a real
@@ -759,7 +981,7 @@ static void test_challenge_stage_combinations(void) {
       "set -lex CSW21 -s1 equity -s2 equity -r1 all -r2 all -threads 1");
   ErrorStack *error_stack = error_stack_create();
   WinPct *win_pcts =
-      win_pct_create(DEFAULT_TEST_DATA_PATH, DEFAULT_WIN_PCT, error_stack);
+      win_pct_create(DEFAULT_TEST_DATA_PATH, "winpct_english", error_stack);
   assert(error_stack_is_empty(error_stack));
 
   const PlayChooserStrategy strategy = {
@@ -914,6 +1136,8 @@ static void test_challenge_stage_combinations(void) {
 
 void test_play_chooser(void) {
   test_game_timer();
+  test_play_chooser_clock_budget();
+  test_play_chooser_fixed_short_budget();
   test_keep_phony_for_triple_triple();
   test_challenge_off_blocks_bingo();
   test_endgame_keep_phony_for_only_q_play();

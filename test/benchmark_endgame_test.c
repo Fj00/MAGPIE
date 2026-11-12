@@ -1,5 +1,6 @@
 #include "benchmark_endgame_test.h"
 
+#include "../src/compat/cfile.h"
 #include "../src/compat/ctime.h"
 #include "../src/def/equity_defs.h"
 #include "../src/def/game_defs.h"
@@ -21,23 +22,19 @@
 #include "../src/impl/gameplay.h"
 #include "../src/impl/move_gen.h"
 #include "../src/util/io_util.h"
+#include "../src/util/string_util.h"
+#include "test_platform.h"
 #include "test_util.h"
 #include <assert.h>
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <time.h>
 
 // Execute config command quietly (suppress stdout during execution)
 static void exec_config_quiet(Config *config, const char *cmd) {
-  // Suppress stdout
-  (void)fflush(stdout);
-  int saved_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0);
-  int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
-  (void)dup2(devnull, STDOUT_FILENO);
-  close(devnull);
+  const int saved_stdout = test_platform_silence_stdout();
 
   ErrorStack *error_stack = error_stack_create();
   thread_control_set_status(config_get_thread_control(config),
@@ -50,10 +47,7 @@ static void exec_config_quiet(Config *config, const char *cmd) {
   thread_control_set_status(config_get_thread_control(config),
                             THREAD_CONTROL_STATUS_FINISHED);
 
-  // Restore stdout
-  (void)fflush(stdout);
-  (void)dup2(saved_stdout, STDOUT_FILENO);
-  close(saved_stdout);
+  test_platform_restore_stdout(saved_stdout);
 }
 
 // Play moves until the bag is empty, returning true if we get a valid endgame
@@ -93,7 +87,6 @@ static float compute_stuck_fraction(Game *game, MoveList *move_list,
       .override_kwg = NULL,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
       .tiles_played_bv = &tiles_bv,
   };
   generate_moves(&args);
@@ -124,8 +117,8 @@ static float compute_stuck_fraction(Game *game, MoveList *move_list,
 
 // Generate stuck-tile CGPs: self-play games until endgame, filter for
 // positions where the opponent is 100% stuck (all rack tiles stuck).
-// Saves CGPs to /tmp/stuck_100pct_cgps.txt and partial-stuck to
-// /tmp/stuck_partial_cgps.txt.
+// Saves CGPs, in the temporary directory, to stuck_100pct_cgps.txt and
+// partial-stuck to stuck_partial_cgps.txt.
 void test_generate_stuck_cgps(void) {
   log_set_level(LOG_FATAL);
 
@@ -142,9 +135,12 @@ void test_generate_stuck_cgps(void) {
   const uint64_t base_seed = 7777;
   const int max_attempts = 1500000;
 
-  FILE *fp_full = fopen("/tmp/stuck_100pct_cgps.txt", "we");
-  FILE *fp_partial = fopen("/tmp/stuck_partial_cgps.txt", "we");
-  FILE *fp_hard = fopen("/tmp/stuck_hard_endgame_cgps.txt", "we");
+  char *full_path = test_platform_temporary_path("stuck_100pct_cgps.txt");
+  char *partial_path = test_platform_temporary_path("stuck_partial_cgps.txt");
+  char *hard_path = test_platform_temporary_path("stuck_hard_endgame_cgps.txt");
+  FILE *fp_full = cfile_open(full_path, "we", false);
+  FILE *fp_partial = cfile_open(partial_path, "we", false);
+  FILE *fp_hard = cfile_open(hard_path, "we", false);
   assert(fp_full);
   assert(fp_partial);
   assert(fp_hard);
@@ -234,17 +230,17 @@ void test_generate_stuck_cgps(void) {
   printf("==============================================================\n");
   printf("  Generate Stuck CGPs (seed=%llu)\n", (unsigned long long)base_seed);
   printf("==============================================================\n");
-  printf("  100%% stuck: %d positions → /tmp/stuck_100pct_cgps.txt\n",
-         found_full);
-  printf("  50-99%% stuck: %d positions → /tmp/stuck_partial_cgps.txt\n",
-         found_partial);
-  printf("  any stuck at bag-empty: %d positions → "
-         "/tmp/stuck_hard_endgame_cgps.txt\n",
-         found_hard);
+  printf("  100%% stuck: %d positions → %s\n", found_full, full_path);
+  printf("  50-99%% stuck: %d positions → %s\n", found_partial, partial_path);
+  printf("  any stuck at bag-empty: %d positions → %s\n", found_hard,
+         hard_path);
   printf("==============================================================\n");
   (void)fflush(stdout);
 
   move_list_destroy(move_list);
+  free(full_path);
+  free(partial_path);
+  free(hard_path);
   config_destroy(config);
 }
 
@@ -260,7 +256,7 @@ static void generate_nonstuck_cgps(uint64_t base_seed, const char *outfile) {
   const int target = 500;
   const int max_attempts = 100000;
 
-  FILE *fp = fopen(outfile, "we");
+  FILE *fp = cfile_open(outfile, "we", false);
   assert(fp);
 
   int found = 0;
@@ -308,19 +304,24 @@ static void generate_nonstuck_cgps(uint64_t base_seed, const char *outfile) {
 
 void test_generate_nonstuck_cgps(void) {
   log_set_level(LOG_FATAL);
-  generate_nonstuck_cgps(31415, "/tmp/nonstuck_cgps.txt");
+  char *path = test_platform_temporary_path("nonstuck_cgps.txt");
+  generate_nonstuck_cgps(31415, path);
+  free(path);
 }
 
 void test_generate_nonstuck_cgps2(void) {
   log_set_level(LOG_FATAL);
-  generate_nonstuck_cgps(271828, "/tmp/nonstuck_cgps2.txt");
+  char *path = test_platform_temporary_path("nonstuck_cgps2.txt");
+  generate_nonstuck_cgps(271828, path);
+  free(path);
 }
 
 // Core A/B benchmark: solve each CGP twice (with and without
-// forced-pass bypass), comparing value and time pairwise.
+// forced-pass bypass), comparing value and time pairwise. Both solves use the
+// incremental move lists, as the endgame command does.
 static void run_ab_benchmark(const char *cgp_file, const char *label,
                              int old_ply, int new_ply, int max_positions) {
-  FILE *fp = fopen(cgp_file, "re");
+  FILE *fp = cfile_open(cgp_file, "re", false);
   if (!fp) {
     printf("No CGP file found at %s — run genstuck/gennonstuck first.\n",
            cgp_file);
@@ -390,6 +391,7 @@ static void run_ab_benchmark(const char *cgp_file, const char *label,
                         .per_ply_callback = NULL,
                         .per_ply_callback_data = NULL,
                         .forced_pass_bypass = false,
+                        .incremental_movegen = true,
                         .enable_pv_display = false,
                         .seed = 42};
 
@@ -463,17 +465,23 @@ static void run_ab_benchmark(const char *cgp_file, const char *label,
 
 void test_benchmark_forced_pass(void) {
   log_set_level(LOG_FATAL);
-  run_ab_benchmark("/tmp/stuck_100pct_cgps.txt", "stuck", 3, 2, 500);
+  char *path = test_platform_temporary_path("stuck_100pct_cgps.txt");
+  run_ab_benchmark(path, "stuck", 3, 2, 500);
+  free(path);
 }
 
 void test_benchmark_nonstuck(void) {
   log_set_level(LOG_FATAL);
-  run_ab_benchmark("/tmp/nonstuck_cgps.txt", "nonstuck", 3, 2, 500);
+  char *path = test_platform_temporary_path("nonstuck_cgps.txt");
+  run_ab_benchmark(path, "nonstuck", 3, 2, 500);
+  free(path);
 }
 
 void test_benchmark_nonstuck_3v3(void) {
   log_set_level(LOG_FATAL);
-  run_ab_benchmark("/tmp/nonstuck_cgps.txt", "nonstuck", 3, 3, 500);
+  char *path = test_platform_temporary_path("nonstuck_cgps.txt");
+  run_ab_benchmark(path, "nonstuck", 3, 3, 500);
+  free(path);
 }
 
 // ---------------------------------------------------------------------------
@@ -492,14 +500,25 @@ void test_benchmark_nonstuck_3v3(void) {
 // the search tree identical, while a pruning change shows as fewer nodes with
 // an unchanged value.
 //
-// Parameterized entirely by environment so the same binary can sweep depth /
-// thread count / battery without recompiling:
-//   MAGPIE_BENCH_CGP     CGP file           (default /tmp/nonstuck_cgps.txt)
-//   MAGPIE_BENCH_LEX     lexicon            (default CSW21)
-//   MAGPIE_BENCH_PLIES   endgame plies      (default 4)
-//   MAGPIE_BENCH_THREADS solver threads     (default 1  -> deterministic nodes)
-//   MAGPIE_BENCH_MAX     max positions      (default 100)
-//   MAGPIE_BENCH_TAG     label for the run  (default "bench")
+// Run as egspeedbench for the defaults, or egspeedbench:<key>=<value>,... so
+// the same binary can sweep depth / thread count / battery without
+// recompiling:
+//   cgp          CGP file  (default nonstuck_cgps.txt, temporary dir)
+//   lex          lexicon            (default CSW21)
+//   plies        endgame plies      (default 4)
+//   threads      solver threads     (default 1  -> deterministic nodes)
+//   max          max positions      (default 100)
+//   bypass       1 = forced-pass bypass (default 1)
+//   incremental  1 = incremental move lists (default 1)
+//   interleave   1 = solve each position with the lists off and on,
+//                alternating order (default 0); incremental is then ignored
+//   tag          label for the run  (default "bench")
+// For example: egspeedbench:cgp=positions.txt,plies=5,threads=4,bypass=0
+// Every solve starts from a cleared TT, so no solve inherits an earlier one's
+// entries. The default, bypass=1, solves as the endgame, analyze, autoplay
+// and PEG solves do. Each row ends with the solve's CPU time
+// across all of its threads (clock(), which is wall time on Windows), so a
+// multi-threaded run shows how much of the machine its speedup cost.
 static int env_int(const char *name, int fallback) {
   const char *v = getenv(name);
   if (v == NULL || v[0] == '\0') {
@@ -516,28 +535,41 @@ static double env_double(const char *name, double fallback) {
   return strtod(v, NULL);
 }
 
-void test_endgame_speed_bench(void) {
+typedef struct EndgameSpeedBenchArgs {
+  const char *cgp_file; // NULL = nonstuck_cgps.txt in the temporary directory
+  const char *lex;
+  const char *tag;
+  int plies;
+  int threads;
+  int max_positions;
+  bool bypass;
+  bool incremental;
+  bool interleave;
+} EndgameSpeedBenchArgs;
+
+static void run_endgame_speed_bench(const EndgameSpeedBenchArgs *bench_args) {
   log_set_level(LOG_FATAL);
 
-  const char *cgp_file = getenv("MAGPIE_BENCH_CGP");
-  if (cgp_file == NULL || cgp_file[0] == '\0') {
-    cgp_file = "/tmp/nonstuck_cgps.txt";
-  }
-  const char *lex = getenv("MAGPIE_BENCH_LEX");
-  if (lex == NULL || lex[0] == '\0') {
-    lex = "CSW21";
-  }
-  const char *tag = getenv("MAGPIE_BENCH_TAG");
-  if (tag == NULL || tag[0] == '\0') {
-    tag = "bench";
-  }
-  const int plies = env_int("MAGPIE_BENCH_PLIES", 4);
-  const int threads = env_int("MAGPIE_BENCH_THREADS", 1);
-  const int max_positions = env_int("MAGPIE_BENCH_MAX", 100);
+  char *default_cgp_file = test_platform_temporary_path("nonstuck_cgps.txt");
+  const char *cgp_file =
+      bench_args->cgp_file != NULL ? bench_args->cgp_file : default_cgp_file;
+  const char *lex = bench_args->lex;
+  const char *tag = bench_args->tag;
+  const int plies = bench_args->plies;
+  const int threads = bench_args->threads;
+  const int max_positions = bench_args->max_positions;
+  const bool bypass = bench_args->bypass;
+  const bool incremental = bench_args->incremental;
+  // Interleaved A/B: solve every position with the incremental lists off and
+  // on, back to back, alternating which goes first per position so neither
+  // side systematically benefits from a warm cache. Rows carry a cfg column
+  // and two summaries are printed.
+  const bool interleave = bench_args->interleave;
 
-  FILE *fp = fopen(cgp_file, "re");
+  FILE *fp = cfile_open(cgp_file, "re", false);
   if (!fp) {
     printf("BENCHERR no CGP file at %s\n", cgp_file);
+    free(default_cgp_file);
     return;
   }
 
@@ -564,68 +596,168 @@ void test_endgame_speed_bench(void) {
   }
   (void)fclose(fp);
 
-  printf("BENCHCFG tag=%s lex=%s plies=%d threads=%d positions=%d file=%s\n",
-         tag, lex, plies, threads, num_cgps, cgp_file);
+  printf("BENCHCFG tag=%s lex=%s plies=%d threads=%d bypass=%d incremental=%d "
+         "interleave=%d positions=%d file=%s\n",
+         tag, lex, plies, threads, (int)bypass, (int)incremental,
+         (int)interleave, num_cgps, cgp_file);
 
-  double total_time = 0.0;
-  uint64_t total_nodes = 0;
+  // Index 0 = incremental off, 1 = on. Non-interleaved runs use only
+  // cfg_totals[incremental].
+  double cfg_time[2] = {0.0, 0.0};
+  double cfg_cpu[2] = {0.0, 0.0};
+  uint64_t cfg_nodes[2] = {0, 0};
 
   for (int ci = 0; ci < num_cgps; ci++) {
-    ErrorStack *err = error_stack_create();
-    game_load_cgp(game, cgp_lines[ci], err);
-    if (!error_stack_is_empty(err)) {
+    const int num_cfgs = interleave ? 2 : 1;
+    for (int cfg_ord = 0; cfg_ord < num_cfgs; cfg_ord++) {
+      // Alternate the order per position: even positions run off first,
+      // odd positions run on first.
+      int cfg = incremental ? 1 : 0;
+      if (interleave) {
+        cfg = (ci % 2 == 0) ? cfg_ord : 1 - cfg_ord;
+      }
+
+      ErrorStack *err = error_stack_create();
+      game_load_cgp(game, cgp_lines[ci], err);
+      if (!error_stack_is_empty(err)) {
+        error_stack_destroy(err);
+        printf("BENCHROW %d SKIP_LOAD\n", ci);
+        // Every config loads the same CGP, so skip the position outright.
+        break;
+      }
       error_stack_destroy(err);
-      printf("BENCHROW %d SKIP_LOAD\n", ci);
-      continue;
+
+      EndgameArgs args = {.game = game,
+                          .thread_control = config_get_thread_control(config),
+                          .plies = plies,
+                          .tt_fraction_of_mem = 0.05,
+                          .initial_small_move_arena_size =
+                              DEFAULT_INITIAL_SMALL_MOVE_ARENA_SIZE,
+                          .num_threads = threads,
+                          .num_top_moves = 1,
+                          .use_heuristics = true,
+                          .per_ply_callback = NULL,
+                          .per_ply_callback_data = NULL,
+                          .forced_pass_bypass = bypass,
+                          .incremental_movegen = cfg != 0,
+                          .enable_pv_display = false,
+                          .seed = 42};
+
+      if (solver != NULL) {
+        endgame_ctx_clear_transposition_table(solver);
+      }
+
+      Timer t;
+      ctimer_start(&t);
+      const clock_t cpu_start = clock();
+      err = error_stack_create();
+      endgame_solve(&solver, &args, results, err);
+      double elapsed = ctimer_elapsed_seconds(&t);
+      const double cpu = (double)(clock() - cpu_start) / (double)CLOCKS_PER_SEC;
+      assert(error_stack_is_empty(err));
+      error_stack_destroy(err);
+
+      int32_t value =
+          endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
+      uint64_t nodes = endgame_ctx_get_nodes_searched(solver);
+
+      if (interleave) {
+        printf("BENCHROW %d %s %d %llu %.6f %.6f\n", ci, cfg ? "on" : "off",
+               value, (unsigned long long)nodes, elapsed, cpu);
+      } else {
+        printf("BENCHROW %d %d %llu %.6f %.6f\n", ci, value,
+               (unsigned long long)nodes, elapsed, cpu);
+      }
+      cfg_time[cfg] += elapsed;
+      cfg_cpu[cfg] += cpu;
+      cfg_nodes[cfg] += nodes;
     }
-    error_stack_destroy(err);
-
-    EndgameArgs args = {.game = game,
-                        .thread_control = config_get_thread_control(config),
-                        .plies = plies,
-                        .tt_fraction_of_mem = 0.05,
-                        .initial_small_move_arena_size =
-                            DEFAULT_INITIAL_SMALL_MOVE_ARENA_SIZE,
-                        .num_threads = threads,
-                        .num_top_moves = 1,
-                        .use_heuristics = true,
-                        .per_ply_callback = NULL,
-                        .per_ply_callback_data = NULL,
-                        .forced_pass_bypass = true,
-                        .enable_pv_display = false,
-                        .seed = 42};
-
-    Timer t;
-    ctimer_start(&t);
-    err = error_stack_create();
-    endgame_solve(&solver, &args, results, err);
-    double elapsed = ctimer_elapsed_seconds(&t);
-    assert(error_stack_is_empty(err));
-    error_stack_destroy(err);
-
-    int32_t value =
-        endgame_results_get_pvline(results, ENDGAME_RESULT_BEST)->score;
-    uint64_t nodes = endgame_ctx_get_nodes_searched(solver);
-
-    printf("BENCHROW %d %d %llu %.6f\n", ci, value, (unsigned long long)nodes,
-           elapsed);
-    total_time += elapsed;
-    total_nodes += nodes;
     if ((ci + 1) % 25 == 0) {
       (void)fflush(stdout);
     }
   }
 
-  printf("BENCHSUM tag=%s positions=%d total_time=%.4f total_nodes=%llu "
-         "nps=%.0f\n",
-         tag, num_cgps, total_time, (unsigned long long)total_nodes,
-         total_time > 0 ? (double)total_nodes / total_time : 0.0);
+  const int single_cfg = incremental ? 1 : 0;
+  const int first_cfg = interleave ? 0 : single_cfg;
+  const int last_cfg = interleave ? 1 : single_cfg;
+  for (int cfg = first_cfg; cfg <= last_cfg; cfg++) {
+    printf("BENCHSUM tag=%s cfg=%s positions=%d total_time=%.4f "
+           "total_cpu=%.4f total_nodes=%llu nps=%.0f\n",
+           tag, cfg ? "on" : "off", num_cgps, cfg_time[cfg], cfg_cpu[cfg],
+           (unsigned long long)cfg_nodes[cfg],
+           cfg_time[cfg] > 0 ? (double)cfg_nodes[cfg] / cfg_time[cfg] : 0.0);
+  }
   (void)fflush(stdout);
 
   free(cgp_lines);
+  free(default_cgp_file);
   endgame_ctx_destroy(solver);
   endgame_results_destroy(results);
   config_destroy(config);
+}
+
+static EndgameSpeedBenchArgs endgame_speed_bench_default_args(void) {
+  return (EndgameSpeedBenchArgs){.cgp_file = NULL,
+                                 .lex = "CSW21",
+                                 .tag = "bench",
+                                 .plies = 4,
+                                 .threads = 1,
+                                 .max_positions = 100,
+                                 .bypass = true,
+                                 .incremental = true,
+                                 .interleave = false};
+}
+
+// The integer after "<key>=" in item.
+static int speed_bench_spec_int(const char *item, const char *key) {
+  ErrorStack *error_stack = error_stack_create();
+  const int value = string_to_int(item + strlen(key) + 1, error_stack);
+  if (!error_stack_is_empty(error_stack)) {
+    log_fatal("egspeedbench %s must be an integer, got '%s'", key, item);
+  }
+  error_stack_destroy(error_stack);
+  return value;
+}
+
+void test_endgame_speed_bench(void) {
+  const EndgameSpeedBenchArgs args = endgame_speed_bench_default_args();
+  run_endgame_speed_bench(&args);
+}
+
+// "<key>=<value>[,<key>=<value>...]", with the keys listed above.
+void endgame_speed_bench_run_spec(const char *spec) {
+  EndgameSpeedBenchArgs args = endgame_speed_bench_default_args();
+  StringSplitter *items = split_string(spec, ',', true);
+  const int num_items = string_splitter_get_number_of_items(items);
+  for (int item_idx = 0; item_idx < num_items; item_idx++) {
+    const char *item = string_splitter_get_item(items, item_idx);
+    if (has_prefix("cgp=", item)) {
+      args.cgp_file = item + strlen("cgp=");
+    } else if (has_prefix("lex=", item)) {
+      args.lex = item + strlen("lex=");
+    } else if (has_prefix("tag=", item)) {
+      args.tag = item + strlen("tag=");
+    } else if (has_prefix("plies=", item)) {
+      args.plies = speed_bench_spec_int(item, "plies");
+    } else if (has_prefix("threads=", item)) {
+      args.threads = speed_bench_spec_int(item, "threads");
+    } else if (has_prefix("max=", item)) {
+      args.max_positions = speed_bench_spec_int(item, "max");
+    } else if (has_prefix("bypass=", item)) {
+      args.bypass = speed_bench_spec_int(item, "bypass") != 0;
+    } else if (has_prefix("incremental=", item)) {
+      args.incremental = speed_bench_spec_int(item, "incremental") != 0;
+    } else if (has_prefix("interleave=", item)) {
+      args.interleave = speed_bench_spec_int(item, "interleave") != 0;
+    } else {
+      log_fatal("egspeedbench spec takes cgp, lex, tag, plies, threads, max, "
+                "bypass, incremental and interleave, got '%s'",
+                item);
+    }
+  }
+  // The strings in args point into items, so it outlives the run.
+  run_endgame_speed_bench(&args);
+  string_splitter_destroy(items);
 }
 
 // ---------------------------------------------------------------------------
@@ -644,7 +776,7 @@ void test_endgame_speed_bench(void) {
 //   POROW <idx> moves=<n> nodes=<N> depthsum=<D> time=<s> ended=<0|1>
 // and a summary. Set MAGPIE_PO_TIMEMS=0 to disable the time limit and instead
 // fully solve each move to MAGPIE_PO_PLIES (a pure speed comparison).
-//   MAGPIE_PO_CGP    CGP file        (default /tmp/nonstuck_cgps.txt)
+//   MAGPIE_PO_CGP    CGP file  (default nonstuck_cgps.txt, temporary dir)
 //   MAGPIE_PO_LEX    lexicon         (default CSW21)
 //   MAGPIE_PO_MAX    positions       (default 20)
 //   MAGPIE_PO_TIMEMS per-move budget (default 100; 0 = no limit)
@@ -652,12 +784,14 @@ void test_endgame_speed_bench(void) {
 //   MAGPIE_PO_THREADS solver threads (default 1)
 //   MAGPIE_PO_MAXMOVES per-playout move cap (default 40, safety)
 //   MAGPIE_PO_TAG    label           (default "playout")
+//   MAGPIE_PO_INCREMENTAL 1 = incremental move lists (default 1)
 void test_endgame_playout_bench(void) {
   log_set_level(LOG_FATAL);
 
+  char *default_cgp_file = test_platform_temporary_path("nonstuck_cgps.txt");
   const char *cgp_file = getenv("MAGPIE_PO_CGP");
   if (cgp_file == NULL || cgp_file[0] == '\0') {
-    cgp_file = "/tmp/nonstuck_cgps.txt";
+    cgp_file = default_cgp_file;
   }
   const char *lex = getenv("MAGPIE_PO_LEX");
   if (lex == NULL || lex[0] == '\0') {
@@ -671,11 +805,13 @@ void test_endgame_playout_bench(void) {
   const int time_ms = env_int("MAGPIE_PO_TIMEMS", 100);
   const int max_plies = env_int("MAGPIE_PO_PLIES", 25);
   const int threads = env_int("MAGPIE_PO_THREADS", 1);
+  const bool incremental = env_int("MAGPIE_PO_INCREMENTAL", 1) != 0;
   const int max_moves = env_int("MAGPIE_PO_MAXMOVES", 40);
 
-  FILE *fp = fopen(cgp_file, "re");
+  FILE *fp = cfile_open(cgp_file, "re", false);
   if (!fp) {
     printf("POERR no CGP file at %s\n", cgp_file);
+    free(default_cgp_file);
     return;
   }
 
@@ -703,8 +839,9 @@ void test_endgame_playout_bench(void) {
   }
   (void)fclose(fp);
 
-  printf("POCFG tag=%s lex=%s time_ms=%d plies=%d threads=%d positions=%d\n",
-         tag, lex, time_ms, max_plies, threads, num_cgps);
+  printf("POCFG tag=%s lex=%s time_ms=%d plies=%d threads=%d incremental=%d "
+         "positions=%d\n",
+         tag, lex, time_ms, max_plies, threads, (int)incremental, num_cgps);
 
   long total_moves = 0;
   uint64_t total_nodes = 0;
@@ -752,6 +889,7 @@ void test_endgame_playout_bench(void) {
                           .num_top_moves = 1,
                           .use_heuristics = true,
                           .forced_pass_bypass = true,
+                          .incremental_movegen = incremental,
                           .enable_pv_display = false,
                           .soft_time_limit = 0,
                           .hard_time_limit = 0,
@@ -814,6 +952,7 @@ void test_endgame_playout_bench(void) {
   (void)fflush(stdout);
 
   free(cgp_lines);
+  free(default_cgp_file);
   move_destroy(play);
   endgame_ctx_destroy(solver);
   endgame_results_destroy(results);
@@ -901,6 +1040,7 @@ void test_endgame_move1(void) {
       .num_top_moves = 1,
       .use_heuristics = true,
       .forced_pass_bypass = true,
+      .incremental_movegen = true,
       .enable_pv_display = false,
       .soft_time_limit = soft,
       .hard_time_limit = hard,
@@ -1084,5 +1224,115 @@ void test_endgame_compare(void) {
   move_list_destroy(move_list);
   endgame_results_destroy(results);
   (void)solver;  // freed at process exit (matches benchns)
+  config_destroy(config);
+}
+
+// Reproducible corpus and solver measurements for root-search changes. Each
+// record is a separate solve with a fresh TT; output includes values and moves
+// so timing comparisons cannot silently hide changed answers.
+void test_endgame_root_bench(void) {
+  log_set_level(LOG_FATAL);
+  const char *path = getenv("MAGPIE_ROOT_FILE");
+  assert(path != NULL);
+  const int count = env_int("MAGPIE_ROOT_COUNT", 64);
+  const int threads = env_int("MAGPIE_ROOT_THREADS", 1);
+  char settings[256];
+  (void)snprintf(settings, sizeof(settings),
+                 "set -lex CSW24 -threads %d -wmp true -rit true -wit true "
+                 "-s1 equity -s2 equity",
+                 threads);
+  Config *config = config_create_or_die(settings);
+  exec_config_quiet(config, "new");
+  Game *game = config_get_game(config);
+  if (env_int("MAGPIE_ROOT_GENERATE", 0)) {
+    FILE *output = cfile_open(path, "we", false);
+    assert(output != NULL);
+    MoveList *moves = move_list_create(1);
+    int found = 0;
+    const int seed = env_int("MAGPIE_ROOT_SEED", 420000103);
+    for (int attempt = 0; found < count && attempt < count * 100; attempt++) {
+      game_reset(game);
+      game_seed(game, (uint64_t)seed + (uint64_t)attempt);
+      draw_starting_racks(game);
+      if (!play_until_bag_empty(game, moves)) {
+        continue;
+      }
+      if (env_int("MAGPIE_ROOT_SMALL", 0)) {
+        while (
+            rack_get_total_letters(player_get_rack(game_get_player(game, 0))) +
+                    rack_get_total_letters(
+                        player_get_rack(game_get_player(game, 1))) >
+                6 &&
+            game_get_game_end_reason(game) == GAME_END_REASON_NONE) {
+          play_move(get_top_equity_move(game, moves), game, NULL);
+        }
+      }
+      if (game_get_game_end_reason(game) != GAME_END_REASON_NONE) {
+        continue;
+      }
+      char *cgp = game_get_cgp(game, true);
+      const int written = fprintf(output, "%s\n", cgp);
+      assert(written > 0);
+      free(cgp);
+      found++;
+    }
+    assert(found == count);
+    const int close_status = fclose(output);
+    assert(close_status == 0);
+    move_list_destroy(moves);
+    config_destroy(config);
+    return;
+  }
+  FILE *input = cfile_open(path, "re", false);
+  assert(input != NULL);
+  char cgp[4096];
+  for (int position = 0; position < count; position++) {
+    const char *line = fgets(cgp, sizeof(cgp), input);
+    assert(line != NULL);
+    ErrorStack *errors = error_stack_create();
+    game_load_cgp(game, cgp, errors);
+    assert(error_stack_is_empty(errors));
+    EndgameCtx *solver = NULL;
+    EndgameResults *results = endgame_results_create();
+    EndgameArgs args = {
+        .game = game,
+        .thread_control = config_get_thread_control(config),
+        .plies = env_int("MAGPIE_ROOT_PLIES", 4),
+        .tt_fraction_of_mem = 0.01,
+        .initial_small_move_arena_size = DEFAULT_INITIAL_SMALL_MOVE_ARENA_SIZE,
+        .num_threads = threads,
+        .num_top_moves = env_int("MAGPIE_ROOT_TOPK", 1),
+        .use_heuristics = true,
+        .forced_pass_bypass = true,
+        .incremental_movegen = true,
+        .first_win = env_int("MAGPIE_ROOT_FIRSTWIN", 0) != 0,
+        .hard_time_limit = env_double("MAGPIE_ROOT_SECONDS", 0),
+        .seed = 42,
+    };
+    Timer timer;
+    ctimer_start(&timer);
+    if (args.hard_time_limit > 0) {
+      args.external_deadline_ns =
+          ctimer_monotonic_ns() + (int64_t)(args.hard_time_limit * 1e9);
+    }
+    endgame_solve(&solver, &args, results, errors);
+    const double elapsed = ctimer_elapsed_seconds(&timer);
+    assert(error_stack_is_empty(errors));
+    const PVLine *pv = endgame_results_get_pvline(results, ENDGAME_RESULT_BEST);
+    printf(
+        "ROOTROW %d value=%d spread=%d depth=%d nodes=%llu seconds=%.9f "
+        "move=%llu\n",
+        position, pv->score,
+        endgame_results_get_spread(results, ENDGAME_RESULT_BEST, game),
+        endgame_results_get_depth(results, ENDGAME_RESULT_BEST),
+        (unsigned long long)endgame_ctx_get_nodes_searched(solver), elapsed,
+        (unsigned long long)(pv->num_moves > 0 ? pv->moves[0].tiny_move : 0));
+    (void)fflush(stdout);
+    endgame_ctx_destroy(solver);
+    endgame_results_destroy(results);
+    error_stack_destroy(errors);
+  }
+  const int close_status = fclose(input);
+  assert(close_status == 0);
   config_destroy(config);
 }

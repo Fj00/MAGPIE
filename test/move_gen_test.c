@@ -1,13 +1,23 @@
+#include "move_gen_test.h"
+
+#include "../src/def/bit_rack_defs.h"
 #include "../src/def/board_defs.h"
 #include "../src/def/equity_defs.h"
+#include "../src/def/game_defs.h"
 #include "../src/def/game_history_defs.h"
+#include "../src/def/kwg_defs.h"
 #include "../src/def/letter_distribution_defs.h"
 #include "../src/def/move_defs.h"
+#include "../src/def/players_data_defs.h"
+#include "../src/ent/bag.h"
+#include "../src/ent/best_move_carry.h"
 #include "../src/ent/bit_rack.h"
 #include "../src/ent/board.h"
+#include "../src/ent/dictionary_word.h"
 #include "../src/ent/equity.h"
 #include "../src/ent/game.h"
 #include "../src/ent/klv.h"
+#include "../src/ent/kwg.h"
 #include "../src/ent/letter_distribution.h"
 #include "../src/ent/move.h"
 #include "../src/ent/player.h"
@@ -15,9 +25,14 @@
 #include "../src/ent/rack.h"
 #include "../src/ent/validated_move.h"
 #include "../src/ent/wmp.h"
+#include "../src/ent/word_info_table.h"
 #include "../src/impl/config.h"
 #include "../src/impl/gameplay.h"
+#include "../src/impl/kwg_maker.h"
 #include "../src/impl/move_gen.h"
+#include "../src/impl/move_gen_base.h"
+#include "../src/impl/wmp_maker.h"
+#include "../src/impl/word_info_table_maker.h"
 #include "../src/util/io_util.h"
 #include "../src/util/string_util.h"
 #include "test_constants.h"
@@ -114,7 +129,6 @@ void assert_move_gen_row(Game *game, MoveList *move_list,
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   generate_moves_for_game(&move_gen_args);
@@ -168,7 +182,6 @@ void macondo_tests(void) {
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   // TestSimpleRowGen
@@ -423,7 +436,6 @@ void unfound_leave_lookup_test(void) {
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   const char cgp[300] = "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 "
@@ -468,7 +480,6 @@ void exchange_tests(void) {
       .override_kwg = NULL,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   generate_moves(&move_gen_args);
@@ -508,7 +519,6 @@ void movegen_many_moves(void) {
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   load_cgp_or_die(game, MANY_MOVES);
@@ -535,7 +545,6 @@ void equity_test(void) {
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   player_set_move_sort_type(player, MOVE_SORT_EQUITY);
@@ -587,7 +596,6 @@ void top_equity_play_recorder_test(void) {
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   player_set_move_record_type(player, MOVE_RECORD_BEST);
@@ -625,7 +633,6 @@ void small_play_recorder_test(void) {
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   player_set_move_record_type(player, MOVE_RECORD_ALL_SMALL);
@@ -669,8 +676,109 @@ void small_play_recorder_test(void) {
                 (MachineLetter[]){8 | 0x80, 5, 1 | 0x80, 4, 23, 0, 0, 4, 19},
                 9) == 0);
 
+  // Compare complete small-record output with the independent full-Move
+  // traversal, including repeated letters and both blanks. Also check that
+  // changing anchor traversal order preserves bounded-list tie breaking.
+  MoveList *full_moves = move_list_create(100000);
+  MoveList *decoded_moves = move_list_create(expected_count);
+  move_gen_args.move_list = full_moves;
+  move_gen_args.move_record_type = MOVE_RECORD_ALL;
+  move_gen_args.move_sort_type = MOVE_SORT_SCORE;
+  generate_moves(&move_gen_args);
+  assert(move_list_get_count(full_moves) == expected_count);
+  move_list_sort_moves(full_moves);
+  for (int move_idx = 0; move_idx < expected_count; move_idx++) {
+    Move *decoded = move_list_get_spare_move(decoded_moves);
+    small_move_to_move(decoded, move_list->small_moves[move_idx],
+                       game_get_board(game));
+    const Equity equity = move_get_type(decoded) == GAME_EVENT_PASS
+                              ? EQUITY_PASS_VALUE
+                              : move_get_score(decoded);
+    move_list_insert_spare_move(decoded_moves, equity);
+  }
+  move_list_sort_moves(decoded_moves);
+  for (int move_idx = 0; move_idx < expected_count; move_idx++) {
+    assert(compare_moves_without_equity(
+               move_list_get_move(full_moves, move_idx),
+               move_list_get_move(decoded_moves, move_idx), true) == -1);
+  }
+  MoveList *limited_moves = move_list_create(7);
+  move_gen_args.move_list = limited_moves;
+  generate_moves(&move_gen_args);
+  move_list_sort_moves(limited_moves);
+  assert(move_list_get_count(limited_moves) == 7);
+  for (int move_idx = 0; move_idx < 7; move_idx++) {
+    assert(compare_moves_without_equity(
+               move_list_get_move(full_moves, move_idx),
+               move_list_get_move(limited_moves, move_idx), true) == -1);
+  }
+  move_list_destroy(limited_moves);
+  move_list_destroy(decoded_moves);
+  move_list_destroy(full_moves);
+
   free(temp_small_moves);
   small_move_list_destroy(move_list);
+  game_destroy(game);
+  config_destroy(config);
+}
+
+// ALL_SMALL enumerates without shadow bounds. Use its exhaustive maximum to
+// check both shadow paths across letter premiums, cross words, multiple word
+// premiums, blanks, and repeated reuse of the generator's backup arrays.
+static void test_shadow_multiplier_rebuild(void) {
+  Config *config =
+      config_create_or_die("set -lex CSW21 -wmp false -s1 score -s2 score");
+  Game *game = config_game_create(config);
+  const LetterDistribution *ld = game_get_ld(game);
+  static const char *const positions[] = {
+      TRIPLE_LETTERS_CGP, DOUG_V_EMELY_CGP, LATER_BETWEEN_DOUBLE_WORDS_CGP,
+      TRIPLE_DOUBLE_CGP,  VS_JEREMY,        EMPTY_CGP,
+  };
+  static const char *const racks[] = {
+      "ZLW?", "BOHGXZQ", "ZLIER", "KT?", "DDESW??", "AEINRST",
+  };
+  MoveList *all = move_list_create_small(100000);
+  MoveList *best_small = move_list_create_small(1);
+  MoveList *best = move_list_create(1);
+  for (int repeat = 0; repeat < 2; repeat++) {
+    for (size_t position_idx = 0;
+         position_idx < sizeof(positions) / sizeof(positions[0]);
+         position_idx++) {
+      load_cgp_or_die(game, positions[position_idx]);
+      rack_set_to_string(ld, player_get_rack(game_get_player(game, 0)),
+                         racks[position_idx]);
+      MoveGenArgs args = {
+          .game = game,
+          .move_list = all,
+          .move_record_type = MOVE_RECORD_ALL_SMALL,
+          .move_sort_type = MOVE_SORT_SCORE,
+          .target_equity = EQUITY_MAX_VALUE,
+      };
+      generate_moves(&args);
+      assert(move_list_get_count(all) > 0);
+      int highest_score = 0;
+      for (int move_idx = 0; move_idx < move_list_get_count(all); move_idx++) {
+        const int score = small_move_get_score(all->small_moves[move_idx]);
+        if (score > highest_score) {
+          highest_score = score;
+        }
+      }
+      args.move_list = best_small;
+      args.move_record_type = MOVE_RECORD_BEST_SMALL;
+      generate_moves(&args);
+      assert(move_list_get_count(best_small) == 1);
+      assert(small_move_get_score(best_small->small_moves[0]) == highest_score);
+      args.move_list = best;
+      args.move_record_type = MOVE_RECORD_BEST;
+      generate_moves(&args);
+      assert(move_list_get_count(best) == 1);
+      assert(move_get_score(move_list_get_move(best, 0)) ==
+             int_to_equity(highest_score));
+    }
+  }
+  move_list_destroy(best);
+  small_move_list_destroy(best_small);
+  small_move_list_destroy(all);
   game_destroy(game);
   config_destroy(config);
 }
@@ -695,7 +803,6 @@ void best_small_play_recorder_test(void) {
       .move_sort_type = MOVE_SORT_SCORE,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
   generate_moves(&args1);
 
@@ -724,7 +831,6 @@ void best_small_play_recorder_test(void) {
       .move_sort_type = MOVE_SORT_SCORE,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
   generate_moves(&args2);
 
@@ -750,7 +856,6 @@ void distinct_lexica_test(bool w1) {
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   const Player *player0 = game_get_player(game, 0);
@@ -830,6 +935,44 @@ void distinct_lexica_test(bool w1) {
   config_destroy(config);
 }
 
+// Wordsmog's words come from the alpha generator, so a wordmap changes
+// nothing: its anchors used to record each play once per play length, which is
+// fatal in the move list.
+static void wordsmog_with_wordmap_test(void) {
+  int counts[2];
+  for (int use_wmp = 0; use_wmp < 2; use_wmp++) {
+    char *set = get_formatted_string(
+        "set -lex CSW21 -wmp %s -var wordsmog -s1 equity -s2 equity -r1 all "
+        "-r2 all -numplays 500",
+        use_wmp ? "true" : "false");
+    Config *config = config_create_or_die(set);
+    free(set);
+    load_and_exec_config_or_die(
+        config, "cgp 15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 / 0/0 0");
+    Game *game = config_get_game(config);
+    MoveList *move_list = move_list_create(500);
+    rack_set_to_string(game_get_ld(game),
+                       player_get_rack(game_get_player(game, 0)), "AEINRST");
+    const MoveGenArgs args = {
+        .game = game,
+        .move_list = move_list,
+        .move_record_type = MOVE_RECORD_ALL,
+        .move_sort_type = MOVE_SORT_EQUITY,
+        .override_kwg = NULL,
+        .eq_margin_movegen = 0,
+        .target_equity = EQUITY_MAX_VALUE,
+        .tiles_played_bv = NULL,
+        .initial_tiles_bv = 0,
+    };
+    generate_moves_for_game(&args);
+    counts[use_wmp] = move_list_get_count(move_list);
+    move_list_destroy(move_list);
+    config_destroy(config);
+  }
+  assert(counts[0] > 0);
+  assert(counts[0] == counts[1]);
+}
+
 void wordsmog_test(void) {
   Config *config = config_create_or_die(
       "set -lex CSW21_alpha -wmp false -s1 equity -s2 equity "
@@ -883,7 +1026,6 @@ void consistent_tiebreaking_test(void) {
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   const Player *player0 = game_get_player(game, 0);
@@ -1060,7 +1202,6 @@ void movegen_within_x_of_best_test(bool use_wmp) {
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
   int all_move_list_count = 0;
   int move_list_count = 0;
@@ -1253,7 +1394,6 @@ void movegen_does_not_return_early_from_anchor(void) {
       .move_sort_type = MOVE_SORT_EQUITY,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   // A8 BRRR 72 should be 1 equity better than A8 BRR 69
@@ -1304,7 +1444,6 @@ void movegen_one_tile_nonwmp(void) {
       .move_sort_type = MOVE_SORT_SCORE,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   SortedMoveList *sml = NULL;
@@ -1348,7 +1487,6 @@ void movegen_one_tile_wmp(void) {
       .move_sort_type = MOVE_SORT_SCORE,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   SortedMoveList *sml = NULL;
@@ -1587,15 +1725,16 @@ void wmp_blank_possibilities_bananas_5(void) {
 }
 
 // Regression guard for the move_gen subrack/KLV cache invalidation. A loaded
-// WMP/KLV exposes an instance fingerprint that gen_load_position uses to
-// invalidate the per-thread caches when a Config's WMP/KLV is freed and a new
-// one is loaded at the same struct address -- a pointer or lexicon-name
-// comparison cannot detect that reuse. The fingerprint must therefore (a) be
-// stable across calls for one instance and (b) differ between two independent
-// loads of the *same* lexicon. This is deterministic on every platform because
-// both instances are alive at once, so their internal arrays are necessarily
-// at distinct addresses; if the fingerprint were ever reverted to a
-// pointer/name basis, the distinct-instance assertions below would fail.
+// WMP exposes an instance fingerprint and a loaded KLV an instance id that
+// gen_load_position uses to invalidate the per-thread caches when a Config's
+// WMP/KLV is freed and a new one is loaded at the same struct address -- a
+// pointer or lexicon-name comparison cannot detect that reuse. Each must
+// therefore (a) be stable across calls for one instance and (b) differ between
+// two independent loads of the *same* lexicon. For the WMP this is
+// deterministic on every platform because both instances are alive at once, so
+// their internal arrays are necessarily at distinct addresses. The KLV's id
+// must also differ for a KLV loaded after another was freed, whose struct and
+// arrays the allocator may place exactly where the freed one's were.
 void test_move_gen_instance_fingerprint(void) {
   ErrorStack *error_stack = error_stack_create();
 
@@ -1611,11 +1750,17 @@ void test_move_gen_instance_fingerprint(void) {
 
   KLV *klv_a = klv_create_or_die(DEFAULT_TEST_DATA_PATH, "CSW21");
   KLV *klv_b = klv_create_or_die(DEFAULT_TEST_DATA_PATH, "CSW21");
-  const uint64_t klv_fp_a = klv_get_instance_fingerprint(klv_a);
-  assert(klv_fp_a == klv_get_instance_fingerprint(klv_a));
-  assert(klv_fp_a != klv_get_instance_fingerprint(klv_b));
+  const uint64_t klv_id_a = klv_get_instance_id(klv_a);
+  const uint64_t klv_id_b = klv_get_instance_id(klv_b);
+  assert(klv_id_a != 0);
+  assert(klv_id_a == klv_get_instance_id(klv_a));
+  assert(klv_id_a != klv_id_b);
   klv_destroy(klv_a);
   klv_destroy(klv_b);
+  KLV *klv_c = klv_create_or_die(DEFAULT_TEST_DATA_PATH, "NWL20");
+  assert(klv_get_instance_id(klv_c) != klv_id_a);
+  assert(klv_get_instance_id(klv_c) != klv_id_b);
+  klv_destroy(klv_c);
 
   error_stack_destroy(error_stack);
 }
@@ -1645,7 +1790,6 @@ void large_alphabet_movegen_test(void) {
       .override_kwg = NULL,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
   generate_moves_for_game(&move_gen_args);
   // The point of this test is that the leave/exchange path ran without
@@ -1655,6 +1799,262 @@ void large_alphabet_movegen_test(void) {
   assert(count_scoring_plays(move_list) + count_nonscoring_plays(move_list) >
          0);
   move_list_destroy(move_list);
+  game_destroy(game);
+  config_destroy(config);
+}
+
+static void add_wit_prune_test_word(DictionaryWordList *words,
+                                    const LetterDistribution *ld,
+                                    const char *word_string) {
+  MachineLetter word[BOARD_DIM];
+  const int word_length =
+      ld_str_to_mls(ld, word_string, false, word, BOARD_DIM);
+  assert(word_length > 0);
+  dictionary_word_list_add_word(words, word, word_length);
+}
+
+// WIT's per-anchor letter union is a necessary condition for every canonical
+// subrack, not just for the rack as a whole. Exercise a surviving anchor whose
+// rack has both usable tiles (B/C) and a proven-impossible tile (X), then
+// verify that enabling the per-subrack rejection leaves the complete move list
+// exact.
+static void assert_wit_prune_agrees(Game *without_wit, Game *with_wit,
+                                    const char *cgp) {
+  load_cgp_or_die(without_wit, cgp);
+  load_cgp_or_die(with_wit, cgp);
+  MoveList *without_wit_moves = move_list_create(1000);
+  MoveList *with_wit_moves = move_list_create(1000);
+  const MoveGenArgs without_wit_args = {
+      .game = without_wit,
+      .move_list = without_wit_moves,
+      .move_record_type = MOVE_RECORD_ALL,
+      .move_sort_type = MOVE_SORT_SCORE,
+      .eq_margin_movegen = 0,
+      .target_equity = EQUITY_MAX_VALUE,
+  };
+  MoveGenArgs with_wit_args = without_wit_args;
+  with_wit_args.game = with_wit;
+  with_wit_args.move_list = with_wit_moves;
+  generate_moves_for_game(&without_wit_args);
+  generate_moves_for_game(&with_wit_args);
+
+  SortedMoveList *without_wit_sorted =
+      sorted_move_list_create(without_wit_moves);
+  SortedMoveList *with_wit_sorted = sorted_move_list_create(with_wit_moves);
+  assert(without_wit_sorted->count > 0);
+  assert(with_wit_sorted->count == without_wit_sorted->count);
+  for (int move_idx = 0; move_idx < without_wit_sorted->count; move_idx++) {
+    assert_moves_are_equal(without_wit_sorted->moves[move_idx],
+                           with_wit_sorted->moves[move_idx]);
+  }
+  sorted_move_list_destroy(without_wit_sorted);
+  sorted_move_list_destroy(with_wit_sorted);
+  move_list_destroy(without_wit_moves);
+  move_list_destroy(with_wit_moves);
+}
+
+// WIT's per-anchor letter union is a necessary condition for every canonical
+// subrack, not just for the rack as a whole. Exercise surviving anchors whose
+// racks mix usable tiles with provably impossible ones, and verify that the
+// complete move list is unchanged by the per-subrack rejection.
+//
+// The forbidden set becomes a 128-bit BitRack lane mask split across two
+// 64-bit halves, so the racks below deliberately place forbidden letters in
+// the low half (D is machine letter 4), the high half (X is 24), and both at
+// once. Blanks are wild -- they may be designated as any letter, including a
+// forbidden one -- so a rack holding a blank must never lose a play.
+static void wit_subrack_prune_movegen_test(void) {
+  Config *config = config_create_or_die(
+      "set -lex CSW21 -wmp true -s1 score -s2 score -r1 all -r2 all");
+  PlayersData *players_data = config_get_players_data(config);
+  const LetterDistribution *ld = config_get_ld(config);
+
+  DictionaryWordList *words = dictionary_word_list_create();
+  static const char *const word_strings[] = {
+      "AT", "BAT", "CAT", "RAT", "ATB", "ATC", "BATS", "CATS", "RATS",
+  };
+  for (size_t word_idx = 0;
+       word_idx < sizeof(word_strings) / sizeof(word_strings[0]); word_idx++) {
+    add_wit_prune_test_word(words, ld, word_strings[word_idx]);
+  }
+  // A lexicon is made from words in alphabetical order.
+  dictionary_word_list_sort(words);
+
+  KWG *test_kwg = make_kwg_from_words(words, KWG_MAKER_OUTPUT_DAWG_AND_GADDAG,
+                                      KWG_MAKER_MERGE_EXACT);
+  WMP *test_wmp = make_wmp_from_words(words, ld, 1);
+  WordInfoTable *test_wit = make_word_info_table_from_words(words);
+
+  KWG *original_kwg = players_data_get_kwg(players_data, 0);
+  WMP *original_wmp = players_data_get_wmp(players_data, 0);
+  assert(players_data_get_kwg(players_data, 1) == original_kwg);
+  assert(players_data_get_wmp(players_data, 1) == original_wmp);
+  assert(players_data_get_word_info_table(players_data, 0) == NULL);
+  assert(players_data_get_word_info_table(players_data, 1) == NULL);
+
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_KWG, 0, test_kwg);
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_KWG, 1, test_kwg);
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_WMP, 0, test_wmp);
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_WMP, 1, test_wmp);
+  Game *without_wit = config_game_create(config);
+
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_WIT, 0, test_wit);
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_WIT, 1, test_wit);
+  Game *with_wit = config_game_create(config);
+
+  // Confirm the fixture really does forbid the letters the racks rely on:
+  // words of length three through the AT block use only A, T, B, C and R.
+  MachineLetter at_block[2];
+  assert(ld_str_to_mls(ld, "AT", false, at_block, 2) == 2);
+  const uint32_t *at_row = word_info_table_lookup(test_wit, at_block, 2);
+  assert(at_row != NULL);
+  const uint32_t length_three_addable = at_row[1];
+  const MachineLetter b_letter = ld_hl_to_ml(ld, "B");
+  const MachineLetter c_letter = ld_hl_to_ml(ld, "C");
+  const MachineLetter d_letter = ld_hl_to_ml(ld, "D");
+  const MachineLetter x_letter = ld_hl_to_ml(ld, "X");
+  assert((length_three_addable & (1U << b_letter)) != 0);
+  assert((length_three_addable & (1U << c_letter)) != 0);
+  assert((length_three_addable & (1U << d_letter)) == 0);
+  assert((length_three_addable & (1U << x_letter)) == 0);
+  // D and X must straddle the 64-bit boundary of the BitRack lane mask, or
+  // these cases would not cover both halves of the split.
+  assert(d_letter * BIT_RACK_BITS_PER_LETTER < 64);
+  assert(x_letter * BIT_RACK_BITS_PER_LETTER >= 64);
+
+  static const char *const cgps[] = {
+      // Forbidden letter in the high mask half only (X).
+      "15/15/15/15/15/15/15/6AT7/15/15/15/15/15/15/15 BCX/ 0/0 0",
+      // Forbidden letter in the low mask half only (D).
+      "15/15/15/15/15/15/15/6AT7/15/15/15/15/15/15/15 BCD/ 0/0 0",
+      // Forbidden letters in both halves at once.
+      "15/15/15/15/15/15/15/6AT7/15/15/15/15/15/15/15 BDX/ 0/0 0",
+      // A blank alongside forbidden letters: the blank can be designated as
+      // any addable letter, so no subrack containing it may be skipped.
+      "15/15/15/15/15/15/15/6AT7/15/15/15/15/15/15/15 B?X/ 0/0 0",
+      "15/15/15/15/15/15/15/6AT7/15/15/15/15/15/15/15 ?DX/ 0/0 0",
+      // Every rack tile forbidden except the blank, spanning both halves.
+      "15/15/15/15/15/15/15/6AT7/15/15/15/15/15/15/15 ?DXG/ 0/0 0",
+      // No forbidden tiles at all: the prune must stay inert.
+      "15/15/15/15/15/15/15/6AT7/15/15/15/15/15/15/15 BCR/ 0/0 0",
+  };
+  for (size_t cgp_idx = 0; cgp_idx < sizeof(cgps) / sizeof(cgps[0]);
+       cgp_idx++) {
+    assert_wit_prune_agrees(without_wit, with_wit, cgps[cgp_idx]);
+  }
+
+  game_destroy(without_wit);
+  game_destroy(with_wit);
+
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_KWG, 0, original_kwg);
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_KWG, 1, original_kwg);
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_WMP, 0, original_wmp);
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_WMP, 1, original_wmp);
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_WIT, 0, NULL);
+  players_data_set_data(players_data, PLAYERS_DATA_TYPE_WIT, 1, NULL);
+  kwg_destroy(test_kwg);
+  wmp_destroy(test_wmp);
+  word_info_table_destroy(test_wit);
+  dictionary_word_list_destroy(words);
+  config_destroy(config);
+}
+
+// Best-move generations seeded from a carry (see best_move_carry.h), which
+// without PAT also skip the lanes whose remembered bounds they beat,
+// choose the same move, at the same equity, as plain ones. The positions mimic
+// a simulation's playouts: every candidate of a position is played on its own
+// copy of the game, and the same opponent rack then moves on each board, so
+// moves the carry remembers from one candidate's board are tried on the next.
+static void best_move_carry_test(const char *config_str, bool skips_lanes,
+                                 bool expect_lane_bounds) {
+  Config *config = config_create_or_die(config_str);
+  Game *game = config_game_create(config);
+  MoveList *candidates = move_list_create(15);
+  MoveList *plain_list = move_list_create(1);
+  MoveList *carried_list = move_list_create(1);
+  BestMoveCarry *carry = best_move_carry_create(1024, skips_lanes);
+  int generations = 0;
+  int racks_with_several_moves = 0;
+  for (int position_idx = 0; position_idx < 12; position_idx++) {
+    game_reset(game);
+    game_seed(game, 7100 + (uint64_t)position_idx);
+    draw_starting_racks(game);
+    for (int turn_idx = 0; turn_idx < 2 + position_idx; turn_idx++) {
+      play_move(get_top_equity_move(game, plain_list), game, NULL);
+      if (game_get_game_end_reason(game) != GAME_END_REASON_NONE) {
+        break;
+      }
+    }
+    if (game_get_game_end_reason(game) != GAME_END_REASON_NONE ||
+        bag_get_letters(game_get_bag(game)) == 0) {
+      continue;
+    }
+    best_move_carry_reset(carry);
+    const MoveGenArgs candidate_args = {
+        .game = game,
+        .move_list = candidates,
+        .move_record_type = MOVE_RECORD_ALL,
+        .move_sort_type = MOVE_SORT_EQUITY,
+        .eq_margin_movegen = 0,
+        .target_equity = EQUITY_MAX_VALUE,
+    };
+    generate_moves(&candidate_args);
+    const int number_of_candidates = move_list_get_count(candidates);
+    for (int candidate_idx = 0; candidate_idx < number_of_candidates;
+         candidate_idx++) {
+      Game *playout = game_duplicate(game);
+      play_move(move_list_get_move(candidates, candidate_idx), playout, NULL);
+      for (int ply = 0; ply < 2; ply++) {
+        if (game_get_game_end_reason(playout) != GAME_END_REASON_NONE) {
+          break;
+        }
+        const Move *plain = get_top_equity_move(playout, plain_list);
+        const Move *carried =
+            get_top_equity_move_with_carry(playout, carried_list, carry);
+        assert(compare_moves_without_equity(plain, carried, true) == -1);
+        assert(move_get_equity(plain) == move_get_equity(carried));
+        generations++;
+        CarriedRackFind found;
+        if (best_move_carry_find(
+                carry,
+                player_get_rack(game_get_player(
+                    playout, game_get_player_on_turn_index(playout))),
+                game_get_player_on_turn_index(playout), NULL, 0, &found) &&
+            found.count > 1) {
+          racks_with_several_moves++;
+        }
+        play_move(plain, playout, NULL);
+      }
+      game_destroy(playout);
+    }
+  }
+  assert(generations > 200);
+  // The opponent's best move differs between some candidates' boards, so
+  // the carry holds several moves for its rack and tries them on new boards.
+  assert(racks_with_several_moves > 0);
+  // A carry that skips lanes remembers lane bounds without PAT, and none
+  // with it.
+  assert(best_move_carry_skips_lanes(carry) == skips_lanes);
+  int lane_bounds = 0;
+  for (int bucket_idx = 0; skips_lanes && bucket_idx < carry->num_buckets;
+       bucket_idx++) {
+    const CarriedLaneBounds *rack_lane_bounds = &carry->lane_bounds[bucket_idx];
+    for (int lane = 0; carry->buckets[bucket_idx].rack_moves.is_valid &&
+                       lane < BEST_MOVE_CARRY_NUM_LANES;
+         lane++) {
+      for (int bound_idx = 0; bound_idx < BEST_MOVE_CARRY_BOUNDS_PER_LANE;
+           bound_idx++) {
+        if (rack_lane_bounds->bounds[lane][bound_idx].lane_hash != 0) {
+          lane_bounds++;
+        }
+      }
+    }
+  }
+  assert((lane_bounds > 0) == expect_lane_bounds);
+  best_move_carry_destroy(carry);
+  move_list_destroy(carried_list);
+  move_list_destroy(plain_list);
+  move_list_destroy(candidates);
   game_destroy(game);
   config_destroy(config);
 }
@@ -1669,10 +2069,12 @@ void test_move_gen(void) {
   top_equity_play_recorder_test();
   small_play_recorder_test();
   best_small_play_recorder_test();
+  test_shadow_multiplier_rebuild();
   distinct_lexica_test(false);
   distinct_lexica_test(true);
   consistent_tiebreaking_test();
   wordsmog_test();
+  wordsmog_with_wordmap_test();
   movegen_game_update_test();
   movegen_var_bingo_bonus_test();
   movegen_only_one_player_wmp();
@@ -1691,4 +2093,14 @@ void test_move_gen(void) {
   wmp_blank_possibilities_bananas_4();
   wmp_blank_possibilities_bananas_5();
   large_alphabet_movegen_test();
+  wit_subrack_prune_movegen_test();
+  for (int skips_lanes = 0; skips_lanes <= 1; skips_lanes++) {
+    best_move_carry_test("set -lex CSW21 -wmp true -s1 equity -s2 equity",
+                         skips_lanes, skips_lanes);
+    best_move_carry_test("set -lex CSW21 -wmp false -s1 equity -s2 equity",
+                         skips_lanes, skips_lanes);
+    best_move_carry_test(
+        "set -lex CSW21 -wmp true -s1 equity -s2 equity -pat CSW21",
+        skips_lanes, false);
+  }
 }

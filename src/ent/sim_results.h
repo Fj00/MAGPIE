@@ -12,6 +12,7 @@
 #include "stats.h"
 #include "win_pct.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef enum {
   PLY_INFO_COUNT_PASS,
@@ -22,6 +23,30 @@ typedef enum {
 } ply_info_count_t;
 
 typedef struct SimmedPlay SimmedPlay;
+
+typedef struct SimmedPlayPlyRecord {
+  Equity score;
+  uint8_t count_type;
+  bool is_bingo;
+  // Filled in only when the play keeps a heat map for this ply.
+  HeatMapPlacement placement;
+} SimmedPlayPlyRecord;
+
+// One sample's contributions to a SimmedPlay, heat map included, captured
+// instead of applied so that they can be applied later, in a fixed order, or
+// dropped. The BAI round scheduler applies each round's records when it folds
+// the round, so the results hold exactly the folded samples.
+typedef struct SimmedPlaySampleRecord {
+  Equity equity_sample;
+  Equity leftover;
+  double win_pct;
+  double utility;
+  bool has_utility;
+  // Rollouts the sample stands for: 1, or a bag-cycled sample's rotations.
+  int num_rollouts;
+  int num_plies;
+  SimmedPlayPlyRecord plies[MAX_PLIES];
+} SimmedPlaySampleRecord;
 
 const Move *simmed_play_get_move(const SimmedPlay *simmed_play);
 const Stat *simmed_play_get_score_stat(const SimmedPlay *simmed_play,
@@ -34,23 +59,51 @@ uint64_t simmed_play_get_ply_info_count(const SimmedPlay *simmed_play,
                                         ply_info_count_t count_type);
 const Stat *simmed_play_get_equity_stat(const SimmedPlay *simmed_play);
 const Stat *simmed_play_get_win_pct_stat(const SimmedPlay *simmed_play);
+// The rollouts behind the play's samples: a bag-cycled sample stands for its
+// rotations' rollouts, so this can exceed the stats' sample counts.
+uint64_t simmed_play_get_num_rollouts(const SimmedPlay *simmed_play);
 const Stat *simmed_play_get_utility_stat(const SimmedPlay *simmed_play);
+// The exactly order-independent means compare_simmed_plays ranks by. They are
+// bit-reproducible for a given sample multiset, unlike the Stat means above.
+double simmed_play_get_exact_equity_mean(const SimmedPlay *simmed_play);
+double simmed_play_get_exact_win_pct_mean(const SimmedPlay *simmed_play);
+double simmed_play_get_exact_utility_mean(const SimmedPlay *simmed_play);
 bool simmed_play_get_utility_w_spread_is_set(const SimmedPlay *simmed_play);
 int simmed_play_get_play_index_by_sort_type(const SimmedPlay *simmed_play);
 uint64_t simmed_play_get_seed(SimmedPlay *simmed_play);
+// The seed simmed_play_get_seed would return after `ahead` more calls,
+// without advancing the stream.
+uint64_t simmed_play_peek_seed(SimmedPlay *simmed_play, uint64_t ahead);
+// Each simmed_play_add_* function applies its contribution to simmed_play,
+// or, when record is non-NULL, writes it to record instead, to be applied by
+// simmed_play_apply_sample_record. A record must be cleared with
+// simmed_play_sample_record_clear before a sample starts filling it.
+void simmed_play_sample_record_clear(SimmedPlaySampleRecord *record);
 void simmed_play_add_stats_for_ply(SimmedPlay *simmed_play, int ply_index,
-                                   const Move *move);
+                                   const Move *move,
+                                   SimmedPlaySampleRecord *record);
 void simmed_play_add_equity_stat(SimmedPlay *simmed_play, Equity initial_spread,
-                                 Equity spread, Equity leftover);
+                                 Equity spread, Equity leftover,
+                                 SimmedPlaySampleRecord *record);
 double simmed_play_add_win_pct_stat(const WinPct *wp, SimmedPlay *simmed_play,
                                     Equity spread, Equity leftover,
                                     game_end_reason_t game_end_reason,
-                                    int game_unseen_tiles, bool plies_are_odd);
-void simmed_play_add_utility_stat(SimmedPlay *simmed_play, double utility);
+                                    int bag_tiles, int on_turn_rack_tiles,
+                                    int off_turn_rack_tiles, bool plies_are_odd,
+                                    SimmedPlaySampleRecord *record);
+void simmed_play_add_utility_stat(SimmedPlay *simmed_play, double utility,
+                                  SimmedPlaySampleRecord *record);
+void simmed_play_apply_sample_record(SimmedPlay *simmed_play,
+                                     const SimmedPlaySampleRecord *record);
 
 typedef struct SimResults SimResults;
 
 SimResults *sim_results_create(const double cutoff);
+// Allocate a new SimResults whose state mirrors sim_results. Every Stat,
+// PRNG state, heat map, BAIResult, and SimmedPlay is independently owned by
+// the duplicate; mutexes are fresh. The TUI saves one per game turn so the
+// analysis can later be resumed onto the prior samples.
+SimResults *sim_results_duplicate(SimResults *sim_results);
 void sim_results_reset(const MoveList *move_list, SimResults *sim_results,
                        int num_plies, uint64_t seed, bool use_heat_map);
 void sim_results_destroy(SimResults *sim_results);
@@ -61,6 +114,7 @@ uint64_t sim_results_get_node_count(const SimResults *sim_results);
 void sim_results_increment_node_count(SimResults *sim_results);
 uint64_t sim_results_get_iteration_count(const SimResults *sim_results);
 void sim_results_increment_iteration_count(SimResults *sim_results);
+void sim_results_add_iteration_count(SimResults *sim_results, uint64_t count);
 SimmedPlay *sim_results_get_simmed_play(const SimResults *sim_results,
                                         int index);
 const Rack *sim_results_get_rack(const SimResults *sim_results);
@@ -82,6 +136,10 @@ double sim_results_get_utility_w_spread(const SimResults *sim_results);
 uint64_t sim_results_get_num_infer_leaves(const SimResults *sim_results);
 void sim_results_set_num_infer_leaves(SimResults *sim_results,
                                       uint64_t num_infer_leaves);
+// Whether the census steered the last sim's rollouts (see -scensus).
+bool sim_results_get_census_rollout(const SimResults *sim_results);
+void sim_results_set_census_rollout(SimResults *sim_results,
+                                    bool census_rollout);
 
 void sim_results_lock_simmed_plays(SimResults *sim_results);
 void sim_results_unlock_simmed_plays(SimResults *sim_results);

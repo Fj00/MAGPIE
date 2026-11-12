@@ -1,3 +1,5 @@
+#include "shadow_test.h"
+
 #include "../src/def/board_defs.h"
 #include "../src/def/equity_defs.h"
 #include "../src/def/move_defs.h"
@@ -43,7 +45,6 @@ void load_and_generate_moves(Game *game, MoveList *move_list,
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
 
   load_cgp_or_die(game, cgp);
@@ -676,6 +677,16 @@ void test_shadow_wmp_one_tile(void) {
   assert(ah.anchors[1].playthrough_blocks == 1);
   assert(ah.anchors[1].leftmost_start_col == 6);
   assert(ah.anchors[1].rightmost_start_col == 6);
+
+  // Reuse the generator on a position with no WMP slot, then return to the
+  // one-tile playthrough. Emission must use this position's per-slot bounds,
+  // without requiring the recursive generator's global tile-count reduction.
+  load_and_shadow(game, player, EMPTY_CGP, "Q", &ah);
+  assert(ah.count == 0);
+  load_and_shadow(game, player, QI_QI_CGP, "D", &ah);
+  assert(ah.count == 2);
+  assert_anchor_score(&ah, 0, 6);
+  assert_anchor_score(&ah, 1, 3);
 
   game_destroy(game);
   config_destroy(config);

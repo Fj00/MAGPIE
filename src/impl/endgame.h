@@ -168,12 +168,33 @@ typedef struct EndgameArgs {
   dual_lexicon_mode_t dual_lexicon_mode;
   // If true, play forced passes without consuming a depth ply (default: false)
   bool forced_pass_bypass;
+  // If true, each node's move list is derived from the same side's list two
+  // moves up the search path, regenerating only the lanes the intervening
+  // moves touched (see path_move_lists.h), instead of generated from scratch.
+  // Results are identical either way. (default: true via endgame_args_fill;
+  // hand-built args get whatever they initialize it to)
+  bool incremental_movegen;
+  // If false (the default), nodes next to the leaves find the side to move's
+  // best play without building its whole move list: with incremental_movegen,
+  // a leaf's greedy playout takes its first move from the incremental lists
+  // (path_move_lists_best_play), and a node one ply above the leaves searches
+  // its best-scoring play before building its list. Both find the play
+  // MOVE_RECORD_BEST_SMALL would, with its ties broken by tiny_move
+  // (MoveGenArgs.best_small_canonical_ties) rather than generation order;
+  // that can change which of two equal-scoring plays a greedy leaf playout
+  // makes, and so a leaf's value. The search order changes too, so among
+  // equal-valued lines a different one can be reported. True turns all of
+  // this off. Zero-initialized args get the default.
+  bool disable_best_reply_shortcuts;
   bool enable_pv_display; // Whether to prepare PVLine data for display
                           // (default: false)
   // IDS time management (0 = no limit, rely on external timer only):
   // After each completed depth, if elapsed > soft_time_limit, stop.
   // If elapsed < soft_time_limit, estimate next depth time via EBF.
   // If estimated completion > hard_time_limit, stop to bank remaining time.
+  // Once a depth has finished, a depth still running at hard_time_limit stops
+  // there. The first depth finishes regardless, so there is a move to return;
+  // only external_deadline_ns can cut that one short.
   double soft_time_limit;
   double hard_time_limit;
   // Sign-stability early stop: stop iterative deepening once the value's sign
@@ -228,6 +249,10 @@ typedef struct EndgameArgs {
   // caller (e.g. PEG) impose a wall-clock budget that propagates through
   // alpha-beta, not just between IDS depth iterations. 0 = no deadline.
   int64_t external_deadline_ns;
+  // When non-NULL, read as often as the deadline, from every thread of the
+  // solve: true ends the solve as the deadline would.
+  bool (*stop_fn)(const void *stop_data);
+  const void *stop_data;
   // If non-NULL, the solver additionally computes an exact (non-pruned)
   // value for this specific move in the same search that finds the best
   // move, instead of requiring a second endgame_solve call. Must be a legal
@@ -261,6 +286,7 @@ static inline void endgame_args_fill(
     EndgamePerRootMoveCallback per_root_move_callback,
     void *per_root_move_callback_data,
     const dual_lexicon_mode_t dual_lexicon_mode, const bool forced_pass_bypass,
+    const bool incremental_movegen, const bool disable_best_reply_shortcuts,
     const bool enable_pv_display, const double soft_time_limit,
     const double hard_time_limit, const int sign_stable_k,
     const uint64_t seed,
@@ -286,6 +312,8 @@ static inline void endgame_args_fill(
   endgame_args->per_root_move_callback_data = per_root_move_callback_data;
   endgame_args->dual_lexicon_mode = dual_lexicon_mode;
   endgame_args->forced_pass_bypass = forced_pass_bypass;
+  endgame_args->incremental_movegen = incremental_movegen;
+  endgame_args->disable_best_reply_shortcuts = disable_best_reply_shortcuts;
   endgame_args->enable_pv_display = enable_pv_display;
   endgame_args->soft_time_limit = soft_time_limit;
   endgame_args->hard_time_limit = hard_time_limit;
@@ -300,6 +328,8 @@ static inline void endgame_args_fill(
   endgame_args->initial_alpha = initial_alpha;
   endgame_args->initial_beta = initial_beta;
   endgame_args->external_deadline_ns = external_deadline_ns;
+  endgame_args->stop_fn = NULL;
+  endgame_args->stop_data = NULL;
   endgame_args->actual_move = actual_move;
 }
 
@@ -323,10 +353,10 @@ void endgame_solve(EndgameCtx **ctx, const EndgameArgs *endgame_args,
 // (read-only) root inputs, and a MoveGen cache slot assigned on demand by
 // get_movegen(); it cooperates with the running workers purely through the
 // shared TT and self-exits when the search completes. Returns true if a worker
-// was spawned, false if the injection window is shut or the max_workers ceiling
-// is reached. Only valid against a ctx whose current solve was launched with
-// max_workers enabling growth (max_workers > effective thread count after reset
-// normalization).
+// was spawned, false if the injection window is shut, the solve has been
+// interrupted, or the max_workers ceiling is reached. Only valid against a ctx
+// whose current solve was launched with max_workers enabling growth
+// (max_workers > effective thread count after reset normalization).
 bool endgame_add_worker(EndgameCtx *ctx);
 
 // Number of worker threads currently live in this solve (main worker + injected
@@ -372,6 +402,14 @@ void endgame_ctx_get_progress(const EndgameCtx *ctx, int *current_depth,
 // intended for "is the engine alive / nodes per second" UI heartbeats during
 // long single-root subtree evaluations.
 uint64_t endgame_ctx_get_nodes_searched(const EndgameCtx *ctx);
+
+// For a thread other than the solve's: reads the nodes searched and the
+// workers running while the solve's helper window is open, and returns whether
+// it was. The window is checked under the lock that frees lent workers, so
+// they stay valid for the read; a window checked first and read after does not
+// keep them.
+bool endgame_ctx_read_live_workers(EndgameCtx *ctx, uint64_t *nodes_searched,
+                                   int *live_workers);
 
 // Snapshot of the line currently being explored by worker `worker_index`
 // (0 = main worker; see conventions above). Writes up to `max_len` `tiny_move`

@@ -6,8 +6,12 @@
 #include "../def/game_history_defs.h"
 #include "../util/io_util.h"
 #include "../util/string_util.h"
+#include "endgame_results.h"
+#include "inference_results.h"
 #include "letter_distribution.h"
+#include "move.h"
 #include "rack.h"
+#include "sim_results.h"
 #include "validated_move.h"
 
 #define PLAYER_ONE_DEFAULT_NAME "Player 1"
@@ -42,6 +46,25 @@ Rack *game_event_get_after_event_player_off_turn_rack(GameEvent *event);
 void game_event_set_vms(GameEvent *event, ValidatedMoves *vms);
 ValidatedMoves *game_event_get_vms(const GameEvent *event);
 
+// The move_list/sim_results/inference_results/endgame_results generated
+// for the position this event represents, if any were live (and valid)
+// when the event was committed. Each setter takes ownership of (and
+// destroys any previously-set) the given object; pass a fresh duplicate,
+// never a pointer also owned elsewhere (e.g. a live Config field).
+void game_event_set_move_list(GameEvent *event, MoveList *move_list);
+MoveList *game_event_get_move_list(const GameEvent *event);
+
+void game_event_set_sim_results(GameEvent *event, SimResults *sim_results);
+SimResults *game_event_get_sim_results(const GameEvent *event);
+
+void game_event_set_inference_results(GameEvent *event,
+                                      InferenceResults *inference_results);
+InferenceResults *game_event_get_inference_results(const GameEvent *event);
+
+void game_event_set_endgame_results(GameEvent *event,
+                                    EndgameResults *endgame_results);
+EndgameResults *game_event_get_endgame_results(const GameEvent *event);
+
 void game_event_set_note(GameEvent *event, const char *note);
 const char *game_event_get_note(const GameEvent *event);
 int game_event_get_turn_value(const GameEvent *event);
@@ -51,6 +74,18 @@ typedef struct GameHistory GameHistory;
 GameHistory *game_history_create(void);
 GameHistory *game_history_duplicate(const GameHistory *gh_orig);
 void game_history_destroy(GameHistory *game_history);
+// Initial position is optional; histories without one start on an empty board.
+void game_history_set_initial_cgp(GameHistory *history, const char *cgp);
+const char *game_history_get_initial_cgp(const GameHistory *history);
+void game_history_set_initial_racks(GameHistory *history, const Rack *first,
+                                    const Rack *second, bool bag_empty);
+// Only complete, nonempty starting racks can supply final penalties: seven
+// tiles, or fewer with an empty starting bag, before the player takes a turn.
+// num_events selects the replay prefix; later history does not invalidate it.
+const Rack *game_history_get_unplayed_initial_rack(const GameHistory *history,
+                                                   int player_index,
+                                                   int num_events);
+
 void game_history_reset(GameHistory *game_history);
 
 void game_history_set_title(GameHistory *history, const char *title);

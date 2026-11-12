@@ -4,7 +4,6 @@
 #include "../def/thread_control_defs.h"
 #include "../ent/transposition_table.h"
 #include "game.h"
-#include "game_history.h"
 #include "move.h"
 #include <stdatomic.h>
 
@@ -31,12 +30,17 @@ typedef struct PVLine {
   Game *game;
   int32_t score;
   int num_moves;
-  int negamax_depth; // number of moves from exact search (rest are greedy)
+  // Number of moves from exact search. The rest are a greedy playout past the
+  // search depth, or moves read from the transposition table where a time
+  // limit or interrupt left the line unsearched.
+  int negamax_depth;
 } PVLine;
 
 typedef struct EndgameResults EndgameResults;
 
 EndgameResults *endgame_results_create(void);
+EndgameResults *
+endgame_results_duplicate(const EndgameResults *endgame_results);
 void endgame_results_destroy(EndgameResults *endgame_results);
 void endgame_results_reset(EndgameResults *endgame_results);
 bool endgame_results_get_valid_for_current_game_state(
@@ -53,6 +57,8 @@ int endgame_results_get_depth(const EndgameResults *endgame_results,
                               endgame_result_t result_type);
 double
 endgame_results_get_seconds_elapsed(const EndgameResults *endgame_results);
+double endgame_results_get_timer_elapsed_seconds(
+    const EndgameResults *endgame_results);
 void endgame_results_lock(EndgameResults *endgame_results,
                           endgame_result_t type);
 void endgame_results_unlock(EndgameResults *endgame_results,
@@ -61,6 +67,18 @@ void endgame_results_update_display_data(EndgameResults *endgame_results);
 void endgame_results_set_best_pvline(EndgameResults *endgame_results,
                                      const PVLine *pv_line, int value,
                                      int depth);
+// Like endgame_results_set_best_pvline, but also replaces a result of the
+// same depth when value is higher. Lets several workers each offer the best
+// line they found at one depth.
+void endgame_results_offer_best_pvline(EndgameResults *endgame_results,
+                                       const PVLine *pv_line, int value,
+                                       int depth);
+// Replaces the best line when the result held is of depth `depth`, and keeps
+// that depth. A line from a deeper search that did not finish replaces only
+// the result of the depth it was meant to improve on.
+void endgame_results_replace_best_pvline(EndgameResults *endgame_results,
+                                         const PVLine *pv_line, int value,
+                                         int depth);
 // Records the exact value found for EndgameArgs.actual_move, alongside the
 // best move, from the same solve. Called at most once per solve (after all
 // workers join), so unlike endgame_results_set_best_pvline this has no
@@ -74,6 +92,10 @@ void endgame_results_set_start_game(EndgameResults *endgame_results,
                                     const Game *game);
 const Game *
 endgame_results_get_start_game(const EndgameResults *endgame_results);
+// Rebuilds the start game snapshot against game_args. Its players borrow
+// lexical data, which a configuration change can free.
+void endgame_results_update_start_game(EndgameResults *endgame_results,
+                                       const GameArgs *game_args);
 void endgame_results_stop_ctimer(EndgameResults *endgame_results);
 endgame_result_status_t
 endgame_results_get_status(const EndgameResults *endgame_results);

@@ -12,8 +12,10 @@
 #include "letter_distribution.h"
 #include <assert.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct Square {
   uint64_t cross_set;
@@ -22,8 +24,19 @@ typedef struct Square {
   Equity cross_score;
   MachineLetter letter;
   BonusSquare bonus_square;
-  bool anchor;
-  bool is_cross_word;
+  // anchor, is_cross_word, and player_idx pack into a single byte
+  // so adding owner tracking didn't grow Square past 32 bytes.
+  // player_idx is the player who placed the tile (0 or 1); only
+  // meaningful when letter != ALPHABET_EMPTY_SQUARE_MARKER and
+  // owner_known is set, and only updated by callers that explicitly
+  // want to track it (sim/endgame board copies leave it as-is).
+  // owner_known is clear for tiles whose player isn't recorded, such
+  // as a position loaded from CGP.
+  uint8_t anchor : 1;
+  uint8_t is_cross_word : 1;
+  uint8_t player_idx : 1;
+  uint8_t owner_known : 1;
+  uint8_t _pad : 4;
 } Square;
 
 typedef struct Board {
@@ -31,11 +44,23 @@ typedef struct Board {
   // - One pair for each direction
   // - One pair for each cross index
   Square squares[2 * 2 * BOARD_DIM * BOARD_DIM];
+  // Word info table data parallel to squares[] (kept out of the hot Square so
+  // move generation's per-square scan stays cache-dense). For a square that is
+  // a block's leftmost tile in its direction, wit_block_rows holds that block's
+  // value row (entry i = letters in any length-(wit_block_lens + i) word that
+  // contains the block) and wit_block_lens its length. NULL/0 otherwise.
+  // Computed with cross sets, invalidated through the same tracked update.
+  const uint32_t *wit_block_rows[2 * 2 * BOARD_DIM * BOARD_DIM];
+  uint8_t wit_block_lens[2 * 2 * BOARD_DIM * BOARD_DIM];
   // Stores the penalties to be applied to
   // the opening move for each square in both
   // horizontal and vertical directions if the
-  // tile is a vowel.
-  Equity opening_move_penalties[BOARD_DIM * 2];
+  // tile is a vowel, split by which square multiplier drove it (word vs
+  // letter) so a caller whose PAT weights already price that axis can skip
+  // it instead of double-charging the same square (see
+  // placement_adjustment).
+  Equity opening_move_word_penalties[BOARD_DIM * 2];
+  Equity opening_move_letter_penalties[BOARD_DIM * 2];
 
   uint8_t number_of_row_anchors[BOARD_DIM * 2];
   int transposed;
@@ -44,7 +69,12 @@ typedef struct Board {
   int start_coords[2];
   // Flag for lazy cross-set evaluation in endgame solver.
   // When false, cross-sets need to be recalculated before move generation.
+  // The endgame clears it while it defers the anchor and cross-set updates
+  // of moves on the board (see play_move_incremental_deferred).
   bool cross_sets_valid;
+  // True if any WIT row may be non-NULL. Empty caches need no clearing in
+  // board_copy or incremental undo, keeping WIT-off copies cheap.
+  bool wit_cache_populated;
 } Board;
 
 // Square: Letter
@@ -194,6 +224,45 @@ board_get_readonly_square(const Board *b, int row, int col, int dir, int ci) {
 static inline MachineLetter board_get_letter(const Board *b, int row, int col) {
   // Cross index doesn't matter for letter reads.
   return square_get_letter(board_get_readonly_square(b, row, col, 0, 0));
+}
+
+// Marks every sub-board copy of (row, col) with `player_idx` (0 or 1).
+// Only meaningful when the square actually has a letter. Sim and
+// endgame board copies don't call this — only the "live" game's
+// play_move flow does (via the TUI), which is why callers must invoke
+// it explicitly rather than having board_set_letter touch the owner
+// bit. Reading: `board_get_writable_square(b, row, col, 0, 0)->player_idx`
+// or the inline accessor below.
+static inline void board_set_square_owner(Board *b, int row, int col,
+                                          int player_idx) {
+  for (int ci = 0; ci < 2; ci++) {
+    for (int dir = 0; dir < 2; dir++) {
+      Square *square = board_get_writable_square(b, row, col, dir, ci);
+      square->player_idx = (uint8_t)(player_idx & 1);
+      square->owner_known = 1;
+    }
+  }
+}
+
+// The player who placed the tile at (row, col), or BOARD_OWNER_UNKNOWN
+// when that isn't recorded.
+static inline int board_get_square_owner(const Board *b, int row, int col) {
+  const Square *square = board_get_readonly_square(b, row, col, 0, 0);
+  return square->owner_known ? square->player_idx : BOARD_OWNER_UNKNOWN;
+}
+
+// Forgets every square's owner, e.g. after loading a position whose
+// tiles have no recorded player.
+static inline void board_clear_square_owners(Board *b) {
+  for (int row = 0; row < BOARD_DIM; row++) {
+    for (int col = 0; col < BOARD_DIM; col++) {
+      for (int ci = 0; ci < 2; ci++) {
+        for (int dir = 0; dir < 2; dir++) {
+          board_get_writable_square(b, row, col, dir, ci)->owner_known = 0;
+        }
+      }
+    }
+  }
 }
 
 static inline void board_set_letter(Board *b, int row, int col,
@@ -401,6 +470,53 @@ board_set_right_extension_set_with_blank(Board *b, int row, int col, int dir,
       right_extension_set_with_blank);
 }
 
+static inline void board_set_wit_block(Board *b, int row, int col, int dir,
+                                       int csi, const uint32_t *row_ptr,
+                                       uint8_t len) {
+  const int index = board_get_square_index(b, row, col, dir, csi);
+  b->wit_block_rows[index] = row_ptr;
+  b->wit_block_lens[index] = len;
+  if (row_ptr != NULL) {
+    b->wit_cache_populated = true;
+  }
+}
+
+static inline bool board_get_wit_cache_populated(const Board *board) {
+  return board->wit_cache_populated;
+}
+
+// WIT rows borrow storage from lexical data and describe the current board.
+// Discard them whenever either changes without corresponding cache updates.
+// NULL rows conservatively disable the optional pruning.
+static inline void board_clear_wit_cache(Board *board) {
+  if (!board->wit_cache_populated) {
+    return;
+  }
+  memset(board->wit_block_rows, 0, sizeof(board->wit_block_rows));
+  memset(board->wit_block_lens, 0, sizeof(board->wit_block_lens));
+  board->wit_cache_populated = false;
+}
+
+// Returns pointers into the WIT parallel arrays for the lane at row_or_col in
+// `dir`/`csi`, mirroring board_get_row_cache: index [i] is the square at
+// position i along the lane (stride 1, transposition handled by
+// get_square_index).
+static inline const uint32_t *const *
+board_get_wit_row_lane(const Board *b, int row_or_col, int dir, int csi) {
+  const int row = (dir == BOARD_HORIZONTAL_DIRECTION) ? row_or_col : 0;
+  const int col = (dir == BOARD_HORIZONTAL_DIRECTION) ? 0 : row_or_col;
+  return &b->wit_block_rows[get_square_index(b->transposed, row, col, dir,
+                                             csi)];
+}
+
+static inline const uint8_t *
+board_get_wit_len_lane(const Board *b, int row_or_col, int dir, int csi) {
+  const int row = (dir == BOARD_HORIZONTAL_DIRECTION) ? row_or_col : 0;
+  const int col = (dir == BOARD_HORIZONTAL_DIRECTION) ? 0 : row_or_col;
+  return &b->wit_block_lens[get_square_index(b->transposed, row, col, dir,
+                                             csi)];
+}
+
 // This bypasses the modification of the number of row anchors and
 // should only be used when resetting the board. Do not use this when
 // updating the board after a play.
@@ -437,8 +553,13 @@ static inline void board_reset_is_cross_word(Board *b, int row, int col,
 // Board: opening penalties
 
 static inline const Equity *
-board_get_opening_move_penalties(const Board *board) {
-  return board->opening_move_penalties;
+board_get_opening_move_word_penalties(const Board *board) {
+  return board->opening_move_word_penalties;
+}
+
+static inline const Equity *
+board_get_opening_move_letter_penalties(const Board *board) {
+  return board->opening_move_letter_penalties;
 }
 
 // Board: Transposed
@@ -719,6 +840,17 @@ static inline void board_reset(Board *board) {
   board_set_all_crosses(board);
   board_reset_all_cross_scores(board);
   board_update_all_anchors(board);
+  // Boards are allocated uninitialized, so a fresh or reused board starts
+  // with no recorded tile owners.
+  board_clear_square_owners(board);
+
+  // Clear the WIT parallel arrays so that, when no word info table is loaded,
+  // move generation reads NULL block rows (skipping the prune) instead of
+  // stale pointers. With a table loaded these are repopulated by the cross-set
+  // computation as tiles are played.
+  memset(board->wit_block_rows, 0, sizeof(board->wit_block_rows));
+  memset(board->wit_block_lens, 0, sizeof(board->wit_block_lens));
+  board->wit_cache_populated = false;
 }
 
 static inline void update_opening_penalty(Board *board, int dir, int i,
@@ -734,9 +866,12 @@ static inline void update_opening_penalty(Board *board, int dir, int i,
       bonus_square_get_letter_multiplier(bonus_square);
 
   // Very basic heuristic which will undoubtedly be greatly improved
-  // at a later time.
-  board->opening_move_penalties[dir * BOARD_DIM + i] +=
-      (OPENING_HOTSPOT_PENALTY / 2) * (word_multiplier - 1) +
+  // at a later time. Kept split by axis (word vs letter multiplier) so a
+  // live PAT class pricing one axis for this square can suppress just that
+  // half instead of the whole thing; see placement_adjustment.
+  board->opening_move_word_penalties[dir * BOARD_DIM + i] +=
+      (OPENING_HOTSPOT_PENALTY / 2) * (word_multiplier - 1);
+  board->opening_move_letter_penalties[dir * BOARD_DIM + i] +=
       (OPENING_HOTSPOT_PENALTY / 2) * (letter_multiplier - 1);
 }
 
@@ -761,8 +896,10 @@ static inline void board_apply_layout(const BoardLayout *bl, Board *board) {
     }
   }
 
-  memset(board->opening_move_penalties, 0,
-         sizeof(board->opening_move_penalties));
+  memset(board->opening_move_word_penalties, 0,
+         sizeof(board->opening_move_word_penalties));
+  memset(board->opening_move_letter_penalties, 0,
+         sizeof(board->opening_move_letter_penalties));
 
   // Calculate opening penalties
 
@@ -805,11 +942,29 @@ static inline Board *board_create(const BoardLayout *bl) {
 }
 
 static inline void board_copy(Board *dst, const Board *src) {
-  memcpy(dst, src, sizeof(Board));
+  // The WIT rows are derived from the squares, and dst receives exactly src's
+  // squares, so src's rows describe dst's blocks: copying them is correct and
+  // keeps the cache usable after the copy. Leaving dst's own rows in place is
+  // not -- they describe the board dst used to hold and can suppress legal
+  // moves -- so the region must be copied whenever either side has any row.
+  if (src->wit_cache_populated || dst->wit_cache_populated) {
+    memcpy(dst, src, sizeof(Board));
+    return;
+  }
+  // Both caches are entirely NULL, so the region needs no traffic at all. This
+  // is the WIT-disabled path, where game_copy runs once per sim rollout.
+  memcpy(dst, src, offsetof(Board, wit_block_rows));
+  const size_t after_wit = offsetof(Board, opening_move_word_penalties);
+  memcpy((char *)dst + after_wit, (const char *)src + after_wit,
+         sizeof(Board) - after_wit);
+  dst->wit_cache_populated = false;
 }
 
 static inline Board *board_duplicate(const Board *board) {
   Board *new_board = (Board *)malloc_or_die(sizeof(Board));
+  memset(new_board->wit_block_rows, 0, sizeof(new_board->wit_block_rows));
+  memset(new_board->wit_block_lens, 0, sizeof(new_board->wit_block_lens));
+  new_board->wit_cache_populated = false;
   board_copy(new_board, board);
   return new_board;
 }
@@ -875,8 +1030,11 @@ static inline void board_copy_row_cache(const Square *lanes_cache,
 }
 
 static inline void board_copy_opening_penalties(const Board *board,
-                                                Equity *opening_penalties) {
-  memcpy(opening_penalties, board->opening_move_penalties,
+                                                Equity *word_penalties,
+                                                Equity *letter_penalties) {
+  memcpy(word_penalties, board->opening_move_word_penalties,
+         sizeof(Equity) * 2 * BOARD_DIM);
+  memcpy(letter_penalties, board->opening_move_letter_penalties,
          sizeof(Equity) * 2 * BOARD_DIM);
 }
 

@@ -3,10 +3,13 @@
 
 #include "../def/move_defs.h"
 #include "../def/players_data_defs.h"
+#include "equity.h"
 #include "klv.h"
 #include "kwg.h"
+#include "pat.h"
 #include "rack_info_table.h"
 #include "wmp.h"
+#include "word_info_table.h"
 #include <stdbool.h>
 
 typedef struct PlayersData PlayersData;
@@ -26,6 +29,13 @@ KLV *players_data_get_klv(const PlayersData *players_data, int player_index);
 WMP *players_data_get_wmp(const PlayersData *players_data, int player_index);
 RackInfoTable *players_data_get_rack_info_table(const PlayersData *players_data,
                                                 int player_index);
+WordInfoTable *players_data_get_word_info_table(const PlayersData *players_data,
+                                                int player_index);
+PATWeights *players_data_get_pat(const PlayersData *players_data,
+                                 int player_index);
+uint32_t
+players_data_get_pat_disabled_classes_mask(const PlayersData *players_data,
+                                           int player_index);
 
 void players_data_set_move_sort_type(PlayersData *players_data,
                                      int player_index,
@@ -33,10 +43,32 @@ void players_data_set_move_sort_type(PlayersData *players_data,
 void players_data_set_move_record_type(PlayersData *players_data,
                                        int player_index,
                                        move_record_t move_record_type);
+void players_data_set_pat_disabled_classes_mask(PlayersData *players_data,
+                                                int player_index,
+                                                uint32_t mask);
+// Whether the player's own move generation (static play and the candidate
+// list a sim starts from) leaves PAT out. Defaults to false.
+void players_data_set_pat_candidates_disabled(PlayersData *players_data,
+                                              int player_index, bool disabled);
+bool players_data_get_pat_candidates_disabled(const PlayersData *players_data,
+                                              int player_index);
+// Whether the rollouts of the player's sims leave PAT out, and which classes
+// they suppress when they don't. Default to false and 0 (every class).
+void players_data_set_pat_rollout_disabled(PlayersData *players_data,
+                                           int player_index, bool disabled);
+bool players_data_get_pat_rollout_disabled(const PlayersData *players_data,
+                                           int player_index);
+void players_data_set_pat_rollout_disabled_classes_mask(
+    PlayersData *players_data, int player_index, uint32_t mask);
+uint32_t players_data_get_pat_rollout_disabled_classes_mask(
+    const PlayersData *players_data, int player_index);
 void *players_data_get_data(const PlayersData *players_data,
                             players_data_t players_data_type, int player_index);
 bool players_data_get_is_shared(const PlayersData *players_data,
                                 players_data_t players_data_type);
+void players_data_set_is_shared(PlayersData *players_data,
+                                players_data_t players_data_type,
+                                bool is_shared);
 bool players_data_get_use_when_available(const PlayersData *players_data,
                                          players_data_t players_data_type,
                                          int player_index);
@@ -59,6 +91,28 @@ void players_data_set(PlayersData *players_data,
 void players_data_set_data(PlayersData *players_data,
                            players_data_t players_data_type, int player_index,
                            void *data);
+void players_data_validate_word_info_tables(const PlayersData *players_data,
+                                            ErrorStack *error_stack);
+// Whether player `player_index`'s word info table, if any, was built from that
+// player's KWG. A table that does not record one cannot be checked, and
+// matches.
+bool players_data_wit_matches_kwg(const PlayersData *players_data,
+                                  int player_index);
+// Whether player `player_index`'s rack info table, if any, was built from
+// that player's lexicon and leaves. A table that records neither (built
+// before version 13) cannot be checked, and matches.
+bool players_data_rit_matches_inputs(const PlayersData *players_data,
+                                     int player_index);
+// Whether player `player_index`'s rack info table, if any, holds the leave
+// values that player's KLV gives. It stores leave values but not always which
+// KLV they came from, so this samples entries spread across it.
+bool players_data_rit_matches_klv(const PlayersData *players_data,
+                                  int player_index);
+// Destroys both players' data of this type and leaves the slots empty, so the
+// next players_data_set loads from disk even for a name that is already
+// loaded. The use-when-available flags are left as they are.
+void players_data_evict(PlayersData *players_data,
+                        players_data_t players_data_type);
 void players_data_reload(PlayersData *players_data,
                          players_data_t players_data_type,
                          const char *data_paths, ErrorStack *error_stack);

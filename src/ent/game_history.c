@@ -1,17 +1,22 @@
 #include "game_history.h"
 
+#include "../compat/cfile.h"
 #include "../def/game_defs.h"
 #include "../def/game_history_defs.h"
+#include "../def/rack_defs.h"
 #include "../ent/board_layout.h"
 #include "../ent/data_filepaths.h"
 #include "../ent/equity.h"
 #include "../util/io_util.h"
 #include "../util/string_util.h"
+#include "endgame_results.h"
+#include "inference_results.h"
+#include "move.h"
 #include "rack.h"
+#include "sim_results.h"
 #include "validated_move.h"
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 enum {
   MAX_GCG_FILENAME_ATTEMPTS = 1000000,
@@ -34,6 +39,10 @@ struct GameEvent {
   Rack after_event_player_off_turn_rack;
   ValidatedMoves *vms;
   char *note;
+  MoveList *move_list;
+  SimResults *sim_results;
+  InferenceResults *inference_results;
+  EndgameResults *endgame_results;
 };
 
 void game_event_reset(GameEvent *game_event) {
@@ -51,6 +60,14 @@ void game_event_reset(GameEvent *game_event) {
   game_event->vms = NULL;
   free(game_event->note);
   game_event->note = NULL;
+  move_list_destroy(game_event->move_list);
+  game_event->move_list = NULL;
+  sim_results_destroy(game_event->sim_results);
+  game_event->sim_results = NULL;
+  inference_results_destroy(game_event->inference_results);
+  game_event->inference_results = NULL;
+  endgame_results_destroy(game_event->endgame_results);
+  game_event->endgame_results = NULL;
 }
 
 void game_event_swap(GameEvent *ge1, GameEvent *ge2) {
@@ -134,6 +151,44 @@ ValidatedMoves *game_event_get_vms(const GameEvent *event) {
   return event->vms;
 }
 
+void game_event_set_move_list(GameEvent *event, MoveList *move_list) {
+  move_list_destroy(event->move_list);
+  event->move_list = move_list;
+}
+
+MoveList *game_event_get_move_list(const GameEvent *event) {
+  return event->move_list;
+}
+
+void game_event_set_sim_results(GameEvent *event, SimResults *sim_results) {
+  sim_results_destroy(event->sim_results);
+  event->sim_results = sim_results;
+}
+
+SimResults *game_event_get_sim_results(const GameEvent *event) {
+  return event->sim_results;
+}
+
+void game_event_set_inference_results(GameEvent *event,
+                                      InferenceResults *inference_results) {
+  inference_results_destroy(event->inference_results);
+  event->inference_results = inference_results;
+}
+
+InferenceResults *game_event_get_inference_results(const GameEvent *event) {
+  return event->inference_results;
+}
+
+void game_event_set_endgame_results(GameEvent *event,
+                                    EndgameResults *endgame_results) {
+  endgame_results_destroy(event->endgame_results);
+  event->endgame_results = endgame_results;
+}
+
+EndgameResults *game_event_get_endgame_results(const GameEvent *event) {
+  return event->endgame_results;
+}
+
 void game_event_set_note(GameEvent *event, const char *note) {
   free(event->note);
   if (is_string_empty_or_null(note)) {
@@ -173,6 +228,9 @@ typedef struct GameHistoryPlayer {
 } GameHistoryPlayer;
 
 struct GameHistory {
+  char *initial_cgp;
+  Rack initial_racks[2];
+  bool initial_bag_empty;
   char *title;
   char *description;
   char *id_auth;
@@ -402,8 +460,7 @@ void game_history_set_gcg_filename(GameHistory *game_history,
       StringBuilder *sb = string_builder_create();
       string_builder_add_formatted_string(sb, "%s%s", new_gcg_filename,
                                           GCG_EXTENSION);
-      game_history->gcg_filename = string_builder_dump(sb, NULL);
-      string_builder_destroy(sb);
+      game_history->gcg_filename = string_builder_dump_and_destroy(sb, NULL);
     } else {
       game_history->gcg_filename = string_duplicate(new_gcg_filename);
     }
@@ -417,7 +474,7 @@ void game_history_set_gcg_filename(GameHistory *game_history,
   }
   StringBuilder *sb = string_builder_create();
   string_builder_add_gcg_filename(sb, game_history, 0);
-  for (int i = 0; access(string_builder_peek(sb), F_OK) == 0 &&
+  for (int i = 0; cfile_access(string_builder_peek(sb), CFILE_ACCESS_EXISTS) &&
                   i < MAX_GCG_FILENAME_ATTEMPTS;
        i++) {
     string_builder_clear(sb);
@@ -432,7 +489,47 @@ const char *game_history_get_gcg_filename(const GameHistory *game_history) {
   return game_history->gcg_filename;
 }
 
+void game_history_set_initial_cgp(GameHistory *history, const char *cgp) {
+  free(history->initial_cgp);
+  history->initial_cgp = string_duplicate_allow_null(cgp);
+  memset(history->initial_racks, 0, sizeof(history->initial_racks));
+  history->initial_bag_empty = false;
+}
+
+const char *game_history_get_initial_cgp(const GameHistory *history) {
+  return history->initial_cgp;
+}
+
+void game_history_set_initial_racks(GameHistory *history, const Rack *first,
+                                    const Rack *second, bool bag_empty) {
+  history->initial_bag_empty = bag_empty;
+  rack_copy(&history->initial_racks[0], first);
+  rack_copy(&history->initial_racks[1], second);
+}
+
+const Rack *game_history_get_unplayed_initial_rack(const GameHistory *history,
+                                                   int player_index,
+                                                   int num_events) {
+  const Rack *rack = &history->initial_racks[player_index];
+  if (rack_is_empty(rack) || (rack_get_total_letters(rack) != RACK_SIZE &&
+                              !history->initial_bag_empty)) {
+    return NULL;
+  }
+  for (int event_index = 0; event_index < num_events; event_index++) {
+    const GameEvent *event = game_history_get_event(history, event_index);
+    if (game_event_get_player_index(event) == player_index) {
+      const game_event_t type = game_event_get_type(event);
+      if (type == GAME_EVENT_TILE_PLACEMENT_MOVE ||
+          type == GAME_EVENT_EXCHANGE || type == GAME_EVENT_PASS) {
+        return NULL;
+      }
+    }
+  }
+  return rack;
+}
+
 void game_history_reset(GameHistory *game_history) {
+  game_history_set_initial_cgp(game_history, NULL);
   free(game_history->title);
   game_history->title = NULL;
   free(game_history->description);
@@ -471,6 +568,10 @@ GameHistory *game_history_create(void) {
 GameHistory *game_history_duplicate(const GameHistory *gh_orig) {
   GameHistory *gh_copy = malloc_or_die(sizeof(GameHistory));
   gh_copy->events = malloc_or_die(sizeof(GameEvent) * (MAX_GAME_EVENTS));
+  gh_copy->initial_cgp = string_duplicate_allow_null(gh_orig->initial_cgp);
+  game_history_set_initial_racks(gh_copy, &gh_orig->initial_racks[0],
+                                 &gh_orig->initial_racks[1],
+                                 gh_orig->initial_bag_empty);
   gh_copy->title = string_duplicate_allow_null(gh_orig->title);
   gh_copy->description = string_duplicate_allow_null(gh_orig->description);
   gh_copy->id_auth = string_duplicate_allow_null(gh_orig->id_auth);
@@ -514,6 +615,12 @@ GameHistory *game_history_duplicate(const GameHistory *gh_orig) {
               &ge_orig->after_event_player_off_turn_rack);
     ge_copy->vms = validated_moves_duplicate(ge_orig->vms);
     ge_copy->note = string_duplicate_allow_null(ge_orig->note);
+    ge_copy->move_list = move_list_duplicate(ge_orig->move_list);
+    ge_copy->sim_results = sim_results_duplicate(ge_orig->sim_results);
+    ge_copy->inference_results =
+        inference_results_duplicate(ge_orig->inference_results);
+    ge_copy->endgame_results =
+        endgame_results_duplicate(ge_orig->endgame_results);
   }
   return gh_copy;
 }
@@ -522,6 +629,7 @@ void game_history_destroy(GameHistory *game_history) {
   if (!game_history) {
     return;
   }
+  free(game_history->initial_cgp);
   free(game_history->title);
   free(game_history->description);
   free(game_history->id_auth);

@@ -1,0 +1,165 @@
+# AGENTS.md — MAGPIE
+
+Crossword game engine in C (C99 with some C11). Move generation, Monte Carlo simulation, inference, autoplay, superleave generation, endgame solving.
+
+## Initial Setup (fresh clone)
+
+```bash
+./download_data.sh             # downloads data/ and testdata/ from MAGPIE-DATA repo
+./convert_lexica.sh            # converts .kwg → .txt → .wmp (builds MAGPIE first)
+```
+
+`data/` and `testdata/` are gitignored. Missing file errors = run these scripts.
+
+## Build
+
+```bash
+make magpie                    # dev build (ASAN/UBSAN enabled)
+make release                   # production static-trained PGO build
+make prepare_data              # validate/upgrade CSW24 WIT; create missing RIT
+make magpie BUILD=no_pgo_release # optimized build without PGO
+make magpie_test               # build test binary
+make magpie_test BUILD=no_pgo_release # optimized test binary
+make magpie_test BUILD=sanitize # dev's ASAN/UBSAN checks at -O1, as CI runs the tests
+make magpie BUILD=thread       # thread sanitizer build
+make leavegen_pgo_release      # leavegen-trained PGO build
+make libmagpie                 # shared library; API is src/impl/cmd_api.h
+make windows                   # bin/magpie.exe via Docker (llvm-mingw); WINDOWS_ARCH=aarch64 for arm64
+make windows_test              # bin/magpie_test.exe; make windows_wine_test TESTS=compat runs it under Wine
+make clean                     # remove build artifacts
+```
+
+The local PGO build uses Clang and `llvm-profdata`, found under their plain or
+distro-versioned names (`clang-18`, `llvm-profdata-18`); with no clang on PATH,
+`make release` builds the plain optimized release and says so. It reuses an
+existing production CSW24 RIT (or creates it when missing), validates/upgrades
+the CSW24 WIT with the native C converter before training, discards old
+profile data, and trains the current source on static autoplay. Experimental `pgo`, `pgo_sim`,
+`pgo_peg`, and `pgo_eg` targets are also available. Each produces a
+`-march=native` binary for the build machine. Rerun the selected target after
+source changes and on each target architecture. Override `PGO_CC`,
+`LLVM_PROFDATA`, and `PGO_LDFLAGS` for versioned toolchains.
+
+`BOARD_DIM` (default 15), `RACK_SIZE` (default 7). Parallel make is automatic. **Use `make release` for production jobs or `BUILD=no_pgo_release` for quick optimized builds** — dev is `-O0` + ASAN/UBSAN, very slow; `BUILD=sanitize` makes the same checks at `-O1`, about 1.6 times as fast.
+
+## Tests
+
+`./bin/magpie_test movegen` — test names are short keys in `test/test.c` (`movegen`, `sim`, `autoplay`, etc.). CI runs both `BOARD_DIM=15` and `21`. Non-CI tests are in `on_demand_test_table[]`.
+
+## CI Checks (the hard part)
+
+CI runs on pull requests into main and on pushes to main; a pull request stacked on another branch runs once it targets main. These must all pass: **cppcheck**, **clang-tidy**, **clang-format**, **circular-dependencies**, **portability**, **windows-cross-compile**, **unit-tests**, **wasm-tests**.
+
+CI uses **cppcheck 2.17.1**, **clang-tidy-18**, **clang-format-20** (Ubuntu 24.04). Local versions will differ.
+
+```bash
+python3 format.py --write      # ALWAYS run before pushing
+./cppcheck.sh                  # builds cppcheck 2.17.1 on first run, cached after
+./tidy.sh                      # clang-tidy (or: ./tidy.sh clang-tidy-18)
+python3 find_circ_deps.py      # circular dependencies (requires: pip install networkx)
+python3 check_portability.py   # platform-specific code stays in src/compat
+python3 check_windows_compile.py # every file compiles for Windows (needs llvm-mingw on PATH)
+```
+
+**Platform code lives in `src/compat`.** Outside it, include only ISO C headers
+(plus `<stdatomic.h>`) and project headers, test no platform macros, and call
+no POSIX function compat wraps. Tests get what compat lacks (temporary
+directories, permissions, symlinks, pipes, file size limits) from
+`test/test_platform.h`, whose `.c` is the one exempt file in `test/`; a case a
+platform cannot run is skipped through that helper's return value, never
+deleted. `check_portability.py` lints for this, with no exceptions, and
+`check_windows_compile.py` cross-compiles every file, all of which must
+compile; the cross-compile is the real check. The Windows compiler is the pinned llvm-mingw release (see the
+`windows-cross-compile` job), also available as the
+`mstorsjo/llvm-mingw:20261006` Docker image.
+
+**format.py is NOT just clang-format** — it reorders includes (self-header first, blank line, then all others contiguous) before running `clang-format-20`. No config files.
+
+## Releasing
+
+```bash
+python3 scripts/release.py --dry-run  # asks the questions, changes nothing
+python3 scripts/release.py            # the whole release, from origin/main
+```
+
+The script needs an authenticated `gh`, and asks for the new version (unless main is already ahead of the latest release) and for feedback on the notes, which the `claude` CLI drafts and revises when it is installed. Then it can be left alone: it saves the notes as a draft release, merges a PR bumping `MAGPIE_VERSION` once CI passes, tags that commit, and publishes the draft once `release-{windows,macos,linux}.yml` have uploaded every file. Allow several hours. It stops only for a failed workflow, offering to rerun the failed jobs. Running it again resumes from the state on GitHub. The docstring has the details.
+
+A tag push alone still runs the workflows, which then create a prerelease with stub notes. Use the script instead.
+
+## C Standard
+
+C99 with two C11 exceptions: `_Atomic`/`<stdatomic.h>` and `static_assert`. Do not introduce other C11+ features without asking.
+
+## Style
+
+Always use `{}` braces for `if`, `else if`, and `else` blocks, even when the body is a single statement. No exceptions.
+
+**No `goto` statements.** Use structured loops, conditionals, early returns, and helper functions. Keep resource ownership explicit so every error path releases what it owns. This rule applies to C control flow; the MAGPIE `goto` navigation command is unrelated.
+
+**No forward declarations** — Never forward-declare a struct that is already defined in another module's header. Use `#include` to bring in that header instead. Forward declarations are only acceptable when the struct or function is defined in the same file.
+
+**Declare enum constants at file scope, never inside a function body.** Named constants belong with the other enum values, not buried where a reader can't find them. A constant shared across modules goes in the relevant `src/def/*_defs.h` header. A constant private to one `.c` file goes in that file's top-of-file anonymous `enum { ... }` block (see `src/impl/endgame.c`). An `enum { FOO = 12 };` declared inside a function is a bug — move it out.
+
+## Naming
+
+Avoid single-character or terse variable names.
+- Prefer `row`/`col` over `i`/`j`
+- Loop variables: use `foo_idx` (e.g., `player_idx`, `tile_idx`)
+- For letters/tiles, `ml` (machine letter) is the idiomatic name
+- No ambiguous single characters: `p` could mean player, ply, or pointer
+
+## Development Methodology
+
+Keep performance work and quality work separate.
+
+### Performance work
+
+Make it faster **without changing behavior**. Validate with autoplay or on-demand tests comparing before/after. Measure the specific functions changed, not just wall-clock time.
+
+Profile the optimized binary itself (`make release` or `BUILD=no_pgo_release`), not a build with inlining turned off, which is a different program. These builds carry debug information, which leaves their code all but unchanged. An inlined function's time counts toward its caller, so split a hot function up by inlined function and source line.
+
+- **macOS:** use the CPU Profiler (`xctrace`) through the scripts of the `cycle-profile` skill, in `.claude/skills/cycle-profile/`. Its `SKILL.md` gives the procedure and the checks. The scripts weight samples by cycles, attribute them to inlined functions and source lines, refuse a stale dSYM and check their own symbol lookups. `sample` misattributes stalls.
+- **Linux:** use `perf record`. `perf report --inline` lists inlined functions only with some perf builds, while `addr2line -i` and `llvm-symbolizer --inlines` always do.
+
+### Feature flags must be free when off
+
+A flag-gated optimization (RIT, WMP, WIT, PGO paths, ...) must cost nothing measurable on the path where the flag is off. Do not add struct fields, per-item stores, cache copies, or branches that the disabled path pays for. Put the mechanism's state where only the enabled path touches it — a sentinel value written by that path beats a flag every path must maintain.
+
+Benchmark both states. The flag-off run is the control and must measure ~0; a flag-off regression means the mechanism is in the wrong place, not that the change is a wash. #614's first port gained +0.7% with RIT on and lost −0.7% with RIT off from exactly this, and the fix removed the loss without touching the gain.
+
+### Quality work
+
+Validate with **game pairs** — two variants play identical tile draws, alternating who goes first.
+
+```bash
+set -lex CSW21 -wmp true -s1 equity -s2 equity -r1 all -r2 all -numplays 1
+autoplay games 1000 -gp true -threads 8 -seed 42
+```
+
+`-gp true` = game pairs (`games 1000` = 2000 total). Always use `-wmp true` and `-threads <N>`.
+
+For automated comparison, register an on-demand test in `on_demand_test_table[]`.
+
+### When speed *is* quality
+
+Under a time limit (e.g., endgame benchmarks), faster code finds better solutions. Measuring quality under a time budget validates that optimizations pay off.
+
+### Endgame benchmarking and transposition tables
+
+When comparing two solver modes, the second benefits unfairly from the first's TT cache. Use separate TTs or reset between solves. Total TT memory must not exceed 50% of system RAM (`0.5` for one TT, `0.25` each for two).
+
+## Common Pitfalls
+
+1. **const pointers (cppcheck)** — The #1 CI failure. `const` every pointer that doesn't need mutation. False positive? `// cppcheck-suppress constVariablePointer`
+2. **Include what you use (clang-tidy)** — Every symbol needs a direct `#include`. Transitive includes don't count.
+3. **Include block formatting** — Contiguous, no blank lines except after the self-header in `.c` files.
+4. **Designated initializers** — Omitted struct fields zero-initialize, which may differ from intended defaults. Audit call sites when adding fields.
+5. **No pthread_mutex_destroy / pthread_cond_destroy** — Project mutexes don't dynamically allocate. LLMs always add these — don't.
+6. **No debug prints** — No `printf`/`fprintf` in production code. Use the status print mechanism.
+7. **Tests in test files** — Test-only code belongs in `test/*.c`, not `src/`.
+8. **Equity is millipoints** — `Equity` (`int32_t`) = millipoints (42 points = `42000`). Use `int_to_equity()` / `equity_to_int()` / `double_to_equity()`.
+9. **Resource leaks on error paths** — Release all resources before error returns. cppcheck catches missing `fclose`/`free`.
+10. **Endian I/O belongs in `src/compat`.** Use `fread_le_uint32s` and `fwrite_le_uint32s` from `src/compat/endian_io.h` for little-endian uint32 array I/O. Keep host-endian checks (`IS_LITTLE_ENDIAN`) and byte swapping inside the compatibility layer. If another type or operation needs support, add a shared helper there; serializers and loaders should call the helpers.
+
+## Keep PRs focused
+Large PRs with multiple concerns get closed. Split into smaller, focused units.

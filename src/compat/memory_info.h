@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 
 #include "../util/io_util.h"
@@ -13,6 +14,7 @@
 #elif defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #elif defined(__APPLE__) || defined(__MACH__)
+#include <mach/mach.h>
 #include <sys/param.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
@@ -22,15 +24,107 @@
 #include <unistd.h>
 #endif
 
-static inline uint64_t get_total_memory(void) {
+// Search budgets use a fixed base on browsers; linear-memory growth must not
+// increase subsequent search allocations. Native budgets use physical RAM.
+#ifdef __EMSCRIPTEN__
+#define DEFAULT_TT_FRACTION 0.125
+#define TT_MIN_SIZE_POWER 20
+#define PEG_TT_MIN_SIZE_POWER 12
+#else
+#define DEFAULT_TT_FRACTION 0.25
+#define TT_MIN_SIZE_POWER 24
+#define PEG_TT_MIN_SIZE_POWER TT_MIN_SIZE_POWER
+#endif
+
+// Per-worker stack of the PEG pool (peg_pool.c). Workers recurse into nested
+// solves while help-draining the queue (bounded by the PEG fork-nesting cap).
+// Natively 64 MiB is virtual address space, committed lazily, so only the
+// nesting depth actually reached is paid for. Emscripten instead mallocs each
+// thread's whole stack from the wasm heap the searches and lexica share, so the
+// browser gets a stack sized to use: a native worker stack reaches about 20 KiB
+// at the default nesting depth, and the PEG suite plus nesting four deep on
+// four workers run within 256 KiB in wasm with STACK_OVERFLOW_CHECK.
+#ifdef __EMSCRIPTEN__
+enum {
+  PEG_POOL_WORKER_STACK_BYTES = 4 * 1024 * 1024,
+};
+#else
+enum {
+  PEG_POOL_WORKER_STACK_BYTES = 64 * 1024 * 1024,
+};
+#endif
+
+// Buckets of a simulation's best-move carry (best_move_carry.h), about 12 KB
+// each, nearly all of it lane bounds: about 12 MB natively. The browser's
+// simulations share the wasm heap with the lexica, so there the carry takes
+// about 1.5 MB; 128 buckets of 8 bounds a lane still skip more lanes than
+// 1024 buckets of 2.
+#ifdef __EMSCRIPTEN__
+enum {
+  SIM_BEST_MOVE_CARRY_BUCKETS = 128,
+};
+#else
+enum {
+  SIM_BEST_MOVE_CARRY_BUCKETS = 1024,
+};
+#endif
+
+// Entries of an endgame worker's lane shadow cache (lane_shadow_cache.h), as
+// a power of two: natively 2^16 entries of 64 bytes, 4 MiB a worker. The
+// browser's endgames share the wasm heap with the lexica and the
+// transposition table, so there it is 2^12, 256 KiB a worker.
+#ifdef __EMSCRIPTEN__
+enum {
+  ENDGAME_LANE_SHADOW_CACHE_INDEX_BITS = 12,
+};
+#else
+enum {
+  ENDGAME_LANE_SHADOW_CACHE_INDEX_BITS = 16,
+};
+#endif
+
+// Entries of the anchor plays an endgame worker's lane shadow cache holds, as
+// a power of two: natively 2^18 entries of 32 bytes, 8 MiB a worker; in the
+// browser 2^13, 256 KiB a worker.
+#ifdef __EMSCRIPTEN__
+enum {
+  ENDGAME_ANCHOR_PLAY_CACHE_INDEX_BITS = 13,
+};
+#else
+enum {
+  ENDGAME_ANCHOR_PLAY_CACHE_INDEX_BITS = 18,
+};
+#endif
+
+// Entries of the cross set cache (cross_set_cache.h) of an endgame worker, a
+// simulation worker or an autoplay game, as a power of two: natively 2^14
+// entries of 64 bytes, 1 MiB each, which answers about 99% of an endgame's or
+// a simulation's cross sets. In the browser 2^11, 128 KiB each.
+#ifdef __EMSCRIPTEN__
+enum {
+  CROSS_SET_CACHE_INDEX_BITS = 11,
+};
+#else
+enum {
+  CROSS_SET_CACHE_INDEX_BITS = 14,
+};
+#endif
+
+static inline bool search_memory_is_bounded(void) {
+#ifdef __EMSCRIPTEN__
+  return true;
+#else
+  return false;
+#endif
+}
+
+static inline uint64_t get_search_memory_budget_base(void) {
   uint64_t total_memory = 0;
 
 #if defined(__EMSCRIPTEN__)
-  // WASM/Emscripten implementation
-  // Return the heap size via EM_ASM
-  total_memory = EM_ASM_INT({
-    return HEAP8.length;
-  });
+  // Fixed browser budgeting base: growing the heap for data must not also
+  // grow search tables on the next solve. 0.125 reserves a stable 32 MiB TT.
+  total_memory = 256ULL * 1024 * 1024;
 
 #elif defined(_WIN32) || defined(_WIN64)
   // Windows implementation
@@ -92,6 +186,72 @@ static inline uint64_t get_total_memory(void) {
 #endif
 
   return total_memory;
+}
+
+// The memory a new allocation can have without the system swapping, in
+// *available_bytes: MemAvailable on Linux, the available physical memory on
+// Windows, the free, inactive and purgeable pages on macOS. False where it
+// cannot be found (browsers), which a caller takes as unconstrained.
+static inline bool get_available_memory_bytes(int64_t *available_bytes) {
+#if defined(__EMSCRIPTEN__)
+  (void)available_bytes;
+  return false;
+#elif defined(_WIN32) || defined(_WIN64)
+  MEMORYSTATUSEX statex;
+  statex.dwLength = sizeof(statex);
+  if (!GlobalMemoryStatusEx(&statex)) {
+    return false;
+  }
+  *available_bytes = statex.ullAvailPhys > (DWORDLONG)INT64_MAX
+                         ? INT64_MAX
+                         : (int64_t)statex.ullAvailPhys;
+  return true;
+#elif defined(__APPLE__) || defined(__MACH__)
+  // Inactive and purgeable pages are reclaimed for a new allocation before
+  // anything is swapped out, so they count as available, as Activity Monitor
+  // counts them.
+  vm_statistics64_data_t stats = {0};
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                        (host_info64_t)&stats, &count) != KERN_SUCCESS) {
+    return false;
+  }
+  vm_size_t page_size = 0;
+  if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS) {
+    return false;
+  }
+  const uint64_t pages = (uint64_t)stats.free_count +
+                         (uint64_t)stats.inactive_count +
+                         (uint64_t)stats.purgeable_count;
+  *available_bytes = pages > (uint64_t)INT64_MAX / (uint64_t)page_size
+                         ? INT64_MAX
+                         : (int64_t)(pages * (uint64_t)page_size);
+  return true;
+#elif defined(__linux__)
+  FILE *file = fopen("/proc/meminfo", "r");
+  if (!file) {
+    return false;
+  }
+  bool found = false;
+  char line[256];
+  while (!found && fgets(line, sizeof(line), file)) {
+    if (strncmp(line, "MemAvailable:", 13) == 0) {
+      char *endptr;
+      errno = 0;
+      const unsigned long long kilobytes = strtoull(line + 13, &endptr, 10);
+      found = errno == 0 && endptr != line + 13 &&
+              kilobytes < (unsigned long long)INT64_MAX / 1024;
+      if (found) {
+        *available_bytes = (int64_t)(kilobytes * 1024);
+      }
+    }
+  }
+  (void)fclose(file);
+  return found;
+#else
+  (void)available_bytes;
+  return false;
+#endif
 }
 
 static inline int get_num_cores(void) {

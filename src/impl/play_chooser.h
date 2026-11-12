@@ -7,6 +7,7 @@
 #include "../ent/win_pct.h"
 #include "../util/io_util.h"
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // How the play chooser evaluates a position when deciding on a play (or
@@ -29,6 +30,21 @@ typedef enum {
   // per-move / per-decision time budget.
   PLAY_CHOOSER_EVAL_PEG,
 } play_chooser_eval_t;
+
+// Order of an endgame challenge decision's keep and challenge solves.
+typedef enum {
+  // Both at once, against a shared transposition table. Whichever finishes
+  // exactly first interrupts the other, which a null-window solve around the
+  // first one's value then resolves. Which one finishes first depends on
+  // timing.
+  PLAY_CHOOSER_CHALLENGE_ORDER_CONCURRENT,
+  // For tests, so each side finishing first is covered every run: the keep
+  // branch is solved first, and if it is exact the challenge branch is
+  // resolved against it as though the keep branch had finished first.
+  PLAY_CHOOSER_CHALLENGE_ORDER_KEEP_FIRST,
+  // The same, with the challenge branch first.
+  PLAY_CHOOSER_CHALLENGE_ORDER_CHALLENGE_FIRST,
+} play_chooser_challenge_order_t;
 
 // Describes how a computer player delegates its decisions. Examples:
 //   static always:          pre_endgame_eval=STATIC, endgame_eval=STATIC
@@ -54,6 +70,11 @@ typedef struct PlayChooserStrategy {
   // evaluation ignores the budget.
   double fixed_seconds_per_move;
   GameTimer *game_timer; // not owned; may be NULL
+  // Length of an overtime penalty period. Once the main clock expires,
+  // PlayChooser may spend time already covered by the current started period,
+  // while reserving enough time to avoid starting the next one. Zero disables
+  // overtime search and falls back to static play after flag fall.
+  double overtime_period_seconds;
   // Whether play_chooser_decide_challenge considers challenging phonies
   // at all. When false it always advises against challenging.
   bool enable_challenges;
@@ -69,6 +90,9 @@ typedef struct PlayChooserStrategy {
   // selects, the preliminary search seeds the move-choosing solve (the
   // post-verdict position is exactly that branch's root).
   double challenge_decision_seconds;
+  // Order of the endgame decision's two solves; the default solves them
+  // concurrently. The other orders are for tests.
+  play_chooser_challenge_order_t challenge_order;
   WinPct *win_pcts; // required for SIM; not owned
   int num_threads;  // 0 = 1
   // PEG scenario stride: 1 = full enumeration, k > 1 = weight-stratified
@@ -88,10 +112,51 @@ typedef struct PlayChooserStrategy {
   double utility_w_winpct;
   double utility_w_spread;
   double utility_spread_scale;
+  // The player's rollout PAT settings for SIM evaluation (see
+  // SimArgs.pat_rollout_disabled). Zero/unset: PAT on, every class.
+  bool pat_rollout_disabled;
+  uint32_t pat_rollout_disabled_classes_mask;
+  // SimArgs.bag_cycle for the chooser's sims.
+  bool sim_bag_cycle;
   uint64_t seed;
 } PlayChooserStrategy;
 
 typedef struct PlayChooser PlayChooser;
+
+// Aggregate work completed by PlayChooser while benchmark collection is
+// enabled. Timed searches should be compared by this work, not by wall time:
+// their wall time is intentionally bounded by the same clock.
+typedef struct PlayChooserBenchmarkStats {
+  uint64_t static_moves;
+  uint64_t fallback_moves;
+  uint64_t sim_calls;
+  uint64_t sim_iterations;
+  uint64_t sim_nodes;
+  uint64_t peg_calls;
+  uint64_t peg_candidate_completions;
+  uint64_t peg_candidate_events_dropped;
+  uint64_t peg_completed_stages;
+  uint64_t peg_final_candidates;
+  uint64_t peg_final_scenarios;
+  uint64_t peg_partial_calls;
+  uint64_t endgame_calls;
+  uint64_t endgame_nodes;
+  uint64_t endgame_depth;
+} PlayChooserBenchmarkStats;
+
+// One completed PEG candidate. A call index identifies the PEG solve and the
+// elapsed time is measured from the start of that solve. Stage indices and
+// candidate ranks are zero-based. Events can arrive concurrently and are kept
+// in callback order; elapsed_ns provides the actual within-call completion
+// timeline, including useful work completed before a time limit interrupts a
+// stage.
+typedef struct PlayChooserPegCandidateEvent {
+  uint64_t call_index;
+  uint64_t elapsed_ns;
+  int stage_index;
+  int candidate_rank;
+  int scenarios_completed;
+} PlayChooserPegCandidateEvent;
 
 typedef struct ChallengeDecision {
   // True if the move forms at least one word that is invalid in the
@@ -107,10 +172,37 @@ typedef struct ChallengeDecision {
   // verdict, since the utility is monotonic in spread).
   double keep_value;
   double challenge_value;
+  // How a both-endgame decision was reached, for diagnostics:
+  // - *_exact: the branch's own solve completed every ply. A branch whose
+  //   sibling finished exactly first is interrupted, so it is not exact.
+  // - *_valid: the branch's own solve produced a value at all.
+  // - resolve_completed: when exactly one branch was exact, the other was
+  //   resolved with a null window around its value, and this proof finished.
+  bool keep_exact;
+  bool keep_valid;
+  bool challenge_exact;
+  bool challenge_valid;
+  bool resolve_completed;
 } ChallengeDecision;
 
 PlayChooser *play_chooser_create(const PlayChooserStrategy *strategy);
 void play_chooser_destroy(PlayChooser *play_chooser);
+
+// Enable/reset, snapshot, and disable the process-wide benchmark counters.
+// Counters are atomic because autoplay may run chooser games concurrently.
+// Collection is disabled by default and has only one predictable branch per
+// chooser operation when unused. Reset, event copying, and stopping require
+// all chooser operations to have finished (including their worker threads);
+// disabling collection does not wait for callbacks already in flight.
+void play_chooser_benchmark_reset(void);
+void play_chooser_benchmark_get(PlayChooserBenchmarkStats *stats);
+// Copies up to capacity PEG candidate events into events and returns the
+// number copied. With a NULL events pointer or zero capacity, returns the
+// number currently retained without copying. The stats snapshot reports any
+// events dropped because the fixed process-wide event buffer filled.
+size_t play_chooser_benchmark_get_peg_candidate_events(
+    PlayChooserPegCandidateEvent *events, size_t capacity);
+void play_chooser_benchmark_stop(void);
 
 // Choose a move for the player on turn in game, delegating to static
 // eval, sim, or the endgame solver per the strategy. Any tiles known to
@@ -118,6 +210,11 @@ void play_chooser_destroy(PlayChooser *play_chooser);
 // passed along to the simulation.
 void play_chooser_choose_move(PlayChooser *play_chooser, Game *game,
                               Move *out_move, ErrorStack *error_stack);
+
+// Returns the current search budget for the player on turn. Zero means there
+// is not enough safely spendable clock for a non-static search.
+double play_chooser_get_seconds_for_move(const PlayChooserStrategy *strategy,
+                                         const Game *game);
 
 // Decide whether opp_move, announced by the player on turn in
 // game_before_move, should be challenged off. game_before_move must be

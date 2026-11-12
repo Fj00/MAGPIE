@@ -1,246 +1,20 @@
 #ifndef MOVE_GEN_H
 #define MOVE_GEN_H
 
-#include "../def/board_defs.h"
-#include "../def/letter_distribution_defs.h"
 #include "../def/move_defs.h"
-#include "../ent/anchor.h"
-#include "../ent/bit_rack.h"
-#include "../ent/board.h"
+#include "../ent/best_move_carry.h"
 #include "../ent/equity.h"
 #include "../ent/game.h"
-#include "../ent/klv.h"
 #include "../ent/kwg.h"
-#include "../ent/leave_map.h"
-#include "../ent/letter_distribution.h"
+#include "../ent/lane_shadow_cache.h"
 #include "../ent/move.h"
-#include "../ent/rack.h"
-#include "../ent/rack_info_table.h"
-#include "wmp_move_gen.h"
+#include "../ent/thread_control.h"
+#include "move_gen_base.h"
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MOVEGEN_RIT_CACHE_SIZE 64
-
-// Per-thread cache of KLV walk results (leave_values[128] and
-// best_leaves[8]) keyed by player_bit_rack. This is the "mini-RIT":
-// the same data a loaded RackInfoTable would have supplied, computed
-// on demand on cache miss and reused on recurring racks in the sim
-// rollouts. Lets WMP-enabled runs without a .rit file still skip the
-// per-rack KLV/KWG descent once the rack has been seen. Direct-mapped.
-#ifndef MOVEGEN_KLV_LEAVES_CACHE_SIZE
-#define MOVEGEN_KLV_LEAVES_CACHE_SIZE 256
-#endif
-
-typedef struct KlvLeavesCacheEntry {
-  BitRack key;
-  bool valid;
-  // Per-subset (128-slot) leave_values, same layout as leave_map.leave_values.
-  Equity leave_values[1 << RACK_SIZE];
-  // Per-leave-size max leave across canonical subsets, same as
-  // RackInfoTableEntry.best_leaves.
-  Equity best_leaves[RACK_SIZE + 1];
-} KlvLeavesCacheEntry;
-
-// Size of the per-thread cache of
-// wmp_move_gen_enumerate_nonplaythrough_subracks results. Keyed by
-// player_bit_rack. The enumeration output is a function of the rack alone, so
-// caching it saves 5-20% of sim time when the same rack recurs across rollouts
-// (typical in MCTS-style sims). Direct-mapped.
-#ifndef MOVEGEN_SUBRACK_CACHE_SIZE
-#define MOVEGEN_SUBRACK_CACHE_SIZE 64
-#endif
-
-// Number of subrack slots stored per rack. Matches (1 << RACK_SIZE) which
-// is the total number of multi-subset combinations of a RACK_SIZE-tile rack.
-#define MOVEGEN_SUBRACK_CACHE_ENTRIES (1 << RACK_SIZE)
-
-typedef struct SubrackEnumCacheEntry {
-  BitRack key;
-  bool valid;
-  // Flat array indexed by subracks_get_combination_offset(size) + idx_for_size.
-  BitRack subracks[MOVEGEN_SUBRACK_CACHE_ENTRIES];
-  Equity leave_values[MOVEGEN_SUBRACK_CACHE_ENTRIES];
-  // wmp_entry pointers per subrack, also rack-determined. Storing them
-  // lets us skip the per-subrack wmp_get_word_entry hash lookups on
-  // cache hit. Invalidated when the WMP pointer changes.
-  const WMPEntry *wmp_entries[MOVEGEN_SUBRACK_CACHE_ENTRIES];
-  uint8_t count_by_size[RACK_SIZE + 1];
-} SubrackEnumCacheEntry;
-
-typedef struct UnrestrictedMultiplier {
-  uint8_t multiplier;
-  uint8_t column;
-} UnrestrictedMultiplier;
-
-typedef struct MoveGen {
-  // Owned by this MoveGen struct
-  int current_row_index;
-  int current_anchor_col;
-  uint64_t anchor_left_extension_set;
-  uint64_t anchor_right_extension_set;
-
-  int last_anchor_col;
-  int dir;
-  int max_tiles_to_play;
-  int tiles_played;
-  int first_played_tile_col;
-  int number_of_plays;
-  int move_sort_type;
-  move_record_t move_record_type;
-  int number_of_tiles_in_bag;
-  int player_index;
-  Equity bingo_bonus;
-  bool kwgs_are_shared;
-  bool is_wordsmog;
-  Rack player_rack;
-  Rack player_rack_shadow_right_copy;
-  // Using to save the player's full rack
-  // for shadow playing and then is later
-  // used for alpha generation
-  Rack full_player_rack;
-  Rack bingo_alpha_rack;
-  Rack bingo_alpha_rack_shadow_right_copy;
-  Rack opponent_rack;
-  Rack leave;
-  // Read-only view into the board's lanes for the current cross index;
-  // refreshed by gen_load_position each call.
-  const Square *lanes_cache;
-  Square row_cache[BOARD_DIM];
-  uint8_t row_number_of_anchors_cache[(BOARD_DIM) * 2];
-  Equity opening_move_penalties[(BOARD_DIM) * 2];
-  int board_number_of_tiles_played;
-  int cross_index;
-  Move best_move_and_current_move[2];
-  int best_move_index;
-  Equity current_anchor_highest_possible_score;
-  // Updated every time a play is recorded
-  Equity cutoff_equity_or_score;
-  // This field is only used for the MOVE_RECORD_WITHIN_X_EQUITY_OF_BEST
-  // record type
-  Equity best_move_equity_or_score;
-  Equity eq_margin_movegen;
-
-  // Inference cutoff fields
-  Equity target_equity_cutoff;
-  int target_leave_size;
-  bool stop_on_threshold;
-  bool threshold_exceeded;
-
-  MachineLetter strip[(MOVE_MAX_TILES)];
-  MachineLetter exchange_strip[(MOVE_MAX_TILES)];
-  // MOVE_RECORD_TILES_PLAYED mode fields:
-  // Bitvector of machine letters that appear in any valid move.
-  // Bit i is set if machine letter i is playable.
-  uint64_t tiles_played_bv;
-  // Bitvector of machine letters on the rack (target for early exit).
-  // Generation stops when (tiles_played_bv & target_tiles_bv) ==
-  // target_tiles_bv.
-  uint64_t target_tiles_bv;
-  LeaveMap leave_map;
-  BitRack player_bit_rack;
-  // Shadow plays
-  int current_left_col;
-  int current_right_col;
-
-  // Used to insert "unrestricted" multipliers into a descending list for
-  // calculating the maximum score for an anchor. We don't know which tiles will
-  // go in which multipliers so we keep a sorted list. The inner product of
-  // those and the descending tile scores is the highest possible score of a
-  // permutation of tiles in those squares.
-  UnrestrictedMultiplier
-      descending_cross_word_multipliers[WORD_ALIGNING_RACK_SIZE];
-  uint16_t descending_effective_letter_multipliers[WORD_ALIGNING_RACK_SIZE];
-  uint8_t num_unrestricted_multipliers;
-  uint8_t last_word_multiplier;
-
-  // Used to reset the arrays after finishing shadow_play_right, which may have
-  // rearranged the ordering of the multipliers used while shadowing left.
-  UnrestrictedMultiplier desc_xw_muls_copy[WORD_ALIGNING_RACK_SIZE];
-  uint16_t desc_eff_letter_muls_copy[WORD_ALIGNING_RACK_SIZE];
-
-  // Since shadow does not have backtracking besides when switching from going
-  // right back to going left, it is convenient to store these parameters here
-  // rather than using function arguments for them.
-
-  // This is a sum of already-played crosswords and tiles restricted to a known
-  // empty square (times a letter or word multiplier). It's a part of the score
-  // not affected by the overall mainword multiplier.
-  Equity shadow_perpendicular_additional_score;
-
-  // This is a sum of both the playthrough tiles and tiles restricted to a known
-  // empty square (times their letter multiplier). It will be multiplied by
-  // shadow_word_multiplier as part of computing score shadow_record.
-  Equity shadow_mainword_restricted_score;
-
-  // Product of word multipliers used by newly played tiles.
-  int shadow_word_multiplier;
-
-  Equity highest_shadow_equity;
-  Equity highest_shadow_score;
-  int number_of_letters_on_rack;
-  const KWG *kwg;
-  const KLV *klv;
-  // Snapshot of klv->mutation_counter captured at the last gen_load_position
-  // call. If the KLV's leave_values have been mutated in place since then
-  // (test-only set_klv_leave_value path), leave-derived caches (the subrack
-  // cache) must be invalidated even though the KLV pointer is unchanged.
-  uint64_t klv_mutation_counter_at_load;
-  // Instance fingerprints of the KLV and WMP captured at the last
-  // gen_load_position call. The MoveGen cache is pooled per thread and
-  // outlives the Configs the engine creates and destroys; when a Config is
-  // freed and another loaded, the allocator can hand the new KLV/WMP the freed
-  // one's struct address (ABA) -- even for the same lexicon -- while its
-  // internal arrays are reallocated elsewhere. A KLV/WMP pointer (or lexicon
-  // name) comparison reads "unchanged" and keeps stale leave_values / dangling
-  // wmp_entry pointers cached. The fingerprint hashes the internal array
-  // addresses, so it changes whenever the backing data is reloaded.
-  uint64_t klv_instance_fp_at_load;
-  uint64_t wmp_instance_fp_at_load;
-  const RackInfoTable *rack_info_table;
-  // RIT entry for the current player_rack, looked up once in
-  // gen_look_up_leaves_and_record_exchanges and cached here for the duration
-  // of this move generation. NULL if rack_info_table is NULL, the rack isn't
-  // a full RACK_SIZE rack, or the rack wasn't found in the table.
-  const RackInfoTableEntry *rit_entry;
-  // Small per-thread RIT lookup cache. In sim rollouts, the same racks
-  // recur across iterations within a turn (limited bag composition).
-  // Direct-mapped by low bits of BitRack hash.
-  BitRack rit_cache_keys[MOVEGEN_RIT_CACHE_SIZE];
-  const RackInfoTableEntry *rit_cache_entries[MOVEGEN_RIT_CACHE_SIZE];
-  bool rit_cache_valid[MOVEGEN_RIT_CACHE_SIZE];
-  // Cache of wmp_move_gen_enumerate_nonplaythrough_subracks output
-  // (purely rack-determined). Hit rate tracks rack-repeat rate in sims.
-  SubrackEnumCacheEntry subrack_cache[MOVEGEN_SUBRACK_CACHE_SIZE];
-  // Per-thread mini-RIT: cached leave_values and best_leaves per full rack.
-  // Populated from the KLV walk (generate_exchange_moves) on first touch
-  // for each rack; reused on subsequent movegen calls when the same rack
-  // recurs. Lets WMP-enabled runs without a loaded RackInfoTable still
-  // amortize the KLV descent cost across the rollout. Invalidated when
-  // the KLV pointer or its mutation_counter changes.
-  KlvLeavesCacheEntry klv_leaves_cache[MOVEGEN_KLV_LEAVES_CACHE_SIZE];
-  const Board *board;
-  LetterDistribution ld;
-  // Whether ld fits a BitRack: <= BIT_RACK_MAX_ALPHABET_SIZE machine letters
-  // (4-bit letter index) and <= 15 of any one letter, blanks included (4-bit
-  // per-letter count) -- see bit_rack_is_compatible_with_ld. The RIT cache,
-  // KLV-leaves cache, and WMP all key on a BitRack, so all three are disabled
-  // when this is false. Set in gen_load_position.
-  bool bit_rack_compatible;
-  MoveList *move_list;
-  AnchorHeap anchor_heap;
-  Equity tile_scores[MACHINE_LETTER_MAX_VALUE];
-  Equity full_rack_descending_tile_scores[RACK_SIZE];
-  Equity descending_tile_scores[RACK_SIZE];
-  Equity descending_tile_scores_copy[RACK_SIZE];
-  WMPMoveGen wmp_move_gen;
-  uint64_t rack_cross_set;
-  bool target_word_full_rack_existence[RACK_SIZE + 1];
-
-  Equity best_leaves[RACK_SIZE + 1];
-
-  MachineLetter playthrough_marked[BOARD_DIM];
-} MoveGen;
+void movegen_budget_init(MovegenBudget *budget, uint64_t limit);
+uint64_t movegen_budget_get_spent(const MovegenBudget *budget);
 
 typedef struct MoveGenArgs {
   const Game *game;
@@ -249,20 +23,13 @@ typedef struct MoveGenArgs {
   const KWG *override_kwg;
   Equity eq_margin_movegen;
 
-  // Movegen for inferences after plays will need a target equity value to skip
-  // anchors that can't surpass it. Callers may either pass a baseline equity
-  // with a separate margin in eq_margin_movegen, or combine them into
-  // target_equity and pass eq_margin_movegen=0 (the inference code does this
-  // for tile placements). Defaults to EQUITY_MAX_VALUE for non-inference mode.
+  // Inference passes the highest equity a move may have while the inferred
+  // move stays within its margin: move generation stops at the first move
+  // above it and skips anchors that cannot exceed it, so the move it returns
+  // is above it exactly when the best move is. EQUITY_MAX_VALUE, for every
+  // other caller, turns this off.
   Equity target_equity;
 
-  // Movegen for inferences after exchanges will need to know the number of
-  // tiles exchanged so that it can determine the target equity value after
-  // generating exchanges, and then skip anchors that can't surpass that value
-  // by eq_margin_movegen. This field does not itself trigger an early return
-  // from move generation based on alternate exchange sizes. Value is
-  // UNSET_LEAVE_SIZE for non-exchange scenarios.
-  int target_leave_size_for_exchange_cutoff;
   MoveList *move_list;
   // Output: bitvector of machine letters that appear in any valid move.
   // Only used with MOVE_RECORD_TILES_PLAYED. Caller provides pointer; callee
@@ -271,15 +38,157 @@ typedef struct MoveGenArgs {
   // Input: initial set of known-playable tiles for MOVE_RECORD_TILES_PLAYED.
   // Movegen ORs further discoveries in. Default 0 (no known tiles).
   uint64_t initial_tiles_bv;
+  // MOVE_RECORD_BEST_SMALL only: rank a play that uses the whole rack by its
+  // score plus this bonus, e.g. twice the opponent's rack for going out in an
+  // endgame. The recorded play keeps its real score. Default 0.
+  Equity best_small_out_bonus;
+  // MOVE_RECORD_BEST_SMALL only: if true, a play that ties the best value
+  // replaces it when its tiny_move is larger, so the play returned does not
+  // depend on the order in which anchors are searched (the endgame's
+  // best-reply shortcuts find it in another order and must agree). Default
+  // false: the first play found keeps a tie.
+  bool best_small_canonical_ties;
+  // Disables the PAT term even when the player has weights loaded.
+  // Set by the inference paths, which build their own equity thresholds
+  // from score plus leave and would misclassify moves whose recorded
+  // equities carried the defense term.
+  bool disable_pat;
+  // Which loaded PAT classes to suppress (bits from pat_premium_class_t
+  // and PAT_CLASS_MASK_WINDOWS; see PAT_CLASS_MASK_ALL). 0 applies every
+  // class the weights have, so one weights file can serve both a fast
+  // rollout mode and a full mode. Ignored when disable_pat is set.
+  uint32_t pat_disabled_classes_mask;
+  // MOVE_RECORD_BEST by equity only: the best moves earlier generations
+  // found for the same rack (see best_move_carry.h). Each one still legal
+  // here starts the generation as its best move, lanes whose remembered
+  // bound it beats are skipped (without PAT), and the generation's best move
+  // is added, as a move and as the bound of the lanes searched. NULL (the
+  // default) skips all of this.
+  BestMoveCarry *best_move_carry;
+  // MOVE_RECORD_BEST_SMALL only: lane shadows that earlier generations
+  // recorded (see lane_shadow_cache.h). A lane the cache holds adds the
+  // anchors recorded for it instead of being shadowed, and every other lane
+  // is recorded. Not used in wordsmog. A word info table does not matter:
+  // only the full shadow and WMP generation read it, not the small shadow and
+  // generator these generations run. NULL (the default) shadows every lane.
+  LaneShadowCache *lane_shadow_cache;
+  // For the census rollout (census_rollout.h), MOVE_RECORD_BEST by equity
+  // only: the lanes (bit dir * BOARD_DIM + row_or_col) whose anchors are not
+  // searched, and by lane the columns of the anchors whose plays are not
+  // searched (each play is its leftmost anchor's), or NULL. The caller
+  // vouches that no skipped anchor holds a move at or above the best move's
+  // equity. 0 and NULL change nothing.
+  uint64_t skip_lanes;
+  const uint32_t *skip_anchor_cols;
 } MoveGenArgs;
 
+// The hash of each lane of the game's board as the best-move carry computes
+// it (0 for a lane without anchors), with player_index's cross sets.
+void gen_hash_game_lanes(const Game *game, int player_index,
+                         uint64_t *lane_hashes);
+
 void gen_destroy_cache(void);
+
+// The move generations made in this process so far, on every thread: each
+// generate_moves call, and each generate_small_moves_in_lanes call (the
+// endgame's incremental move list for a node, which stands in for a
+// generate_moves call), whoever made it -- autoplay, a simulation, an
+// inference, an endgame or pre-endgame solve. The difference between two
+// readings is what was made in between.
+//
+// Each thread counts on its own MoveGen, unsynchronized, so nothing is shared
+// in the hot path; this sums them, and so is only exact while no thread is
+// generating moves: read it before and after a command, not during one.
+//
+// Only generations made while something accounts for them are counted: a
+// movegen limit, a movegen budget on any thread, or a counting session. A
+// caller that wants the count of some work starts a session around it.
+uint64_t gen_get_movegen_count(void);
+// A counting session: generations on every thread are counted from start to
+// stop. Sessions nest. Started and stopped with no thread generating moves.
+void gen_start_counting_movegens(void);
+void gen_stop_counting_movegens(void);
+
+// A command's movegen limit (-movegenlimit): a work budget that, unlike a
+// time limit, is the same on any machine. Started before a command runs and
+// stopped after it, on one thread, with no thread generating moves. While it
+// runs, every generation on any thread counts against `limit`, and the one
+// that reaches it stops the command as a user interrupt would, through
+// `thread_control`. A command stops where it next checks for an interrupt --
+// after a game, a simulation's iteration -- and generations are charged in
+// batches, so it runs somewhat past the limit, never short of it: further
+// for a player that generates many times a turn. A limit of 0 is none.
+void gen_start_movegen_limit(uint64_t limit, ThreadControl *thread_control);
+// Ends the running command's limit, and says whether it was reached.
+bool gen_stop_movegen_limit(void);
+
+// Makes `budget` the calling thread's move budget (NULL for none), charging
+// the old one what this thread has not yet; returns the old one, for the
+// caller to restore. A thread a search starts for a move takes the starting
+// thread's budget (gen_get_movegen_budget) and clears it before it exits.
+MovegenBudget *gen_set_movegen_budget(MovegenBudget *budget);
+MovegenBudget *gen_get_movegen_budget(void);
+// Whether the calling thread's move budget, if any, is spent: what a search
+// checks wherever it checks its deadline.
+bool gen_movegen_budget_spent(void);
+
+// The most pool slots (see MAX_THREADS) live threads have held at once since
+// the last gen_reset_slots_high_water, which starts the count again from the
+// slots held now. A thread takes its slot on its first move generation and
+// gives it back when it exits; past MAX_THREADS at once, magpie exits.
+int gen_get_slots_high_water(void);
+void gen_reset_slots_high_water(void);
 
 // If override_kwg is NULL, the full KWG for the on-turn player is used,
 // but if it is nonnull, override_kwg is used. The only use case for this
 // so far is using a reduced wordlist kwg (done with wordprune) for endgame
 // solving.
 void generate_moves(const MoveGenArgs *args);
+
+// The MOVE_RECORD_ALL_SMALL plays of the lanes whose bit is set in
+// `lane_mask` (bit dir * BOARD_DIM + row_or_col: the BOARD_DIM horizontal
+// rows, then the BOARD_DIM vertical columns), appended to args->move_list in
+// generate_moves' lane order with no pass, skipping every anchor none of whose
+// plays can span a square set in its lane's lane_hits entry (bit c: column c
+// of a row, row c of a column). A play from an anchor starts right of the
+// anchor's leftward limit (the previous anchor's square, or the square after
+// it when that holds a tile) and covers, on either side of the anchor, no
+// more empty squares than the rack has tiles and none where no rack tile
+// fits, besides the tiles it plays through. lane_end[lane] receives the list
+// count once that lane has been processed, so lane L's plays occupy
+// [lane_end[L - 1], lane_end[L]) (from 0 for L == 0). For each lane in
+// lane_mask, lane_anchors[lane] receives the bits of the lane's anchors and
+// lane_generated[lane] those of the anchors not skipped. Serves the endgame's
+// incremental move lists (path_move_lists.h).
+void generate_small_moves_in_lanes(const MoveGenArgs *args, uint64_t lane_mask,
+                                   const uint32_t *lane_hits, int *lane_end,
+                                   uint32_t *lane_anchors,
+                                   uint32_t *lane_generated);
+
+// The MOVE_RECORD_TILES_PLAYED generation (see generate_moves) restricted as
+// generate_small_moves_in_lanes restricts its own: to the lanes in `lane_mask`
+// and, in each, to the anchors some of whose plays can span a square set in
+// its lane_hits entry. Every play it finds is a play on the board, so the tile
+// types it reports are playable; a tile type it does not report has no play
+// from those anchors. Writes the tile types to *args->tiles_played_bv.
+void generate_tiles_played_in_lanes(const MoveGenArgs *args, uint64_t lane_mask,
+                                    const uint32_t *lane_hits);
+
+// The MOVE_RECORD_BEST_SMALL generation restricted to the anchors of the lanes
+// in `lane_mask` (indexed as for generate_small_moves_in_lanes), competing
+// against `incumbent`: a play found elsewhere on the board, worth
+// `incumbent_value` (its score, plus args->best_small_out_bonus when it uses
+// the whole rack), or NULL for none. Anchors are pruned by their shadow bounds
+// against the incumbent from the start, and with
+// args->best_small_canonical_ties an equal-valued play wins only with a larger
+// tiny_move, so the result is the argmax over the lanes and the incumbent under
+// BEST_SMALL's ranking. Leaves the winner as the only entry of args->move_list
+// and returns true, or returns false with the list empty when there is neither
+// an incumbent nor a play in those lanes. Records no pass.
+bool generate_best_small_move_in_lanes(const MoveGenArgs *args,
+                                       uint64_t lane_mask,
+                                       const SmallMove *incumbent,
+                                       Equity incumbent_value);
 
 MoveGen *get_movegen(void);
 

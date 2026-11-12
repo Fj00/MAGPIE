@@ -1,9 +1,9 @@
 #include "rack_info_table_maker.h"
 
 #include "../compat/cpthread.h"
+#include "../compat/cpthread_defs.h"
 #include "../def/bit_rack_defs.h"
 #include "../def/board_defs.h"
-#include "../def/cpthread_defs.h"
 #include "../def/equity_defs.h"
 #include "../def/klv_defs.h"
 #include "../def/kwg_defs.h"
@@ -79,6 +79,21 @@ static uint32_t count_all_racks(const LetterDistribution *ld) {
   uint32_t count = 0;
   count_racks_recursive(ld, ld_get_size(ld), 0, RACK_SIZE, &count);
   return count;
+}
+
+int64_t rack_info_table_file_bytes(const LetterDistribution *ld) {
+  const uint32_t total_racks = count_all_racks(ld);
+  uint32_t num_buckets =
+      total_racks > 0 ? next_power_of_2(total_racks) : RIT_MIN_BUCKETS;
+  if (num_buckets < RIT_MIN_BUCKETS) {
+    num_buckets = RIT_MIN_BUCKETS;
+  }
+  // The header (4 bytes of version and sizes, then the bucket and entry
+  // counts), the bucket starts, the entries and the inputs trailer, as the
+  // table is written.
+  return 12 + ((int64_t)num_buckets + 1) * (int64_t)sizeof(uint32_t) +
+         (int64_t)total_racks * (int64_t)sizeof(RackInfoTableEntry) +
+         (int64_t)RIT_INPUTS_UINT32S * (int64_t)sizeof(uint32_t);
 }
 
 static void enumerate_racks_recursive(const LetterDistribution *ld, int ld_size,
@@ -394,7 +409,7 @@ static void compute_entry_for_rack(const KLV *klv, const WMP *wmp,
   if (wmp != NULL && (entry->nonplaythrough_has_word_of_length_bitmask &
                       (1U << RACK_SIZE)) != 0) {
     BitRack full_bit_rack = bit_rack_create_from_rack(ld, &player_rack);
-    MachineLetter buf[WMP_RESULT_BUFFER_SIZE];
+    MachineLetter buf[WMP_RESULT_BUFFER_SIZE + WMP_WORD_BUFFER_SLACK_BYTES];
     const int bytes =
         wmp_write_words_to_buffer(wmp, &full_bit_rack, RACK_SIZE, buf);
     const int num_words = bytes / RACK_SIZE;
@@ -841,6 +856,7 @@ RackInfoTable *make_rack_info_table(const KLV *klv, const WMP *wmp,
   if (total_racks == 0) {
     RackInfoTable *rit =
         (RackInfoTable *)calloc_or_die(1, sizeof(RackInfoTable));
+    rit->instance_id = rack_info_table_next_instance_id();
     rit->version = RIT_VERSION;
     rit->rack_size = (uint8_t)RACK_SIZE;
     rit->playthrough_min_played_size = effective_min;
@@ -958,6 +974,7 @@ RackInfoTable *make_rack_info_table(const KLV *klv, const WMP *wmp,
 
   // 7. Build the RackInfoTable
   RackInfoTable *rit = (RackInfoTable *)calloc_or_die(1, sizeof(RackInfoTable));
+  rit->instance_id = rack_info_table_next_instance_id();
   rit->version = RIT_VERSION;
   rit->rack_size = (uint8_t)RACK_SIZE;
   rit->playthrough_min_played_size = effective_min;

@@ -1,9 +1,12 @@
+#include "word_test.h"
+
 #include "../src/def/letter_distribution_defs.h"
 #include "../src/ent/game.h"
 #include "../src/ent/validated_move.h"
 #include "../src/ent/words.h"
 #include "../src/impl/config.h"
 #include "../src/impl/gameplay.h"
+#include "../src/impl/rack_draw.h"
 #include "../src/util/io_util.h"
 #include "test_util.h"
 #include <assert.h>

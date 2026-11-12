@@ -1,6 +1,7 @@
+#include "board_layout_default_test.h"
+
 #include "../src/def/board_defs.h"
 #include "../src/def/equity_defs.h"
-#include "../src/def/move_defs.h"
 #include "../src/def/static_eval_defs.h"
 #include "../src/ent/board.h"
 #include "../src/ent/bonus_square.h"
@@ -126,7 +127,6 @@ void assert_opening_penalties(Game *game, const char *data_paths,
       .move_list = move_list,
       .eq_margin_movegen = 0,
       .target_equity = EQUITY_MAX_VALUE,
-      .target_leave_size_for_exchange_cutoff = UNSET_LEAVE_SIZE,
   };
   generate_moves_for_game(&move_gen_args);
   const Move *move = move_list_get_move(move_list, 0);
@@ -261,8 +261,15 @@ void test_board_layout_correctness(void) {
   load_game_with_test_board(game, data_paths,
                             "many_opening_hotspots_vertical_15");
 
+  Equity opening_word_penalties[BOARD_DIM * 2];
+  Equity opening_letter_penalties[BOARD_DIM * 2];
+  board_copy_opening_penalties(board, opening_word_penalties,
+                               opening_letter_penalties);
   Equity opening_penalties[BOARD_DIM * 2];
-  board_copy_opening_penalties(board, opening_penalties);
+  for (int i = 0; i < BOARD_DIM * 2; i++) {
+    opening_penalties[i] =
+        opening_word_penalties[i] + opening_letter_penalties[i];
+  }
   assert(opening_penalties[0] == 0);
   assert(opening_penalties[1] == 0);
   assert(opening_penalties[2] == OPENING_HOTSPOT_PENALTY * 3);
