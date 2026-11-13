@@ -167,12 +167,17 @@ static inline TranspositionTable *transposition_table_create_with_threads(
              minimum_size_power,
              (1 << minimum_size_power) * TTENTRY_SIZE_BYTES / 1024);
   }
-  int num_elems = 1 << tt->size_power_of_2;
+  // uint64_t, not int (2026-11-12): on a 264 GB machine the default fraction
+  // asks for 2^31+ entries, and `1 << 31` as an int overflowed into a garbage
+  // allocation size ("failed to allocate transposition table" for a 32 GiB
+  // table that fits fine). The size computation further down in this header
+  // already shifts as uint64_t.
+  const uint64_t num_elems = (uint64_t)1 << tt->size_power_of_2;
   size_t memory_mb = ((size_t)TTENTRY_SIZE_BYTES * num_elems) / (1024 * 1024);
   log_info("Creating transposition table. System memory: %llu, TT size: 2^%d "
-           "(elements: %d, memory: %zu MB)",
-           (unsigned long long)total_memory, tt->size_power_of_2, num_elems,
-           memory_mb);
+           "(elements: %llu, memory: %zu MB)",
+           (unsigned long long)total_memory, tt->size_power_of_2,
+           (unsigned long long)num_elems, memory_mb);
   tt->index_bits = tt->size_power_of_2 - TT_BUCKET_POWER;
   tt->bucket_mask = ((uint64_t)1 << tt->index_bits) - 1;
   void *table_memory;
